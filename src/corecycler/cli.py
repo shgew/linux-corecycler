@@ -22,6 +22,10 @@ EXIT_ENGINE_ABORTED = 6
 EXIT_LOCKED = 7
 EXIT_SIGNAL = 130
 
+# How often the paused engine is checked for a still-running test, and how
+# often the Qt loop yields to Python so a pending signal handler can run.
+SETTLE_POLL_MS = 500
+
 USAGE = """\
 corecycler headless commands:
 
@@ -32,7 +36,8 @@ corecycler headless commands:
 
 Exit codes: 0 completed, 3 paused (needs attention), 4 quarantined,
 5 refused (bad config/environment), 6 engine aborted, 7 already running,
-130 stopped by signal (offsets reverted to baseline).
+130 aborted by SIGINT (offsets reverted to baseline).
+SIGTERM pauses after the current test and exits 3.
 
 Running the binary with no command opens the GUI.
 """
@@ -157,7 +162,7 @@ def cmd_run(
     engine_factory=None,
     db=None,
 ) -> int:
-    from PySide6.QtCore import QCoreApplication, QLockFile
+    from PySide6.QtCore import QCoreApplication, QLockFile, QTimer
 
     from corecycler.config.paths import user_home
 
@@ -237,9 +242,17 @@ def cmd_run(
     engine.log_message.connect(lambda m: print(m, flush=True))
     engine.session_completed.connect(lambda _p: finish(EXIT_COMPLETED, force=True))
 
+    def settle_paused() -> None:
+        # pause() takes effect after the in-flight test; quitting sooner would
+        # kill the worker mid-test and leave its offset resident and in_test.
+        if engine.test_in_flight:
+            QTimer.singleShot(SETTLE_POLL_MS, settle_paused)
+            return
+        finish(EXIT_PAUSED)
+
     def on_status(status: str) -> None:
         if status == "paused":
-            finish(EXIT_PAUSED)
+            settle_paused()
         elif status == "quarantined":
             finish(EXIT_QUARANTINED)
         elif status == "idle":
@@ -247,14 +260,24 @@ def cmd_run(
 
     engine.status_changed.connect(on_status)
 
-    def on_signal(signum, _frame) -> None:
+    def on_interrupt(signum, _frame) -> None:
         print(f"corecycler: signal {signum} — aborting (offsets revert)", flush=True)
         outcome["exit"] = EXIT_SIGNAL
         engine.abort()
         app.quit()
 
-    signal.signal(signal.SIGINT, on_signal)
-    signal.signal(signal.SIGTERM, on_signal)
+    def on_terminate(_signum, _frame) -> None:
+        print("corecycler: SIGTERM — pausing after the current test", flush=True)
+        engine.pause()
+
+    signal.signal(signal.SIGINT, on_interrupt)
+    signal.signal(signal.SIGTERM, on_terminate)
+
+    # Python runs signal handlers only between bytecodes; a loop idle in C
+    # would otherwise defer them until the worker's next queued emission.
+    wake = QTimer()
+    wake.timeout.connect(lambda: None)
+    wake.start(SETTLE_POLL_MS)
 
     if resume_id is not None:
         engine.resume(resume_id)

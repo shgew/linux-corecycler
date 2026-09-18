@@ -513,6 +513,11 @@ class TunerEngine(QObject):
         return self._session_id
 
     @property
+    def test_in_flight(self) -> bool:
+        """True from worker start until its result has been processed."""
+        return self._worker is not None
+
+    @property
     def core_states(self) -> dict[int, CoreState]:
         return self._core_states
 

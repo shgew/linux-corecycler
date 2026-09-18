@@ -1114,6 +1114,11 @@ class TestResumeGuards:
         engine.resume(sid)
         assert engine._paused is True
 
+    def test_in_flight_follows_the_worker_lifetime(self, engine):
+        assert engine.test_in_flight is False
+        engine._worker = MagicMock()
+        assert engine.test_in_flight is True
+
     def test_an_unknown_session_is_refused(self, engine):
         lines = []
         engine.log_message.connect(lines.append)

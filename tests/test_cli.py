@@ -54,6 +54,7 @@ class FakeEngine(QObject):
         self.behavior = behavior
         self.status = "idle"
         self.resumed_with: int | None = None
+        self.test_in_flight = False
 
     def start(self) -> None:
         self._act()
@@ -64,6 +65,10 @@ class FakeEngine(QObject):
 
     def abort(self) -> None:
         self.status = "idle"
+
+    def pause(self) -> None:
+        self.status = "paused"
+        self.status_changed.emit("paused")
 
     def _act(self) -> None:
         if self.behavior == "completes":
@@ -322,7 +327,7 @@ class TestRunStatusAndSignal:
         code = cli.cmd_run(None, None, False, engine_factory=lambda *_: FakeEngine("aborts"), db=db)
         assert code == cli.EXIT_ENGINE_ABORTED
 
-    def test_signal_handler_aborts_with_signal_exit(self, db, monkeypatch):
+    def _capture_signal_handlers(self, monkeypatch) -> dict:
         import signal as signal_mod
 
         captured: dict = {}
@@ -333,6 +338,12 @@ class TestRunStatusAndSignal:
             return real(sig, handler)
 
         monkeypatch.setattr(signal_mod, "signal", fake_signal)
+        return captured
+
+    def test_sigint_aborts_with_signal_exit(self, db, monkeypatch):
+        import signal as signal_mod
+
+        captured = self._capture_signal_handlers(monkeypatch)
         made = []
 
         def factory(_db, _config):
@@ -344,6 +355,25 @@ class TestRunStatusAndSignal:
         code = cli.cmd_run(None, None, False, engine_factory=factory, db=db)
         assert code == cli.EXIT_SIGNAL
         assert made[0].status == "idle"
+
+    def test_sigterm_pauses_and_waits_for_the_in_flight_test(self, db, monkeypatch):
+        import signal as signal_mod
+
+        captured = self._capture_signal_handlers(monkeypatch)
+        monkeypatch.setattr(cli, "SETTLE_POLL_MS", 10)
+        made = []
+
+        def factory(_db, _config):
+            eng = FakeEngine("runs")
+            eng.test_in_flight = True
+            made.append(eng)
+            QTimer.singleShot(10, lambda: captured[signal_mod.SIGTERM](signal_mod.SIGTERM, None))
+            QTimer.singleShot(60, lambda: setattr(eng, "test_in_flight", False))
+            return eng
+
+        code = cli.cmd_run(None, None, False, engine_factory=factory, db=db)
+        assert code == cli.EXIT_PAUSED
+        assert made[0].status == "paused"
 
     def test_auto_resume_falls_back_to_first_resumable(self, db):
         sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
