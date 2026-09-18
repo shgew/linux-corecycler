@@ -4,10 +4,17 @@ Note: Like all backends, stressapptest runs indefinitely and the
 CoreScheduler handles timing by killing the process after
 seconds_per_core. We pass -s 86400 (24h) so stressapptest doesn't
 self-terminate before the scheduler stops it.
+
+Memory is always sized explicitly. Without -M stressapptest targets 95% of
+PHYSICAL RAM minus 192 MB per process, which is fine for the single-instance
+DIMM test it was written for but fatal for the tuner's memory stage, where one
+process per core launched together tried to claim all of RAM eight times over
+and the OOM killer tore the batch down before any core got a verdict.
 """
 
 from __future__ import annotations
 
+import contextlib
 from typing import TYPE_CHECKING
 
 from corecycler.engine.backends import register_backend
@@ -17,6 +24,29 @@ from .base import CRASH_SIGNALS, KILLED_BY_US_CODES, StressBackend, StressConfig
 if TYPE_CHECKING:
     from pathlib import Path
 
+MEMORY_SHARE = 0.75
+MIN_MEMORY_MB = 256
+FALLBACK_MEMORY_MB = 1024
+
+
+def available_memory_mb() -> int | None:
+    """MemAvailable from /proc/meminfo in MB, None when it cannot be read."""
+    with contextlib.suppress(OSError, ValueError), open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    return None
+
+
+def default_memory_mb(lanes: int = 1) -> int:
+    """Per-process -M size: 75% of MemAvailable shared equally across ``lanes``
+    concurrent processes (never below MIN_MEMORY_MB), so a batch of them
+    together stays clear of the OOM killer. Falls back to a fixed total when
+    /proc/meminfo is unreadable."""
+    available = available_memory_mb()
+    total = int(available * MEMORY_SHARE) if available else FALLBACK_MEMORY_MB
+    return max(MIN_MEMORY_MB, total // max(1, lanes))
+
 
 @register_backend("stressapptest")
 class StressapptestBackend(StressBackend):
@@ -25,9 +55,12 @@ class StressapptestBackend(StressBackend):
     def get_command(self, config: StressConfig, work_dir: Path) -> list[str]:
         # stressapptest sizes its worker pool from its affinity mask, which the
         # engine's cgroup cpuset already clamps to the lane's CPUs.
+        memory_mb = config.memory_mb if config.memory_mb and config.memory_mb > 0 else default_memory_mb()
         return [
             self.require_binary(),
             "-W",
+            "-M",
+            str(memory_mb),
             "-s",
             "86400",
         ]

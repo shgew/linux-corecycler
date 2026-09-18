@@ -21,6 +21,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 from corecycler.config.paths import resolve_work_dir
 from corecycler.engine.backends import get_backend, load_all
 from corecycler.engine.backends.base import StressConfig
+from corecycler.engine.backends.stressapptest import default_memory_mb
 from corecycler.engine.detector import (
     ErrorDetector,
     MCEEvent,
@@ -3406,7 +3407,12 @@ class TunerEngine(QObject):
 
         self._last_tested_core = cores[0]
         self._mark_cores_under_stress(cores)
-        self._start_multi_core_worker(cores, self._config.validate_duration_seconds, backend=backend)
+        self._start_multi_core_worker(
+            cores,
+            self._config.validate_duration_seconds,
+            backend=backend,
+            memory_mb=default_memory_mb(len(cores)),
+        )
 
     def _run_validation_stage3(self) -> None:
         """Stage 3: alternating half-core load — catches voltage transients."""
@@ -3497,15 +3503,20 @@ class TunerEngine(QObject):
             return None
         return backend if backend.is_available() else None
 
-    def _start_multi_core_worker(self, cores: list[int], duration: int, backend=None) -> None:
+    def _start_multi_core_worker(
+        self, cores: list[int], duration: int, backend=None, memory_mb: int | None = None
+    ) -> None:
         """Launch every core's stress process simultaneously (one pinned
         process per core) with per-core verdicts; the worker reports the
         first failing core, else the first core's pass. ``backend`` overrides
-        the configured CPU backend (the memory stage passes stressapptest)."""
+        the configured CPU backend and ``memory_mb`` sizes each process (the
+        memory stage passes stressapptest and its per-lane share of RAM, since
+        every lane's process allocates at once)."""
         stress_config = StressConfig(
             mode=self._get_stress_mode(),
             fft_preset=self._get_fft_preset(),
             threads=2,
+            memory_mb=memory_mb,
         )
         scheduler_config = SchedulerConfig(
             seconds_per_core=duration,

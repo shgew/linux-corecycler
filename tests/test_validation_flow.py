@@ -369,12 +369,17 @@ class TestMemoryValidationStage:
         eng._validation_core_order = sorted(BEST)
         return eng
 
-    def test_memory_stage_runs_with_memory_backend_when_available(self, db, topo_dual_ccd_x3d, mock_backend):
+    def test_memory_stage_runs_with_memory_backend_when_available(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        import corecycler.engine.backends.stressapptest as sat
+
+        monkeypatch.setattr(sat, "available_memory_mb", lambda: 29000)
         eng = self._seed(db, topo_dual_ccd_x3d, mock_backend)
         captured = {}
         eng._get_memory_backend = lambda: _FakeMemBackend()
-        eng._start_multi_core_worker = lambda cores, dur, backend=None: captured.update(
-            cores=list(cores), backend=backend
+        eng._start_multi_core_worker = lambda cores, dur, backend=None, memory_mb=None: captured.update(
+            cores=list(cores), backend=backend, memory_mb=memory_mb
         )
         eng._validation_stage = 6
 
@@ -382,6 +387,9 @@ class TestMemoryValidationStage:
 
         assert captured["cores"] == sorted(BEST)  # every core stressed together
         assert isinstance(captured["backend"], _FakeMemBackend)  # memory, not CPU
+        # Every lane allocates at once, so each gets the budget divided by the
+        # lane count: the whole batch stays within 75% of what is available.
+        assert captured["memory_mb"] == int(29000 * 0.75) // len(BEST)
         assert eng._validation_stage == 6
 
     def test_memory_pass_advances_to_soak(self, db, topo_dual_ccd_x3d, mock_backend):

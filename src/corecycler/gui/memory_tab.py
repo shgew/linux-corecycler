@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import re
 import subprocess
@@ -28,6 +27,7 @@ from corecycler.config import tools
 from corecycler.config.settings import load_settings
 from corecycler.engine import execution
 from corecycler.engine.backends.base import KILLED_BY_US_CODES
+from corecycler.engine.backends.stressapptest import default_memory_mb
 from corecycler.gui.style import theme
 from corecycler.monitor.memory import DIMMInfo, SPD5118Reader, read_dimm_info
 from corecycler.smu.pmtable import PMTableReader, compute_fclk_uclk_ratio
@@ -56,10 +56,7 @@ class _StressWorker(QThread):
         try:
             seconds = self._duration * 60
             if self._tool == "stressapptest":
-                # Limit to 75% of free memory to avoid "freepages < neededpages"
-                free_mb = _get_free_memory_mb()
-                mem_mb = max(256, int(free_mb * 0.75)) if free_mb else 1024
-                cmd = [tools.command_name("stressapptest"), "-W", "-M", str(mem_mb), "-s", str(seconds)]
+                cmd = [tools.command_name("stressapptest"), "-W", "-M", str(default_memory_mb()), "-s", str(seconds)]
             elif self._tool == "stress-ng --vm":
                 cmd = [
                     tools.command_name("stress-ng"),
@@ -108,15 +105,6 @@ class _StressWorker(QThread):
 
         with contextlib.suppress(OSError, ProcessLookupError):
             os.killpg(os.getpgid(proc.pid), sig.SIGKILL)
-
-
-def _get_free_memory_mb() -> int | None:
-    """Read available memory from /proc/meminfo in MB."""
-    with contextlib.suppress(OSError, ValueError), open("/proc/meminfo") as f:
-        for line in f:
-            if line.startswith("MemAvailable:"):
-                return int(line.split()[1]) // 1024  # kB → MB
-    return None
 
 
 class MemoryTab(QWidget):

@@ -1,11 +1,11 @@
-"""memory_tab _StressWorker and free-memory probe coverage."""
+"""memory_tab _StressWorker coverage."""
 
 from __future__ import annotations
 
 import signal
 import subprocess
 import sys as _sys
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -34,41 +34,20 @@ def _proc(stdout="Status: PASS\n", stderr="", returncode=0, timeout_first=False)
     return proc
 
 
-def _run_worker(monkeypatch, tool, proc=None, free=2048, popen_error=None):
+def _run_worker(monkeypatch, tool, proc=None, popen_error=None):
     import corecycler.gui.memory_tab as mt
 
     _qapp()
     results: list = []
     worker = mt._StressWorker(tool, 1)
     worker.done.connect(lambda ok, out: results.append((ok, out)))
-    monkeypatch.setattr(mt, "_get_free_memory_mb", lambda: free)
+    monkeypatch.setattr(mt, "default_memory_mb", lambda: 1536)
     if popen_error is not None:
         monkeypatch.setattr("subprocess.Popen", MagicMock(side_effect=popen_error))
     elif proc is not None:
         monkeypatch.setattr("subprocess.Popen", MagicMock(return_value=proc))
     worker.run()
     return results
-
-
-class TestFreeMemoryProbe:
-    def test_reads_mem_available(self):
-        from corecycler.gui.memory_tab import _get_free_memory_mb
-
-        data = "MemTotal:       16000000 kB\nMemAvailable:    2097152 kB\n"
-        with patch("builtins.open", mock_open(read_data=data)):
-            assert _get_free_memory_mb() == 2048
-
-    def test_absent_field_returns_none(self):
-        from corecycler.gui.memory_tab import _get_free_memory_mb
-
-        with patch("builtins.open", mock_open(read_data="MemTotal: 1 kB\n")):
-            assert _get_free_memory_mb() is None
-
-    def test_unreadable_meminfo_returns_none(self):
-        from corecycler.gui.memory_tab import _get_free_memory_mb
-
-        with patch("builtins.open", side_effect=OSError):
-            assert _get_free_memory_mb() is None
 
 
 class TestStressWorkerRun:
@@ -84,30 +63,21 @@ class TestStressWorkerRun:
         results = _run_worker(monkeypatch, "stressapptest", proc=_proc(stdout="miscompare\n"))
         assert results[0][0] is False
 
-    def test_stressapptest_sizes_from_free_memory(self, monkeypatch):
+    def test_stressapptest_sizes_memory_explicitly(self, monkeypatch):
+        """The GUI run is a single process, so it gets the whole single-lane
+        share; without -M stressapptest would grab 95% of physical RAM."""
         popen = MagicMock(return_value=_proc())
         import corecycler.gui.memory_tab as mt
 
         _qapp()
         worker = mt._StressWorker("stressapptest", 2)
-        monkeypatch.setattr(mt, "_get_free_memory_mb", lambda: 4096)
+        monkeypatch.setattr(mt, "default_memory_mb", lambda: 3072)
         monkeypatch.setattr("subprocess.Popen", popen)
         worker.run()
         cmd = popen.call_args[0][0]
         assert cmd[0] == "stressapptest"
-        assert str(int(4096 * 0.75)) in cmd
+        assert cmd[cmd.index("-M") + 1] == "3072"
         assert str(2 * 60) in cmd
-
-    def test_stressapptest_defaults_when_free_memory_unknown(self, monkeypatch):
-        popen = MagicMock(return_value=_proc())
-        import corecycler.gui.memory_tab as mt
-
-        _qapp()
-        worker = mt._StressWorker("stressapptest", 1)
-        monkeypatch.setattr(mt, "_get_free_memory_mb", lambda: None)
-        monkeypatch.setattr("subprocess.Popen", popen)
-        worker.run()
-        assert "1024" in popen.call_args[0][0]
 
     def test_stress_ng_uses_returncode(self, monkeypatch):
         results = _run_worker(monkeypatch, "stress-ng --vm", proc=_proc(returncode=0))
