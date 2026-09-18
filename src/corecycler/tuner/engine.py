@@ -762,8 +762,13 @@ class TunerEngine(QObject):
                     # Reboot zeroes SMU SRAM, so 0 is already resident. Without
                     # a reboot the SMU holds whatever was live at app exit (a
                     # mid-test offset, e.g.) — it must be written back like any
-                    # other baseline, never assumed.
+                    # other baseline, never assumed. The journal still has to
+                    # say 0 is what is resident: the crash above was attributed
+                    # from its un-survived row, and left in place that row would
+                    # convict the same core again on every later reboot, a
+                    # deliberate one included.
                     self._co_applied[cs.core_id] = 0
+                    tp.journal_co_intent(self._db, session_id, cs.core_id, 0, True)
                     continue
                 try:
                     success = self._apply_co(cs.core_id, cs.baseline_offset)

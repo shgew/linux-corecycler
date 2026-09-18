@@ -525,6 +525,36 @@ class TestJournalCatchesUnflaggedCrash:
         logs = tp.get_test_log(db, sid, core_id=0)
         assert any(e.get("error_type") == "crash" and not e.get("passed") for e in logs)
 
+    def test_a_journal_crash_is_attributed_once(self, db, topo, smu, mock_backend):
+        """After the penalty the reboot has zeroed the SMU, so the journal must
+        say 0 is resident. Otherwise the same row convicts the core again on
+        every later reboot, a deliberate one after a pause included, and the
+        crash-resume breaker trips on penalties for a crash that happened once."""
+        cfg = TunerConfig(cores_to_test=[0], crash_penalty_steps=3, fine_step=1)
+        sid = tp.create_session(db, cfg, "", "")
+        tp.save_core_state(
+            db,
+            sid,
+            CoreState(
+                core_id=0,
+                phase=TunerPhase.FINE_SEARCH,
+                current_offset=-12,
+                best_offset=-10,
+                baseline_offset=0,
+            ),
+        )
+        db.journal_co_intent(sid, 0, -12, survived=False)
+
+        _resume_fresh(db, topo, smu, mock_backend, sid, cores_to_test=[0], crash_penalty_steps=3, fine_step=1)
+        assert db.journal_suspects(sid) == []
+        assert tp.get_resume_crash_streak(db, sid) == 1
+
+        eng = _resume_fresh(db, topo, smu, mock_backend, sid, cores_to_test=[0], crash_penalty_steps=3, fine_step=1)
+        cs = eng._core_states[0]
+        assert cs.crash_count == 1
+        assert cs.current_offset == -9
+        assert tp.get_resume_crash_streak(db, sid) == 0
+
     def test_zero_value_is_never_a_suspect(self, db, topo, smu, mock_backend):
         """CO=0 (stock) is axiomatically safe and must never be treated as a crash."""
         cfg = TunerConfig(cores_to_test=[0])
@@ -1876,7 +1906,7 @@ class TestNoRebootResidentOffset:
 
     def test_rebooted_zero_baseline_is_not_rewritten(self, db, topo, smu, mock_backend):
         """After a real reboot SMU SRAM is zeroed — writing 0 again would be a
-        pointless hardware write (and journal churn)."""
+        pointless hardware write. The journal alone records that 0 is resident."""
         sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
         tp.save_core_state(
             db,
@@ -1892,6 +1922,7 @@ class TestNoRebootResidentOffset:
         eng = _resume_fresh(db, topo, smu, mock_backend, sid)
         assert (0, 0) not in smu.writes
         assert eng._co_applied[0] == 0
+        assert db.journal_survived_values(sid).get(0) == 0
 
 
 # ---------------------------------------------------------------------------
