@@ -384,6 +384,14 @@ class Supervisor:
                     )
                     return self.stop_on_first_failure
                 if rc not in KILLED_BY_US_CODES and now - run.started_at < STARTUP_WINDOW_SECONDS:
+                    # A fatal error the tool recorded before stopping is a
+                    # verdict, however fast it came: mprime writes it to
+                    # results.txt and exits 0 within a second at a bad offset.
+                    # Only an exit with nothing recorded is an apparatus fault.
+                    live_err = self.backend.poll_errors(run.lane.work_dir)
+                    if live_err:
+                        self._fail(run, live_err, start)
+                        return self.stop_on_first_failure
                     log.warning(
                         "Stress process for core %d exited in <%.0fs (code %d) — "
                         "binary may be missing or misconfigured",

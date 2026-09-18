@@ -205,6 +205,18 @@ class TestVerdicts:
         assert verdict.error_type == "startup"
         assert "verdict unavailable" in verdict.error_message or "at startup" in verdict.error_message
 
+    def test_an_instant_exit_with_a_recorded_error_is_a_verdict(self, tmp_path):
+        backend = FakeBackend(
+            _child("import sys; sys.exit(0)"),
+            poll_error="fake error: FATAL ERROR: Rounding was 0.5, expected less than 0.4",
+        )
+        supervisor, _, _ = make_supervisor(backend)
+        with patch.object(execution, "STARTUP_WINDOW_SECONDS", 60.0):
+            verdict = run_one(supervisor, lane(tmp_path), 1.0)
+        assert verdict is not None and not verdict.passed
+        assert verdict.error_type == "computation"
+        assert "Rounding" in verdict.error_message
+
     def test_a_parsed_failure_is_attributed(self, tmp_path):
         backend = FakeBackend(
             _child("import time; time.sleep(0.3)"),
