@@ -1415,9 +1415,14 @@ class TunerEngine(QObject):
     def _apparatus_suspect(self, core_id: int) -> bool:
         """Trip on a physically implausible fail streak and recover from evidence.
 
-        Post-fail steps only ADD voltage, so a healthy apparatus cannot fail
-        ``apparatus_failure_streak`` times in a row on one core (a broken
-        backend, stale results file, or dying disk can). Roll back to the most
+        A healthy core cannot fail at an offset it has already PASSED under the
+        same workload, nor at any less aggressive one: post-fail steps only ADD
+        voltage. ``apparatus_failure_streak`` such contradicted fails in a row
+        on one core mean the apparatus is lying (a broken backend, stale results
+        file, or dying disk can). A fail with no same-workload pass at or beyond
+        its offset is ordinary evidence and does not count: a hardening tier is
+        a different workload with a cliff of its own, and the linear backoff may
+        legitimately walk many steps before it finds it. Roll back to the most
         aggressive PROVEN pass (passes cannot be faked by a stale error file),
         clear the backoff bounds, and pause. Synthetic crash rows (duration
         NULL) are reboots, not apparatus verdicts, and do not count.
@@ -1432,9 +1437,20 @@ class TunerEngine(QObject):
             for r in tp.get_test_log(self._db, self._session_id, core_id=core_id)
             if r.get("duration_seconds") is not None
         ]
+        proven: dict[tuple[str | None, str | None, str | None], int] = {}
+        for r in rows:
+            if not r["passed"]:
+                continue
+            workload = (r.get("backend"), r.get("stress_mode"), r.get("fft_preset"))
+            best = proven.get(workload)
+            if best is None or self._is_more_aggressive(r["offset_tested"], best):
+                proven[workload] = r["offset_tested"]
         streak = 0
         for r in reversed(rows):
             if r["passed"]:
+                break
+            best = proven.get((r.get("backend"), r.get("stress_mode"), r.get("fft_preset")))
+            if best is None or self._is_more_aggressive(r["offset_tested"], best):
                 break
             streak += 1
         if streak < threshold:
@@ -1444,10 +1460,10 @@ class TunerEngine(QObject):
         rollback = self._rollback_core_to_evidence(cs)
         self.log_message.emit(
             f"APPARATUS SUSPECT: core {core_id} failed {streak} consecutive tests "
-            f"while every step ADDED voltage — implausible for healthy tooling. "
-            f"Rolled back to the most aggressive proven pass ({rollback}); backoff "
-            f"bounds cleared; the core must re-confirm. Check the stress backend, "
-            f"work directory and log, fix the cause, then Resume."
+            f"at offsets it already passed under the same workload — implausible "
+            f"for healthy tooling. Rolled back to the most aggressive proven pass "
+            f"({rollback}); backoff bounds cleared; the core must re-confirm. Check "
+            f"the stress backend, work directory and log, fix the cause, then Resume."
         )
         self.pause()
         return True

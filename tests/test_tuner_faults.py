@@ -1746,7 +1746,11 @@ class TestStartupFailureIsNotAVerdict:
 
 
 class TestApparatusBreaker:
-    def _seed(self, db, topo, smu, backend, streak_threshold=5):
+    # The workload _on_test_finished records for a core outside hardening:
+    # the session's own backend/mode/preset (TunerConfig defaults).
+    BASE = dict(backend="mprime", stress_mode="SSE", fft_preset="SMALL")
+
+    def _seed(self, db, topo, smu, backend, streak_threshold=5, **core):
         sid = tp.create_session(
             db,
             TunerConfig(cores_to_test=[0], apparatus_failure_streak=streak_threshold),
@@ -1763,33 +1767,41 @@ class TestApparatusBreaker:
         eng._session_id = sid
         cs = CoreState(
             core_id=0,
-            phase=TunerPhase.BACKOFF_PRECONFIRM,
-            current_offset=-20,
-            best_offset=-20,
-            baseline_offset=0,
-            backoff_mode=True,
+            **{
+                "phase": TunerPhase.BACKOFF_PRECONFIRM,
+                "current_offset": -20,
+                "best_offset": -20,
+                "baseline_offset": 0,
+                "backoff_mode": True,
+                **core,
+            },
         )
         eng._core_states = {0: cs}
         return eng, sid, cs
 
+    def _log(self, db, sid, offset, phase, passed, *, duration=122.0, workload=None):
+        tp.log_test_result(
+            db,
+            sid,
+            0,
+            offset,
+            phase,
+            passed,
+            error_msg=None if passed else "mprime error: FATAL ERROR",
+            error_type=None if passed else "computation",
+            duration=duration,
+            **(workload or self.BASE),
+        )
+
     def test_trips_rolls_back_to_evidence_and_pauses(self, db, topo, smu, mock_backend):
-        """The stale-results class: N consecutive FAILs while every step adds
-        voltage is physically implausible — the breaker must roll the core back
-        to its most aggressive PROVEN pass, clear poisoned bounds, and pause."""
+        """The stale-results class: N consecutive FAILs at offsets the core has
+        already passed under the same workload, while every step adds voltage,
+        is physically implausible — the breaker must roll the core back to its
+        most aggressive PROVEN pass, clear poisoned bounds, and pause."""
         eng, sid, cs = self._seed(db, topo, smu, mock_backend, streak_threshold=5)
-        tp.log_test_result(db, sid, 0, -44, "confirm", True, duration=300.0)  # proven pass
+        self._log(db, sid, -44, "confirm", True, duration=300.0)  # proven pass
         for off in (-24, -23, -22, -21):  # 4 prior fails
-            tp.log_test_result(
-                db,
-                sid,
-                0,
-                off,
-                "backoff_preconfirm",
-                False,
-                error_msg="mprime error: FATAL ERROR",
-                error_type="computation",
-                duration=122.0,
-            )
+            self._log(db, sid, off, "backoff_preconfirm", False)
 
         with patch.object(eng, "_run_next"), patch.object(eng, "_advance_core") as adv:
             # the 5th consecutive fail crosses the threshold
@@ -1806,35 +1818,79 @@ class TestApparatusBreaker:
 
     def test_below_threshold_does_not_trip(self, db, topo, smu, mock_backend):
         eng, sid, cs = self._seed(db, topo, smu, mock_backend, streak_threshold=5)
+        self._log(db, sid, -44, "confirm", True, duration=300.0)
         for off in (-24, -23):
-            tp.log_test_result(db, sid, 0, off, "backoff_preconfirm", False, error_type="computation", duration=122.0)
+            self._log(db, sid, off, "backoff_preconfirm", False)
         with patch.object(eng, "_run_next"):
             eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 122.0, 0.0)
         assert eng._status != "paused"  # normal backoff continues
 
     def test_pass_breaks_the_streak(self, db, topo, smu, mock_backend):
         eng, sid, cs = self._seed(db, topo, smu, mock_backend, streak_threshold=5)
+        self._log(db, sid, -44, "confirm", True, duration=300.0)
         for off in (-24, -23, -22):
-            tp.log_test_result(db, sid, 0, off, "backoff_preconfirm", False, error_type="computation", duration=122.0)
-        tp.log_test_result(db, sid, 0, -21, "backoff_preconfirm", True, duration=122.0)
-        for off in (-20,):
-            tp.log_test_result(db, sid, 0, off, "backoff_confirm", False, error_type="computation", duration=300.0)
+            self._log(db, sid, off, "backoff_preconfirm", False)
+        self._log(db, sid, -21, "backoff_preconfirm", True)
+        self._log(db, sid, -20, "backoff_confirm", False, duration=300.0)
         with patch.object(eng, "_run_next"):
             eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 300.0, 0.0)
         assert eng._status != "paused"  # streak is 2, not 6
 
     def test_synthetic_crash_rows_do_not_count(self, db, topo, smu, mock_backend):
         eng, sid, cs = self._seed(db, topo, smu, mock_backend, streak_threshold=3)
+        self._log(db, sid, -44, "confirm", True, duration=300.0)
         # two real fails + two synthetic reboot rows (duration NULL)
         for off in (-24, -23):
-            tp.log_test_result(db, sid, 0, off, "backoff_preconfirm", False, error_type="computation", duration=122.0)
+            self._log(db, sid, off, "backoff_preconfirm", False)
         for off in (-22, -21):
-            tp.log_test_result(db, sid, 0, off, "coarse_search", False, error_type="crash", duration=None)
+            tp.log_test_result(db, sid, 0, off, "coarse_search", False, error_type="crash", duration=None, **self.BASE)
         with patch.object(eng, "_run_next"):
             eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 122.0, 0.0)
         # real-test streak is 3 (threshold) — trips; but the point is the
         # synthetic rows alone must not have tripped it earlier: recompute
         assert eng._status == "paused"
+
+    def test_fails_beyond_the_proven_pass_are_not_contradicted(self, db, topo, smu, mock_backend):
+        """A search walking down from a pass fails at offsets MORE aggressive
+        than anything proven: that is the search working, never the breaker's
+        business. Only the fail at the pass itself starts counting."""
+        eng, sid, cs = self._seed(db, topo, smu, mock_backend, streak_threshold=3)
+        self._log(db, sid, -20, "coarse", True, duration=60.0)
+        for off in (-25, -24, -23, -22, -21):
+            self._log(db, sid, off, "fine", False, duration=60.0)
+        with patch.object(eng, "_run_next"):
+            eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 122.0, 0.0)
+        assert eng._status != "paused"  # streak is 1: the fail at -20 alone
+
+    def test_a_fresh_workload_has_nothing_to_contradict(self, db, topo, smu, mock_backend):
+        """A hardening tier is a different workload with a cliff of its own. A
+        core confirmed under SSE that fails AVX2 fourteen times walking up from
+        its confirmed offset is silicon, not apparatus: no AVX2 pass exists, so
+        nothing is contradicted and the linear backoff keeps walking."""
+        eng, sid, cs = self._seed(
+            db,
+            topo,
+            smu,
+            mock_backend,
+            streak_threshold=5,
+            phase=TunerPhase.HARDENING_T1,
+            current_offset=-14,
+            best_offset=-14,
+            backoff_mode=False,
+        )
+        tier = eng._config.hardening_tiers[0]
+        avx2 = dict(backend=tier["backend"], stress_mode=tier["stress_mode"], fft_preset=tier["fft_preset"])
+        assert avx2 != self.BASE
+        self._log(db, sid, -30, "confirm", True, duration=300.0)
+        for off in range(-28, -14):
+            self._log(db, sid, off, "hardening_t1", False, duration=1.0, workload=avx2)
+
+        with patch.object(eng, "_run_next"):
+            eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 1.0, 0.0)
+
+        assert eng._status != "paused"
+        assert cs.phase == TunerPhase.HARDENING_T1
+        assert cs.current_offset == -13  # backed off one more step, still hardening
 
 
 # ---------------------------------------------------------------------------
