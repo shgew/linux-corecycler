@@ -1792,10 +1792,11 @@ class TestHardeningTransitions:
         ]
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, hardening_tiers=tiers)
         cs = CoreState(core_id=0, phase=TunerPhase.HARDENING_T2, current_offset=-8, hardening_tier_index=1)
-        backend, mode, fft = eng._get_active_stress_config(cs)
+        backend, mode, fft, threads = eng._get_active_stress_config(cs)
         assert backend == "mprime"
         assert mode == "SSE"
         assert fft == "LARGE"
+        assert threads is None
 
     def test_start_worker_uses_tier_backend_during_hardening(self, db, simple_topology, mock_smu, mock_backend):
         """Hardening scheduler receives backend instantiated from tier backend name."""
@@ -1835,10 +1836,11 @@ class TestHardeningTransitions:
             db, simple_topology, mock_smu, mock_backend, backend="mprime", stress_mode="SSE", fft_preset="SMALL"
         )
         cs = CoreState(core_id=0, phase=TunerPhase.CONFIRMING, current_offset=-8)
-        backend, mode, fft = eng._get_active_stress_config(cs)
+        backend, mode, fft, threads = eng._get_active_stress_config(cs)
         assert backend == "mprime"
         assert mode == "SSE"
         assert fft == "SMALL"
+        assert threads is None
 
     def test_backoff_confirming_pass_enters_hardening_when_tiers(self, db, simple_topology, mock_smu, mock_backend):
         """BACKOFF_CONFIRMING pass with tiers should enter HARDENING_T1 (not CONFIRMED)."""

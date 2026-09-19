@@ -26,13 +26,27 @@ EXIT_SIGNAL = 130
 # often the Qt loop yields to Python so a pending signal handler can run.
 SETTLE_POLL_MS = 500
 
+# Fields that define what a session searched: a resumed session's saved config
+# may be replaced, but never in a way that rewrites the search it already ran.
+SEARCH_DEFINING_FIELDS = (
+    "start_offset",
+    "coarse_step",
+    "fine_step",
+    "direction",
+    "max_offset",
+    "cores_to_test",
+    "inherit_current",
+)
+
 USAGE = """\
 corecycler headless commands:
 
   corecycler doctor               report every external tool and where it resolved
-  corecycler status               list tuner sessions and their state
+  corecycler status               list tuner sessions; newest one with per-core offsets and live-evidence hours
   corecycler tune [--config F]    start a NEW tuning session and run to the end
-  corecycler resume [SESSION_ID]  resume a mid-run/paused session (newest if omitted)
+  corecycler resume [SESSION_ID [--config F]]
+                                  resume a session (newest if omitted); --config replaces its
+                                  saved settings (search fields must match)
 
 Exit codes: 0 completed, 3 paused (needs attention), 4 quarantined,
 5 refused (bad config/environment), 6 engine aborted, 7 already running,
@@ -67,17 +81,24 @@ def cli_main(argv: list[str]) -> int:
             return EXIT_REFUSED
         return cmd_run(config_path=args[1] if args else None, resume_id=None, auto_resume=False)
     if command == "resume":
-        if len(args) > 1 or any(a.startswith("-") for a in args):
-            print("corecycler resume: expected one SESSION_ID or no arguments", file=sys.stderr)
+        if not args:
+            return cmd_run(config_path=None, resume_id=None, auto_resume=True)
+        bad_shape = len(args) not in (1, 3) or args[0].startswith("-")
+        if not bad_shape and len(args) == 3:
+            bad_shape = args[1] != "--config" or args[2].startswith("-")
+        if bad_shape:
+            print("corecycler resume: expected SESSION_ID [--config FILE] or no arguments", file=sys.stderr)
             return EXIT_REFUSED
-        if args:
-            try:
-                session_id = int(args[0])
-            except ValueError:
-                print(f"corecycler resume: invalid session id {args[0]!r}", file=sys.stderr)
-                return EXIT_REFUSED
-            return cmd_run(config_path=None, resume_id=session_id, auto_resume=False)
-        return cmd_run(config_path=None, resume_id=None, auto_resume=True)
+        try:
+            session_id = int(args[0])
+        except ValueError:
+            print(f"corecycler resume: invalid session id {args[0]!r}", file=sys.stderr)
+            return EXIT_REFUSED
+        return cmd_run(
+            config_path=args[2] if len(args) == 3 else None,
+            resume_id=session_id,
+            auto_resume=False,
+        )
     print(USAGE, file=sys.stderr)
     return EXIT_REFUSED
 
@@ -114,6 +135,7 @@ def cmd_doctor() -> int:
 def cmd_status(db=None) -> int:
     from corecycler.history.db import HistoryDB
     from corecycler.tuner import persistence as tp
+    from corecycler.tuner.config import TunerConfig
 
     own_db = db is None
     if db is None:
@@ -123,13 +145,32 @@ def cmd_status(db=None) -> int:
         if not sessions:
             print("no tuner sessions")
             return EXIT_COMPLETED
-        for sess in sessions:
+        latest_states = {}
+        for index, sess in enumerate(sessions):
             states = tp.load_core_states(db, sess.id)
+            if index == 0:
+                latest_states = states
             done = sum(1 for cs in states.values() if cs.phase in ("confirmed", "hardened"))
             print(
                 f"#{sess.id}  {sess.status:<12} {done}/{len(states)} cores done  "
                 f"created {sess.created_at[:19]}  {sess.cpu_model or ''}"
             )
+        latest = sessions[0]
+        try:
+            config = TunerConfig.from_json(latest.config_json)
+        except ValueError:
+            print("  (config unreadable; no evidence summary)")
+            return EXIT_COMPLETED
+        if latest.validation_stage == 9:
+            print(
+                f"  endurance round {latest.endurance_round}, workload "
+                f"{latest.endurance_workload + 1}/{len(config.endurance_workloads)}, "
+                f"slot {latest.endurance_index}"
+            )
+        summary = tp.evidence_summary(db, latest.id, latest_states, config.direction)
+        for core_id in sorted(latest_states):
+            cs = latest_states[core_id]
+            print("  " + tp.format_evidence_line(core_id, cs.best_offset, summary.get(core_id, {})))
         return EXIT_COMPLETED
     finally:
         if own_db:
@@ -195,9 +236,12 @@ def cmd_run(
     if (resume_id is not None or auto_resume) and session is None:
         print("corecycler: no resumable session", file=sys.stderr)
         return EXIT_REFUSED
+    override = None
     try:
         if session is not None:
             config = TunerConfig.from_json(session.config_json)
+            if config_path is not None:
+                override = TunerConfig.from_json(Path(config_path).read_text())
         elif config_path is not None:
             config = TunerConfig.from_json(Path(config_path).read_text())
         else:
@@ -205,6 +249,23 @@ def cmd_run(
     except (OSError, ValueError) as e:
         print(f"corecycler: cannot read config: {e}", file=sys.stderr)
         return EXIT_REFUSED
+
+    if override is not None:
+        changed = [f for f in SEARCH_DEFINING_FIELDS if getattr(override, f) != getattr(config, f)]
+        if changed:
+            print(
+                f"corecycler: --config would change search-defining field(s) "
+                f"{', '.join(changed)} of session {session.id}; start a new "
+                f"session with 'tune' instead",
+                file=sys.stderr,
+            )
+            return EXIT_REFUSED
+        if session.status == "quarantined":
+            print("corecycler: --config cannot be applied to a quarantined session", file=sys.stderr)
+            return EXIT_REFUSED
+        tp.update_session_config(db, session.id, override.to_json())
+        print(f"corecycler: session {session.id} config replaced from {config_path}")
+        config = override
 
     if engine_factory is not None:
         engine = engine_factory(db, config)

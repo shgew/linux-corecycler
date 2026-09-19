@@ -900,6 +900,7 @@ class TunerTab(QWidget):
             5: "spectrum",
             6: "memory",
             7: "soak",
+            9: "endurance",
         }
         stage_name = stage_names.get(stage, f"stage {stage}")
         self._status_label.setText(f"Status: Validating S{stage} ({stage_name})")

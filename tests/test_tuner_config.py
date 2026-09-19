@@ -162,6 +162,46 @@ class TestNewConfigOptions:
         assert TunerConfig().hardening_tiers[-1]["profile"] == "spectrum"
 
 
+class TestEnduranceConfig:
+    """The endurance workload matrix: thread counts, knob ranges, round-trip."""
+
+    def _workload(self, **kw):
+        return {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "SMALL", **kw}
+
+    @pytest.mark.parametrize("field", ["hardening_tiers", "endurance_workloads"])
+    @pytest.mark.parametrize("threads", [True, 0, -1, "2", 1.0])
+    def test_non_positive_int_threads_rejected(self, field, threads):
+        errors = TunerConfig(**{field: [self._workload(threads=threads)]}).validate()
+        assert any(f"{field}[0].threads must be a positive integer" == e for e in errors)
+
+    @pytest.mark.parametrize("field", ["hardening_tiers", "endurance_workloads"])
+    def test_positive_int_threads_accepted(self, field):
+        assert TunerConfig(**{field: [self._workload(threads=2)]}).validate() == []
+
+    def test_endurance_requires_auto_validate(self):
+        errors = TunerConfig(endurance=True, auto_validate=False).validate()
+        assert "endurance requires auto_validate" in errors
+
+    def test_endurance_requires_a_workload(self):
+        errors = TunerConfig(endurance=True, endurance_workloads=[]).validate()
+        assert "endurance requires at least one endurance_workloads entry" in errors
+
+    def test_slot_bounds_are_ordered_and_capped(self):
+        assert any("endurance_slot_seconds must be" in e for e in TunerConfig(endurance_slot_seconds=30).validate())
+        errors = TunerConfig(endurance_slot_seconds=1200, endurance_slot_max_seconds=600).validate()
+        assert any("endurance_slot_max_seconds must be" in e for e in errors)
+        assert any("endurance_slot_max_seconds" in e for e in TunerConfig(endurance_slot_max_seconds=20000).validate())
+
+    def test_endurance_json_roundtrip(self):
+        cfg = TunerConfig(endurance=True)
+        restored = TunerConfig.from_json(cfg.to_json())
+        assert restored.endurance is True
+        assert restored.endurance_workloads == cfg.endurance_workloads
+        assert restored.endurance_workloads[0]["threads"] == 2
+        assert restored.endurance_slot_seconds == 600
+        assert restored.endurance_slot_max_seconds == 3600
+
+
 class TestConfigValidationFailsClosed:
     """Invalid configs must be rejected (fail closed). A step size < 1 would make
     the search advance by 0 and loop forever, so it must never validate."""

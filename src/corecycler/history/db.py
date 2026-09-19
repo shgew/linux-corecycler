@@ -162,7 +162,7 @@ class TelemetrySample:
 class HistoryDB:
     """Crash-safe SQLite database for test run history."""
 
-    SCHEMA_VERSION = 15
+    SCHEMA_VERSION = 16
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
@@ -336,7 +336,10 @@ CREATE TABLE IF NOT EXISTS tuner_sessions (
     validation_index    INTEGER NOT NULL DEFAULT 0,
     validation_half     INTEGER NOT NULL DEFAULT 0,
     validation_dirty    INTEGER NOT NULL DEFAULT 0,
-    validation_requeue  TEXT    NOT NULL DEFAULT '[]'
+    validation_requeue  TEXT    NOT NULL DEFAULT '[]',
+    endurance_round     INTEGER NOT NULL DEFAULT 0,
+    endurance_workload  INTEGER NOT NULL DEFAULT 0,
+    endurance_index     INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS tuner_core_states (
@@ -378,7 +381,9 @@ CREATE TABLE IF NOT EXISTS tuner_test_log (
     stress_mode         TEXT,
     fft_preset          TEXT,
     tested_at           TEXT    NOT NULL,
-    peak_stretch_pct    REAL
+    peak_stretch_pct    REAL,
+    threads             INTEGER,
+    profile             TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tuner_log_session ON tuner_test_log(session_id, core_id);
 
@@ -674,6 +679,23 @@ CREATE TABLE IF NOT EXISTS tuner_events (
 CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
 """
 
+    # v15 -> v16: perpetual endurance validation. The session-level cursor
+    # (round, workload, slot) survives a reboot, and every test row records
+    # the thread count and load profile it actually ran so the per-core
+    # evidence ledger can be read back per workload.
+    @staticmethod
+    def _migrate_v16(conn: sqlite3.Connection) -> None:
+        HistoryDB._add_columns(
+            conn,
+            "tuner_sessions",
+            [
+                ("endurance_round", "INTEGER NOT NULL DEFAULT 0"),
+                ("endurance_workload", "INTEGER NOT NULL DEFAULT 0"),
+                ("endurance_index", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )
+        HistoryDB._add_columns(conn, "tuner_test_log", [("threads", "INTEGER"), ("profile", "TEXT")])
+
     _MIGRATIONS: dict[int, str | callable] = {
         2: _migrate_v2,
         3: _DDL_MIGRATE_V3,
@@ -689,6 +711,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         13: _migrate_v13,
         14: _migrate_v14,
         15: _DDL_MIGRATE_V15,
+        16: _migrate_v16,
     }
 
     # ------------------------------------------------------------------
@@ -1353,6 +1376,21 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             (stage, index, half, int(dirty), requeue_json, self._now_iso(), session_id),
         )
 
+    def set_endurance_position(self, session_id: int, round_: int, workload: int, index: int) -> None:
+        """Persist the endurance cursor before every slot, so a reboot mid-slot
+        resumes the same round and workload instead of restarting endurance."""
+        self.__conn.execute(
+            "UPDATE tuner_sessions SET endurance_round=?, endurance_workload=?, "
+            "endurance_index=?, updated_at=? WHERE id=?",
+            (round_, workload, index, self._now_iso(), session_id),
+        )
+
+    def update_tuner_session_config(self, session_id: int, config_json: str) -> None:
+        self.__conn.execute(
+            "UPDATE tuner_sessions SET config_json=?, updated_at=? WHERE id=?",
+            (config_json, self._now_iso(), session_id),
+        )
+
     def insert_tuner_event(self, session_id: int, message: str, boot_id: str = "", severity: str = "info") -> None:
         self.__conn.execute(
             "INSERT INTO tuner_events (session_id, timestamp, boot_id, severity, message) VALUES (?,?,?,?,?)",
@@ -1537,14 +1575,17 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         stress_mode: str | None = None,
         fft_preset: str | None = None,
         peak_stretch_pct: float | None = None,
+        threads: int | None = None,
+        profile: str | None = None,
     ) -> int:
         cur = self.__conn.execute(
             """\
             INSERT INTO tuner_test_log
                 (session_id, core_id, offset_tested, phase, passed,
                  error_message, error_type, duration_seconds, run_id,
-                 backend, stress_mode, fft_preset, tested_at, peak_stretch_pct)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 backend, stress_mode, fft_preset, tested_at, peak_stretch_pct,
+                 threads, profile)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 session_id,
@@ -1561,6 +1602,8 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                 fft_preset,
                 self._now_iso(),
                 peak_stretch_pct,
+                threads,
+                profile,
             ),
         )
         return cur.lastrowid
@@ -1627,6 +1670,9 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             validation_half=row["validation_half"] or 0,
             validation_dirty=bool(row["validation_dirty"]),
             validation_requeue=row["validation_requeue"] or "[]",
+            endurance_round=row["endurance_round"] or 0,
+            endurance_workload=row["endurance_workload"] or 0,
+            endurance_index=row["endurance_index"] or 0,
         )
 
     def _execute_raw(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
@@ -1717,6 +1763,8 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                 "fft_preset",
                 "tested_at",
                 "peak_stretch_pct",
+                "threads",
+                "profile",
             ),
             {"session_id": "tuner_sessions", "run_id": "runs"},
         ),
@@ -1843,6 +1891,9 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                     "validation_half",
                     "validation_dirty",
                     "validation_requeue",
+                    "endurance_round",
+                    "endurance_workload",
+                    "endurance_index",
                 ),
             )
             counts["tuner_sessions"] = len(maps["tuner_sessions"])

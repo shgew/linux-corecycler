@@ -165,6 +165,40 @@ class TestStatus:
         assert "paused" in out
         assert "1/2 cores done" in out
 
+    def test_reports_live_evidence_and_the_endurance_cursor(self, db, capsys):
+        sid = tp.create_session(db, TunerConfig(endurance=True), "", "")
+        tp.save_core_state(
+            db,
+            sid,
+            CoreState(
+                core_id=0,
+                phase=TunerPhase.HARDENED,
+                current_offset=-40,
+                best_offset=-40,
+                baseline_offset=0,
+            ),
+        )
+        tp.log_test_result(
+            db, sid, 0, -41, "endurance", True, duration=1200.0,
+            backend="mprime", stress_mode="AVX2", fft_preset="SMALL", threads=2,
+        )
+        tp.set_validation_position(db, sid, 9, 0, 0, False, "[]")
+        tp.set_endurance_position(db, sid, 0, 0, 1)
+
+        assert cli.cmd_status(db=db) == cli.EXIT_COMPLETED
+        out = capsys.readouterr().out
+        assert "endurance round 0, workload 1/5, slot 1" in out
+        assert "core 0 @ -40: 0.3h live evidence (mprime AVX2 SMALL 2T 0.3h)" in out
+
+    def test_an_unreadable_config_still_lists_sessions(self, db, capsys):
+        sid = tp.create_session(db, TunerConfig(), "", "")
+        tp.update_session_config(db, sid, '{"fine_step": 0}')
+
+        assert cli.cmd_status(db=db) == cli.EXIT_COMPLETED
+        out = capsys.readouterr().out
+        assert f"#{sid}" in out
+        assert "config unreadable" in out
+
 
 class TestRunOutcomes:
     def _run(self, db, behavior, **kw):
@@ -247,6 +281,79 @@ class TestRunOutcomes:
             assert code == cli.EXIT_LOCKED
         finally:
             held.unlock()
+
+
+class TestResumeConfigOverride:
+    """`resume ID --config F` replaces a session's saved settings, but never
+    the fields that define the search it already ran."""
+
+    def _cfg_file(self, tmp_path, **kw):
+        path = tmp_path / "override.json"
+        path.write_text(TunerConfig(**kw).to_json())
+        return str(path)
+
+    def _completed_session(self, db, **kw):
+        sid = tp.create_session(db, TunerConfig(**kw), "", "")
+        tp.update_session_status(db, sid, "completed")
+        return sid
+
+    @pytest.mark.parametrize("args", [
+        ["resume", "--config", "f.json"], ["resume", "7", "f.json"],
+        ["resume", "7", "--config"], ["resume", "7", "--config", "--help"],
+        ["resume", "--config", "7", "f.json"],
+    ])
+    def test_malformed_invocations_never_start_tuning(self, args, monkeypatch):
+        monkeypatch.setattr(cli, "cmd_run", lambda **kw: pytest.fail("invalid arguments started tuning"))
+        assert cli.cli_main(args) == cli.EXIT_REFUSED
+
+    def test_the_flag_reaches_cmd_run(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(cli, "cmd_run", lambda **kw: seen.update(kw) or cli.EXIT_COMPLETED)
+        assert cli.cli_main(["resume", "7", "--config", "f.json"]) == cli.EXIT_COMPLETED
+        assert seen == {"config_path": "f.json", "resume_id": 7, "auto_resume": False}
+
+    def test_a_compatible_override_replaces_the_saved_config(self, db, tmp_path):
+        sid = self._completed_session(db)
+        made = []
+
+        def factory(_db, cfg):
+            made.append(cfg)
+            return FakeEngine("completes")
+
+        code = cli.cmd_run(self._cfg_file(tmp_path, endurance=True), sid, False, engine_factory=factory, db=db)
+
+        assert code == cli.EXIT_COMPLETED
+        assert TunerConfig.from_json(tp.get_session(db, sid).config_json).endurance is True
+        assert made[0].endurance is True  # the engine runs the replacement, not the stale config
+
+    def test_a_search_defining_change_is_refused(self, db, tmp_path, capsys):
+        sid = self._completed_session(db)
+        before = tp.get_session(db, sid).config_json
+        code = cli.cmd_run(
+            self._cfg_file(tmp_path, fine_step=2, endurance=True),
+            sid,
+            False,
+            engine_factory=lambda *_: pytest.fail("a refused override reached the engine"),
+            db=db,
+        )
+        assert code == cli.EXIT_REFUSED
+        assert tp.get_session(db, sid).config_json == before
+        assert "fine_step" in capsys.readouterr().err
+
+    def test_a_quarantined_session_is_refused(self, db, tmp_path, capsys):
+        sid = self._completed_session(db)
+        tp.update_session_status(db, sid, "quarantined")
+        before = tp.get_session(db, sid).config_json
+        code = cli.cmd_run(
+            self._cfg_file(tmp_path, endurance=True),
+            sid,
+            False,
+            engine_factory=lambda *_: pytest.fail("a quarantined session reached the engine"),
+            db=db,
+        )
+        assert code == cli.EXIT_REFUSED
+        assert tp.get_session(db, sid).config_json == before
+        assert "quarantined" in capsys.readouterr().err
 
 
 class TestBuildSmu:

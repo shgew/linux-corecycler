@@ -309,7 +309,12 @@ class TestSchemaV11:
             ("tuner_sessions", "validation_half"),
             ("tuner_sessions", "validation_dirty"),
             ("tuner_sessions", "validation_requeue"),
+            ("tuner_sessions", "endurance_round"),
+            ("tuner_sessions", "endurance_workload"),
+            ("tuner_sessions", "endurance_index"),
             ("tuner_test_log", "peak_stretch_pct"),
+            ("tuner_test_log", "threads"),
+            ("tuner_test_log", "profile"),
         ):
             db._execute_raw(f"ALTER TABLE {table} DROP COLUMN {column}")
         db.close()
@@ -321,6 +326,12 @@ class TestSchemaV11:
             assert (0, -25) in db2.journal_suspects(sid)
             db2.set_resume_crash_streak(sid, 2)
             assert db2.get_resume_crash_streak(sid) == 2
+            db2.set_endurance_position(sid, 3, 2, 5)
+            restored = db2.get_tuner_session(sid)
+            assert (restored.endurance_round, restored.endurance_workload, restored.endurance_index) == (3, 2, 5)
+            db2.insert_tuner_test_log(sid, 0, -30, "endurance", True, threads=2, profile="spectrum")
+            row = db2.get_tuner_test_log(sid)[-1]
+            assert (row["threads"], row["profile"]) == (2, "spectrum")
         finally:
             db2.close()
 

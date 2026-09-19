@@ -80,3 +80,8 @@ class TunerSession:
     validation_half: int = 0
     validation_dirty: bool = False
     validation_requeue: str = "[]"  # JSON list of cores owing a solo re-test
+    # Endurance cursor (validation stage 9): round number, index into
+    # endurance_workloads, and slot index within the round's workload.
+    endurance_round: int = 0
+    endurance_workload: int = 0
+    endurance_index: int = 0

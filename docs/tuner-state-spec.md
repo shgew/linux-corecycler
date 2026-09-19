@@ -100,3 +100,15 @@ leaving validation. Resuming preserves that debt even when loading an older
 cursor snapshot. Explicit Validate Profile first reconfirms each core and then
 runs the configured staged validation; it cannot skip stages just because the
 UI already reports validating.
+
+Endurance (`TunerConfig.endurance`) is validation stage 9: a session-level,
+perpetual confirmation loop entered instead of completion once a clean staged
+pass finishes. It changes no per-core transition - cores stay `HARDENED` and
+the chart above holds. Each round runs, per configured workload, one solo slot
+per core with every offset live followed by one all-core slot, with slot length
+doubling each round up to `endurance_slot_max_seconds`. A solo-slot failure is
+`_backoff_core` by one fine step and a retry of the same slot; an all-core-slot
+failure backs off the reported lane, re-tests it solo, then reruns the slot.
+Crash attribution treats stage 9 exactly like any other validation stage: the
+isolated hunt runs and nobody is convicted by guess. `unattributed_crashes`
+resets to 0 after every round that completed with no back-off.

@@ -24,6 +24,20 @@ def _json_value_ok(default: object, value: object) -> bool:
     return value is None or isinstance(value, list)
 
 
+def _workload_errors(name: str, i: int, item: object) -> list[str]:
+    """Validate one workload/tier dict shared by hardening_tiers and endurance_workloads."""
+    if not isinstance(item, dict):
+        return [f"{name}[{i}] must be a dict"]
+    if not all(isinstance(item.get(k), str) for k in ("backend", "stress_mode", "fft_preset")):
+        return [f"{name}[{i}] requires string backend, stress_mode, fft_preset"]
+    if item.get("profile") not in (None, "sustained", "spectrum"):
+        return [f"{name}[{i}].profile must be sustained or spectrum"]
+    threads = item.get("threads")
+    if not (threads is None or (type(threads) is int and threads >= 1)):
+        return [f"{name}[{i}].threads must be a positive integer"]
+    return []
+
+
 @dataclass(slots=True)
 class TunerConfig:
     """Configuration for the automated PBO Curve Optimizer tuner.
@@ -113,7 +127,7 @@ class TunerConfig:
     # Multi-mode hardening tiers (run after confirmation)
     # profile "spectrum" runs the tier as light-load coverage (bursts,
     # transitions, idle watch) instead of sustained stress.
-    hardening_tiers: list[dict[str, str]] = dataclasses.field(
+    hardening_tiers: list[dict[str, str | int]] = dataclasses.field(
         default_factory=lambda: [
             {"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL"},
             {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "LARGE"},
@@ -146,6 +160,23 @@ class TunerConfig:
     # used normally. Zero events = DONE.
     validate_soak: bool = True
     soak_duration_seconds: int = 1800
+
+    # Perpetual endurance after a clean validation pass: rounds of per-core and
+    # all-core slots over endurance_workloads, slot length doubling each round
+    # from endurance_slot_seconds up to endurance_slot_max_seconds. Never
+    # completes; a failing slot backs its core off one fine_step.
+    endurance: bool = False
+    endurance_workloads: list[dict[str, str | int]] = dataclasses.field(
+        default_factory=lambda: [
+            {"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL", "threads": 2},
+            {"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL", "threads": 1},
+            {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "SMALL", "threads": 1},
+            {"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "LARGE", "threads": 2},
+            {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "SMALL", "profile": "spectrum"},
+        ]
+    )
+    endurance_slot_seconds: int = 600
+    endurance_slot_max_seconds: int = 3600
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), separators=(",", ":"))
@@ -215,12 +246,17 @@ class TunerConfig:
         if not 1800 <= self.max_core_time_seconds <= 14400:
             errors.append("max_core_time_seconds must be 1800-14400")
         for i, tier in enumerate(self.hardening_tiers):
-            if not isinstance(tier, dict):
-                errors.append(f"hardening_tiers[{i}] must be a dict")
-            elif not all(isinstance(tier.get(k), str) for k in ("backend", "stress_mode", "fft_preset")):
-                errors.append(f"hardening_tiers[{i}] requires string backend, stress_mode, fft_preset")
-            elif tier.get("profile") not in (None, "sustained", "spectrum"):
-                errors.append(f"hardening_tiers[{i}].profile must be sustained or spectrum")
+            errors.extend(_workload_errors("hardening_tiers", i, tier))
+        for i, workload in enumerate(self.endurance_workloads):
+            errors.extend(_workload_errors("endurance_workloads", i, workload))
+        if self.endurance and not self.auto_validate:
+            errors.append("endurance requires auto_validate")
+        if self.endurance and not self.endurance_workloads:
+            errors.append("endurance requires at least one endurance_workloads entry")
+        if not 60 <= self.endurance_slot_seconds <= 14400:
+            errors.append("endurance_slot_seconds must be 60-14400")
+        if not self.endurance_slot_seconds <= self.endurance_slot_max_seconds <= 14400:
+            errors.append("endurance_slot_max_seconds must be endurance_slot_seconds-14400")
         if not 60 <= self.max_temperature_c <= 110:
             errors.append(f"max_temperature_c must be 60-110, got {self.max_temperature_c}")
         if self.over_temp_grace_seconds < 0:

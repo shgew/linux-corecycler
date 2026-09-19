@@ -152,6 +152,15 @@ def set_validation_position(
     db.set_validation_position(session_id, stage, index, half, dirty, requeue_json)
 
 
+def set_endurance_position(db: HistoryDB, session_id: int, round_: int, workload: int, index: int) -> None:
+    """Persist the endurance cursor so a reboot mid-round resumes in place."""
+    db.set_endurance_position(session_id, round_, workload, index)
+
+
+def update_session_config(db: HistoryDB, session_id: int, config_json: str) -> None:
+    db.update_tuner_session_config(session_id, config_json)
+
+
 # ---------------------------------------------------------------------------
 # Test log
 # ---------------------------------------------------------------------------
@@ -172,6 +181,8 @@ def log_test_result(
     stress_mode: str | None = None,
     fft_preset: str | None = None,
     peak_stretch_pct: float | None = None,
+    threads: int | None = None,
+    profile: str | None = None,
 ) -> int:
     return db.insert_tuner_test_log(
         session_id,
@@ -187,6 +198,8 @@ def log_test_result(
         stress_mode=stress_mode,
         fft_preset=fft_preset,
         peak_stretch_pct=peak_stretch_pct,
+        threads=threads,
+        profile=profile,
     )
 
 
@@ -202,3 +215,69 @@ def get_best_profile(db: HistoryDB, session_id: int) -> dict[int, int]:
 def get_session_offsets(db: HistoryDB, session_id: int) -> dict[int, int]:
     """Return {core_id: best_offset} for every core with a value, any phase."""
     return db.get_tuner_session_offsets(session_id)
+
+
+# ---------------------------------------------------------------------------
+# Live-evidence ledger
+# ---------------------------------------------------------------------------
+
+# Only all-offsets-live phases count as evidence. Isolation-mode search,
+# hardening and hunt slots run with every other core at stock, which holds the
+# shared VDDCR rail high and overstates what the profile survives in use.
+LIVE_EVIDENCE_PHASES = frozenset(
+    {"validate_s1", "validate_s2", "validate_s3", "validate_s5", "validate_s6", "endurance"}
+)
+
+
+def workload_label(
+    backend: str | None,
+    stress_mode: str | None,
+    fft_preset: str | None,
+    threads: int | None = None,
+    profile: str | None = None,
+) -> str:
+    label = f"{backend} {stress_mode} {fft_preset}"
+    if threads:
+        label += f" {threads}T"
+    if profile == "spectrum":
+        label += " spectrum"
+    elif profile == "transitions":
+        label += " transitions"
+    return label
+
+
+def evidence_summary(
+    db: HistoryDB,
+    session_id: int,
+    core_states: dict[int, CoreState],
+    direction: int,
+) -> dict[int, dict[str, float]]:
+    """Per-core, per-workload seconds of passing all-offsets-live evidence at
+    an offset at least as aggressive as the core's current best."""
+    summary: dict[int, dict[str, float]] = {}
+    for row in get_test_log(db, session_id):
+        cs = core_states.get(row["core_id"])
+        duration = row["duration_seconds"]
+        if cs is None or not row["passed"] or not isinstance(duration, (int, float)):
+            continue
+        if row["phase"] not in LIVE_EVIDENCE_PHASES:
+            continue
+        best = cs.best_offset if cs.best_offset is not None else cs.baseline_offset
+        if direction * row["offset_tested"] < direction * best:
+            continue
+        label = workload_label(
+            row["backend"], row["stress_mode"], row["fft_preset"], row["threads"], row["profile"]
+        )
+        per_label = summary.setdefault(cs.core_id, {})
+        per_label[label] = per_label.get(label, 0.0) + float(duration)
+    return summary
+
+
+def format_evidence_line(core_id: int, offset: int | None, per_label: dict[str, float]) -> str:
+    total = sum(per_label.values()) / 3600
+    line = f"core {core_id} @ {'n/a' if offset is None else offset}: {total:.1f}h live evidence"
+    if not per_label:
+        return line + " (none yet)"
+    ranked = sorted(per_label.items(), key=lambda kv: -kv[1])
+    parts = ", ".join(f"{label} {seconds / 3600:.1f}h" for label, seconds in ranked)
+    return f"{line} ({parts})"

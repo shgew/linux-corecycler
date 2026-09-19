@@ -501,6 +501,13 @@ class TunerEngine(QObject):
         self._validation_requeue: list[int] = []
         self._in_requeue = False
 
+        # Endurance (validation stage 9): perpetual rounds of per-core and
+        # all-core slots over the configured workload matrix.
+        self._endurance_round = 0
+        self._endurance_workload = 0
+        self._endurance_index = 0
+        self._worker_profile = "sustained"
+
         # Crash hunt: when a hard crash cannot be attributed by evidence, the
         # engine runs isolated per-core hunt slots instead of guessing.
         self._hunting = False
@@ -659,6 +666,9 @@ class TunerEngine(QObject):
         self._validation_stage = 0
         self._validation_dirty = False
         self._validation_requeue = []
+        self._endurance_round = 0
+        self._endurance_workload = 0
+        self._endurance_index = 0
         self._in_requeue = False
         self._hunting = False
         self._hunt_queue = []
@@ -1006,12 +1016,24 @@ class TunerEngine(QObject):
     # State machine
     # ------------------------------------------------------------------
 
-    def _get_active_stress_config(self, cs: CoreState) -> tuple[str, str, str]:
-        """Return (backend, stress_mode, fft_preset) for the current core's phase."""
+    def _get_active_stress_config(self, cs: CoreState) -> tuple[str, str, str, int | None]:
+        """Return (backend, stress_mode, fft_preset, threads) for the active slot.
+
+        ``threads`` None means every SMT sibling of the core.
+        """
+        if self._validation_stage == 9 and not self._in_requeue:
+            wl = self._config.endurance_workloads[self._endurance_workload]
+            return wl["backend"], wl["stress_mode"], wl["fft_preset"], wl.get("threads")
         if cs.phase in (TunerPhase.HARDENING_T1, TunerPhase.HARDENING_T2):
             tier = self._config.hardening_tiers[cs.hardening_tier_index]
-            return tier["backend"], tier["stress_mode"], tier["fft_preset"]
-        return self._config.backend, self._config.stress_mode, self._config.fft_preset
+            return tier["backend"], tier["stress_mode"], tier["fft_preset"], tier.get("threads")
+        return self._config.backend, self._config.stress_mode, self._config.fft_preset, None
+
+    def _threads_for(self, core_id: int, requested: int | None) -> int:
+        """Clamp a workload's requested thread count to the core's SMT width."""
+        core_info = self._topology.cores.get(core_id)
+        n = max(1, len(core_info.logical_cpus) if core_info else 1)
+        return n if requested is None else max(1, min(requested, n))
 
     def _get_backend_for_name(self, name: str) -> StressBackend:
         """Return the injected primary backend or instantiate a named tier backend."""
@@ -2423,11 +2445,12 @@ class TunerEngine(QObject):
             return
 
         cs = self._core_states.get(core_id)
-        backend_name, stress_mode_str, fft_preset_str = (
+        backend_name, stress_mode_str, fft_preset_str, requested_threads = (
             self._get_active_stress_config(cs)
             if cs is not None
-            else (self._config.backend, self._config.stress_mode, self._config.fft_preset)
+            else (self._config.backend, self._config.stress_mode, self._config.fft_preset, None)
         )
+        self._worker_profile = "spectrum" if spectrum else "sustained"
         from corecycler.engine.backends.base import FFTPreset, StressMode
 
         try:
@@ -2442,7 +2465,7 @@ class TunerEngine(QObject):
         stress_config = StressConfig(
             mode=_stress_mode,
             fft_preset=_fft_preset,
-            threads=len(core_info.logical_cpus),
+            threads=self._threads_for(core_id, requested_threads),
         )
         scheduler_config = SchedulerConfig(
             seconds_per_core=duration,
@@ -2645,6 +2668,8 @@ class TunerEngine(QObject):
         }
         if self._hunting:
             log_phase = "hunt"
+        elif self._status == "validating" and self._validation_stage == 9:
+            log_phase = "endurance"
         elif self._status == "validating" and self._validation_stage > 0:
             log_phase = f"validate_s{self._validation_stage}"
         else:
@@ -2653,7 +2678,7 @@ class TunerEngine(QObject):
         # Log to DB (soak is a session-level watch, not one core's test — its
         # record is the narrative plus any mce_evidence rows)
         if self._session_id and not self._soaking:
-            backend, stress_mode, fft_preset = self._get_active_stress_config(cs)
+            backend, stress_mode, fft_preset, requested_threads = self._get_active_stress_config(cs)
             tp.log_test_result(
                 self._db,
                 self._session_id,
@@ -2668,9 +2693,11 @@ class TunerEngine(QObject):
                 stress_mode=stress_mode,
                 fft_preset=fft_preset,
                 peak_stretch_pct=peak_stretch_pct if peak_stretch_pct > 0 else None,
+                threads=self._threads_for(core_id, requested_threads),
+                profile=self._worker_profile,
             )
 
-        if results_json and self._session_id and self._validation_stage in (2, 3, 6):
+        if results_json and self._session_id and self._validation_stage in (2, 3, 6, 9):
             self._log_parallel_rows(core_id, results_json, log_phase)
 
         status_str = "PASS" if passed else "FAIL"
@@ -2793,10 +2820,8 @@ class TunerEngine(QObject):
             return
         if not isinstance(entries, list):
             return
-        backend, stress_mode, fft_preset = (
-            self._config.backend,
-            self._config.stress_mode,
-            self._config.fft_preset,
+        backend, stress_mode, fft_preset, requested_threads = self._get_active_stress_config(
+            self._core_states[reported]
         )
         for e in entries:
             if not isinstance(e, dict):
@@ -2824,6 +2849,8 @@ class TunerEngine(QObject):
                 backend=backend,
                 stress_mode=stress_mode,
                 fft_preset=fft_preset,
+                threads=self._threads_for(core, requested_threads),
+                profile="sustained",
             )
 
     def _handle_thermal_abort(self, core_id: int, cs: CoreState, duration: float) -> None:
@@ -3099,7 +3126,14 @@ class TunerEngine(QObject):
         if resume_from is not None and resume_from.validation_stage > 0:
             # Clamp below the terminal soak (7) and finalize sentinel (8): a
             # resume re-runs synthetic stages, never lands straight in the soak.
-            self._validation_stage = min(resume_from.validation_stage, 6)
+            # Endurance (9) is its own perpetual stage and resumes in place.
+            stage = resume_from.validation_stage
+            self._validation_stage = 9 if stage == 9 else min(stage, 6)
+            self._endurance_round = max(0, resume_from.endurance_round)
+            self._endurance_workload = max(
+                0, min(resume_from.endurance_workload, len(self._config.endurance_workloads))
+            )
+            self._endurance_index = max(0, min(resume_from.endurance_index, len(self._validation_core_order)))
             self._validation_core_index = max(0, min(resume_from.validation_index, len(self._validation_core_order)))
             self._validation_half_index = max(0, min(resume_from.validation_half, len(self._validation_halves)))
             self._validation_dirty = self._validation_dirty or resume_from.validation_dirty
@@ -3118,6 +3152,7 @@ class TunerEngine(QObject):
                 f"(position preserved; {len(requeue)} core(s) owe a solo re-test)"
             )
             self._save_validation_pos()
+            self._save_endurance_pos()
             if requeue:
                 self._run_validation_requeue()
             else:
@@ -3129,6 +3164,10 @@ class TunerEngine(QObject):
         self._validation_stage = 1
         self._validation_dirty = False
         self._validation_requeue = []
+        self._endurance_round = 0
+        self._endurance_workload = 0
+        self._endurance_index = 0
+        self._save_endurance_pos()
         self.log_message.emit("Validation stage 1: per-core with all offsets live")
         self.validation_progress.emit(1, 0, len(self._validation_core_order))
         self._save_validation_pos()
@@ -3158,8 +3197,9 @@ class TunerEngine(QObject):
         )
 
     def _has_stage1_pass_at_current_best(self, core_id: int) -> bool:
-        """True when the test log holds a real stage-1 pass at the core's
-        CURRENT best offset — the evidence a solo re-test would reproduce."""
+        """True when the test log holds a real all-offsets-live solo pass at the
+        core's CURRENT best offset — the evidence a solo re-test would reproduce.
+        Endurance slots run with every offset live too, so they count."""
         if self._session_id is None:
             return False
         cs = self._core_states.get(core_id)
@@ -3167,7 +3207,7 @@ class TunerEngine(QObject):
             return False
         for r in tp.get_test_log(self._db, self._session_id, core_id=core_id):
             if (
-                r.get("phase") == "validate_s1"
+                r.get("phase") in ("validate_s1", "endurance")
                 and r.get("passed")
                 and r.get("offset_tested") == cs.best_offset
                 and r.get("duration_seconds") is not None
@@ -3287,6 +3327,7 @@ class TunerEngine(QObject):
             self._fail_test_async(cores[0], str(e))
             return
 
+        self._worker_profile = "transitions"
         self._last_tested_core = cores[0]
         self._mark_cores_under_stress(cores)
         core_info = self._topology.cores.get(cores[0])
@@ -3348,6 +3389,8 @@ class TunerEngine(QObject):
                     self._validation_stage = 8
                     self._save_validation_pos()
                     QTimer.singleShot(0, self._run_validation_next)
+            case 9:
+                self._run_endurance_next()
             case _:
                 # All stages complete. If any back-off happened along the way,
                 # the profile changed mid-pass — run ONE final complete pass
@@ -3372,6 +3415,9 @@ class TunerEngine(QObject):
                 self.log_message.emit("All validation stages passed in one clean pass")
                 self._validation_core_index = 0
                 self._validation_half_index = 0
+                if self._config.endurance:
+                    self._enter_endurance()
+                    return
                 self._finalize_session(profile)
 
     def _run_validation_stage1(self) -> None:
@@ -3423,6 +3469,124 @@ class TunerEngine(QObject):
         self._last_tested_core = cores[0]
         self._mark_cores_under_stress(cores)
         self._start_multi_core_worker(cores, self._config.validate_duration_seconds)
+
+    # ------------------------------------------------------------------
+    # Endurance (validation stage 9): perpetual confirmation of the live profile
+    # ------------------------------------------------------------------
+
+    def _enter_endurance(self) -> None:
+        """Replace completion with an endless confirmation loop over the
+        configured workload matrix. Cores stay HARDENED; a failing slot backs
+        its core off one fine step, exactly like any other validation stage."""
+        self._validation_stage = 9
+        self._endurance_round = 0
+        self._endurance_workload = 0
+        self._endurance_index = 0
+        self._validation_dirty = False
+        if self._session_id:
+            # The clean pass just proved the profile; stale unexplained
+            # incidents must not haunt the next resume (mirrors finalize).
+            tp.set_unattributed_crashes(self._db, self._session_id, 0)
+        self._save_validation_pos()
+        self._save_endurance_pos()
+        self.log_message.emit(
+            f"All validation stages passed - entering endurance: "
+            f"{len(self._config.endurance_workloads)} workload(s), "
+            f"{self._config.endurance_slot_seconds}s slots doubling each round up to "
+            f"{self._config.endurance_slot_max_seconds}s. Runs until stopped; "
+            f"'corecycler status' shows accumulated evidence."
+        )
+        QTimer.singleShot(0, self._run_validation_next)
+
+    def _save_endurance_pos(self) -> None:
+        if self._session_id is None:
+            return
+        tp.set_endurance_position(
+            self._db,
+            self._session_id,
+            self._endurance_round,
+            self._endurance_workload,
+            self._endurance_index,
+        )
+
+    def _endurance_duration(self) -> int:
+        """Slot length for the current round: doubles each round, capped."""
+        grown = self._config.endurance_slot_seconds * 2 ** min(self._endurance_round, 20)
+        return min(grown, self._config.endurance_slot_max_seconds)
+
+    def _run_endurance_next(self) -> None:
+        """Run the next endurance slot: one solo slot per core (all offsets
+        live), then one all-core slot, per workload, per round."""
+        workloads = self._config.endurance_workloads
+        if self._endurance_workload >= len(workloads):
+            self._finish_endurance_round()
+            return
+
+        order = self._validation_core_order
+        wl = workloads[self._endurance_workload]
+        spectrum = wl.get("profile") == "spectrum"
+        duration = self._endurance_duration()
+        label = tp.workload_label(
+            wl["backend"], wl["stress_mode"], wl["fft_preset"], wl.get("threads"), wl.get("profile")
+        )
+        slots = len(order) + (0 if spectrum else 1)
+        prefix = f"Endurance r{self._endurance_round} {self._endurance_workload + 1}/{len(workloads)} {label}"
+
+        if self._endurance_index < len(order):
+            core_id = order[self._endurance_index]
+            cs = self._core_states[core_id]
+            offset = cs.best_offset if cs.best_offset is not None else cs.baseline_offset
+            self.log_message.emit(f"{prefix}: core {core_id} at {offset} for {duration}s (all offsets live)")
+            self.validation_progress.emit(9, self._endurance_index, slots)
+            if self._smu is not None and not self._apply_validation_offsets(core_id, offset):
+                return
+            self._last_tested_core = core_id
+            self._mark_cores_under_stress([core_id])
+            self._start_worker(core_id, duration, spectrum=spectrum)
+            return
+
+        if self._endurance_index == len(order) and not spectrum:
+            self.log_message.emit(f"{prefix}: all {len(order)} cores for {duration}s")
+            self.validation_progress.emit(9, len(order), slots)
+            if self._smu is not None:
+                first_core = order[0]
+                cs = self._core_states[first_core]
+                offset = cs.best_offset if cs.best_offset is not None else cs.baseline_offset
+                if not self._apply_validation_offsets(first_core, offset):
+                    return
+            self._last_tested_core = order[0]
+            self._mark_cores_under_stress(order)
+            self._start_multi_core_worker(order, duration, workload=wl)
+            return
+
+        self._endurance_workload += 1
+        self._endurance_index = 0
+        self._save_endurance_pos()
+        QTimer.singleShot(0, self._run_validation_next)
+
+    def _finish_endurance_round(self) -> None:
+        """Report the round's evidence ledger and start the next, longer one."""
+        clean = not self._validation_dirty
+        self._endurance_round += 1
+        self.log_message.emit(
+            f"Endurance round {self._endurance_round - 1} complete "
+            f"({'clean' if clean else 'with back-offs'}) - next slots {self._endurance_duration()}s"
+        )
+        if self._session_id:
+            summary = tp.evidence_summary(
+                self._db, self._session_id, self._core_states, self._config.direction
+            )
+            for core_id in sorted(self._core_states):
+                cs = self._core_states[core_id]
+                self.log_message.emit(tp.format_evidence_line(core_id, cs.best_offset, summary.get(core_id, {})))
+            if clean:
+                tp.set_unattributed_crashes(self._db, self._session_id, 0)
+        self._validation_dirty = False
+        self._endurance_workload = 0
+        self._endurance_index = 0
+        self._save_validation_pos()
+        self._save_endurance_pos()
+        QTimer.singleShot(0, self._run_validation_next)
 
     def _run_validation_memory(self) -> None:
         """Stage 6: all cores stressed simultaneously under a MEMORY load with
@@ -3550,20 +3714,42 @@ class TunerEngine(QObject):
         return backend if backend.is_available() else None
 
     def _start_multi_core_worker(
-        self, cores: list[int], duration: int, backend=None, memory_mb: int | None = None
+        self,
+        cores: list[int],
+        duration: int,
+        backend=None,
+        memory_mb: int | None = None,
+        workload: dict | None = None,
     ) -> None:
         """Launch every core's stress process simultaneously (one pinned
         process per core) with per-core verdicts; the worker reports the
         first failing core, else the first core's pass. ``backend`` overrides
         the configured CPU backend and ``memory_mb`` sizes each process (the
         memory stage passes stressapptest and its per-lane share of RAM, since
-        every lane's process allocates at once)."""
-        stress_config = StressConfig(
-            mode=self._get_stress_mode(),
-            fft_preset=self._get_fft_preset(),
-            threads=2,
-            memory_mb=memory_mb,
-        )
+        every lane's process allocates at once). ``workload`` (endurance) names
+        the backend, mode, preset and per-core thread count for the slot."""
+        self._worker_profile = "sustained"
+        if workload is not None:
+            from corecycler.engine.backends.base import FFTPreset, StressMode
+
+            try:
+                stress_config = StressConfig(
+                    mode=StressMode[workload["stress_mode"].upper()],
+                    fft_preset=FFTPreset[workload["fft_preset"].upper()],
+                    threads=self._threads_for(cores[0], workload.get("threads")),
+                    memory_mb=memory_mb,
+                )
+                backend = self._get_backend_for_name(workload["backend"])
+            except Exception as e:
+                self._fail_test_async(cores[0], str(e))
+                return
+        else:
+            stress_config = StressConfig(
+                mode=self._get_stress_mode(),
+                fft_preset=self._get_fft_preset(),
+                threads=2,
+                memory_mb=memory_mb,
+            )
         scheduler_config = SchedulerConfig(
             seconds_per_core=duration,
             cores_to_test=cores,
@@ -3732,7 +3918,10 @@ class TunerEngine(QObject):
                 case 6:
                     # Memory stage passed — advance to soak (stage 7)
                     self._validation_stage = 7
+                case 9:
+                    self._endurance_index += 1
             self._save_validation_pos()
+            self._save_endurance_pos()
             # Use QTimer to break the call stack (this is called from _on_test_finished)
             QTimer.singleShot(0, self._run_validation_next)
             return
@@ -3743,7 +3932,7 @@ class TunerEngine(QObject):
         # aggressive offset there.
         target: int | None = None
         match self._validation_stage:
-            case 1 | 2 | 3 | 5 | 6:
+            case 1 | 2 | 3 | 5 | 6 | 9:
                 target = core_id
             case 4:
                 target = self._find_most_aggressive_core()
@@ -3753,13 +3942,24 @@ class TunerEngine(QObject):
             return
 
         self._validation_dirty = True
-        if self._validation_stage in (1, 5):
+        endurance_solo = self._validation_stage == 9 and self._endurance_index < len(self._validation_core_order)
+        if self._validation_stage in (1, 5) or endurance_solo:
             # The failed slot simply retries at the new offset — the cursor
             # has not advanced, and nobody else's coverage changed.
-            self.log_message.emit(
-                f"Validation stage {self._validation_stage}: core {target} backed "
-                f"off — retrying its slot (position kept)"
-            )
+            if endurance_solo:
+                wl = self._config.endurance_workloads[self._endurance_workload]
+                label = tp.workload_label(
+                    wl["backend"], wl["stress_mode"], wl["fft_preset"], wl.get("threads"), wl.get("profile")
+                )
+                self.log_message.emit(
+                    f"Endurance: core {target} backed off to {self._core_states[target].best_offset} "
+                    f"after {label} - retrying its slot"
+                )
+            else:
+                self.log_message.emit(
+                    f"Validation stage {self._validation_stage}: core {target} backed "
+                    f"off — retrying its slot (position kept)"
+                )
             self._save_validation_pos()
             QTimer.singleShot(0, self._run_validation_next)
             return
