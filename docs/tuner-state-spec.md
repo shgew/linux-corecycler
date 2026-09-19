@@ -15,13 +15,13 @@ this chart covers what happens to a core once it has a verdict.
 | NOT_STARTED | COARSE_SEARCH (entry step, verdict ignored) | COARSE_SEARCH |
 | COARSE_SEARCH | COARSE_SEARCH, SETTLED (hit max) | FINE_SEARCH, SETTLED |
 | FINE_SEARCH | FINE_SEARCH, SETTLED | SETTLED |
-| SETTLED | CONFIRMING, CONFIRMED (no best found) | same |
+| SETTLED | CONFIRMING (baseline if no passing candidate) | same |
 | CONFIRMING | CONFIRMED (HARDENING_T1 with tiers) | CONFIRMING (retry), FAILED_CONFIRM |
-| FAILED_CONFIRM | BACKOFF_PRECONFIRM, CONFIRMED (at baseline) | same |
-| BACKOFF_PRECONFIRM | BACKOFF_PRECONFIRM (midpoint probe), BACKOFF_CONFIRMING, CONFIRMED (converged; HARDENING_T1 with tiers) | BACKOFF_PRECONFIRM, CONFIRMED (floor/baseline) |
-| BACKOFF_CONFIRMING | CONFIRMED, BACKOFF_PRECONFIRM (midpoint; HARDENING_T1 with tiers) | BACKOFF_PRECONFIRM, CONFIRMED |
-| HARDENING_T1 | HARDENING_T2, HARDENED | HARDENING_T1 (backed off), HARDENED (at baseline) |
-| HARDENING_T2 | HARDENING_T1 (next tier), HARDENED | HARDENING_T2 (backed off), HARDENED |
+| FAILED_CONFIRM | BACKOFF_PRECONFIRM (baseline still needs testing) | same |
+| BACKOFF_PRECONFIRM | BACKOFF_PRECONFIRM (midpoint probe), BACKOFF_CONFIRMING | BACKOFF_PRECONFIRM, BACKOFF_CONFIRMING (retry pass bound); pause if baseline fails |
+| BACKOFF_CONFIRMING | CONFIRMED, BACKOFF_PRECONFIRM (midpoint; HARDENING_T1 with tiers) | BACKOFF_PRECONFIRM, BACKOFF_CONFIRMING; pause if baseline fails |
+| HARDENING_T1 | HARDENING_T2, HARDENED | HARDENING_T1 (back off and retest; pause if baseline fails) |
+| HARDENING_T2 | HARDENING_T1 (next tier), HARDENED | HARDENING_T2 (back off and retest; pause if baseline fails) |
 | CONFIRMED | CONFIRMED (absorbing) | CONFIRMED |
 | HARDENED | HARDENED (absorbing) | HARDENED |
 
@@ -46,6 +46,12 @@ penalty never overshoots past stock (CO=0).
 - **Persistence boundary**: reading or writing a core state with offsets
   outside the sane CO range or negative counters raises — corruption is
   rejected at the boundary, in both directions.
+- **Contradicted pass bounds**: a failure at a pass bound, or at a less aggressive
+  offset, invalidates that bound. Backoff must earn confirmation again.
+- **Baseline is not proof**: reaching stock or an inherited BIOS baseline does
+  not confirm or harden it. Baseline failures pause instead of certifying it.
+- **Time limit is not proof**: process the completed test's verdict first, then
+  pause an unfinished search when its per-core time budget is exceeded.
 
 ## Invariants (asserted after every transition in the sweep)
 
@@ -56,7 +62,8 @@ penalty never overshoots past stock (CO=0).
 
 ## Verdict classes that never enter this state machine
 
-- `thermal` — cool down and retry the same offset (no transition).
+- `thermal` - cool down and retry without treating heat as an offset failure.
+  Independently observed MCEs still penalize the named cores, including the loaded core.
 - `startup` — environment fault: revert the offset, persist `in_test=0`,
   pause. Never logged as a verdict, never marks the journal survived.
 - Apparatus-breaker trips (implausible fail streaks, search flow only) —
@@ -76,7 +83,8 @@ Evidence outranks policy; a guess is never written. Priority order:
 3. A single in-test core in the SEARCH flow (isolation mode): direct blame.
 4. The CO journal's un-survived residents.
 5. Anything ambiguous (multi-core in-test set, or any crash under
-   validation): penalize NOBODY; run the isolated crash hunt — per-core
+   validation, including a paused session with a persisted validation cursor):
+   penalize NOBODY; run the isolated crash hunt - per-core
    slots at the tuned value with all other cores at stock, most suspect
    first (prior MCE rows, crash history, deepest undervolt). A slot failure
    convicts its core. After `max_unattributed_crash_hunts` fruitless hunts
@@ -85,4 +93,10 @@ Evidence outranks policy; a guess is never written. Priority order:
 Cross-core MCE evidence during a live test uses `_apply_crash_penalty` with
 `steps=1, count_crash=False` for corrected errors (one-step backoff, re-earn
 confirmation, journal kept un-survived) and the full penalty for uncorrected
-ones — the same declared transition relation, so the chart above holds.
+ones - the same declared transition relation, so the chart above holds.
+
+Hardware-evidence backoff invalidates persisted clean-validation credit before
+leaving validation. Resuming preserves that debt even when loading an older
+cursor snapshot. Explicit Validate Profile first reconfirms each core and then
+runs the configured staged validation; it cannot skip stages just because the
+UI already reports validating.

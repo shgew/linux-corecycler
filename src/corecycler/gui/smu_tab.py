@@ -449,6 +449,7 @@ class SMUTab(QWidget):
         smu_ok = self._smu is not None and self._smu.is_available() if hasattr(self, "_smu") else False
         write_enabled = not running and smu_ok
 
+        self._dry_run_cb.setEnabled(not running)
         self._apply_all_btn.setEnabled(write_enabled)
         self._reset_btn.setEnabled(write_enabled)
         self._restore_btn.setEnabled(write_enabled and self._smu is not None and self._smu.has_backup())

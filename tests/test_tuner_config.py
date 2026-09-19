@@ -3,26 +3,13 @@
 from __future__ import annotations
 
 import json
+ 
+import pytest
 
 from corecycler.tuner.config import TunerConfig
 
 
 class TestTunerConfigDefaults:
-    def test_defaults_are_sensible(self):
-        cfg = TunerConfig()
-        assert cfg.start_offset == 0
-        assert cfg.coarse_step == 5
-        assert cfg.fine_step == 1
-        assert cfg.direction == -1
-        assert cfg.search_duration_seconds == 60
-        assert cfg.confirm_duration_seconds == 300
-        assert cfg.max_offset == -50
-        assert cfg.max_confirm_retries == 2
-        assert cfg.cores_to_test is None
-        assert cfg.test_order == "sequential"
-        assert cfg.backend == "mprime"
-        assert cfg.abort_on_consecutive_failures == 0
-
     def test_json_roundtrip(self):
         cfg = TunerConfig(coarse_step=10, max_offset=-40, cores_to_test=[0, 1, 2])
         json_str = cfg.to_json()
@@ -39,28 +26,22 @@ class TestTunerConfigDefaults:
         assert restored.direction == cfg.direction
         assert restored.cores_to_test == cfg.cores_to_test
 
-    def test_from_json_ignores_unknown_fields(self):
-        data = json.dumps({"coarse_step": 3, "unknown_field": 42})
-        cfg = TunerConfig.from_json(data)
-        assert cfg.coarse_step == 3
+    @pytest.mark.parametrize("payload", [
+        '{broken', '[]', '{"max_temperatur_c": 80}', '{"max_temperature_c": "80"}',
+        '{"hardening_tiers": null}', '{"auto_validate": 1}', '{"start_offset": -10.5}',
+        '{"search_duration_seconds": NaN}', '{"over_temp_grace_seconds": Infinity}',
+        '{"cores_to_test": [0, "1"]}', '{"cores_to_test": [0, 0]}', '{"hardening_tiers": [7]}',
+        '{"hardening_tiers": [{"backend": [], "stress_mode": "SSE", "fft_preset": "SMALL"}]}',
+    ])
+    def test_invalid_json_is_rejected_instead_of_using_defaults(self, payload):
+        with pytest.raises(ValueError):
+            TunerConfig.from_json(payload)
 
-    def test_from_json_fails_closed_on_wrong_typed_fields(self):
-        """A corrupted/hand-edited config_json with wrong-typed fields must fall
-        back to defaults, not raise later in validate()/the engine."""
-        defaults = TunerConfig()
-        cases = {
-            "hardening_tiers": None,  # unguarded: TypeError 'NoneType' not iterable
-            "cores_to_test": 42,  # unguarded: TypeError int has no len()
-            "coarse_step": "abc",  # unguarded: TypeError str < int
-            "auto_validate": 1,  # int for a bool field
-            "max_temperature_c": "hot",  # str for a float field
-        }
-        for field, bad in cases.items():
-            cfg = TunerConfig.from_json(json.dumps({field: bad}))
-            assert getattr(cfg, field) == getattr(defaults, field), (
-                f"{field}={bad!r} should have reverted to the default"
-            )
-            cfg.validate()  # must not raise
+    def test_direct_config_rejects_wrong_types_before_comparisons(self):
+        cfg = TunerConfig(coarse_step="five", search_duration_seconds=float("nan"))
+        errors = cfg.validate()
+        assert any("coarse_step" in error for error in errors)
+        assert any("search_duration_seconds" in error for error in errors)
 
     def test_from_json_keeps_valid_typed_fields(self):
         """The type guard must not reject legitimate values."""

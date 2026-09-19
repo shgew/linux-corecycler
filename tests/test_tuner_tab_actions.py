@@ -342,7 +342,8 @@ class TestResumeSession:
         tab = _tab(db=db, topology=_topo(), smu=_smu(), backend_factory=lambda _n: _backend(False))
         engine_cls = MagicMock()
         monkeypatch.setattr(tt, "TunerEngine", engine_cls)
-        tab._resume_session(1)
+        sid = _seed_session(db)
+        tab._resume_session(sid)
         assert not engine_cls.called
 
     def test_the_saved_config_is_mirrored_into_the_panel(self, tab, monkeypatch):
@@ -783,3 +784,52 @@ class TestForceStop:
     def test_force_stop_without_an_engine_is_a_noop(self, tab):
         tab.force_stop()
         assert tab._engine is None
+
+
+class TestExternalOwnership:
+    def test_external_stress_blocks_all_tuner_actions(self, tab, monkeypatch):
+        eng = _engine(status="paused")
+        eng.test_in_flight = False
+        tab._engine = eng
+        tab._resume_btn.setEnabled(True)
+        tab._validate_btn.setEnabled(True)
+        tab.set_test_running(True)
+        for button in (tab._start_btn, tab._resume_btn, tab._validate_btn):
+            assert not button.isEnabled()
+        tab._on_start()
+        tab._resume_session(1)
+        tab._on_validate()
+        eng.start.assert_not_called()
+        eng.resume.assert_not_called()
+        eng.validate_profile.assert_not_called()
+        tab.set_test_running(False)
+        assert tab._resume_btn.isEnabled()
+        assert tab._validate_btn.isEnabled()
+
+    def test_cold_resume_selects_the_saved_backend(self, tab, monkeypatch):
+        config = TunerConfig(backend="stress-ng")
+        sid = tp.create_session(tab._db, config, "", "")
+        requested = []
+        tab._backend_factory = lambda name: requested.append(name) or _backend()
+        eng = _engine(session_id=sid)
+        monkeypatch.setattr(tt, "TunerEngine", lambda **kw: eng)
+        tab._backend_combo.setCurrentText("mprime")
+        tab._resume_session(sid)
+        assert requested == ["stress-ng"]
+        assert tab._backend_combo.currentText() == "stress-ng"
+
+    def test_resume_refuses_corrupt_saved_config(self, tab, monkeypatch):
+        sid = _seed_session(tab._db)
+        tab._db._execute_raw("UPDATE tuner_sessions SET config_json = ? WHERE id = ?", ("{broken", sid))
+        constructor = MagicMock()
+        monkeypatch.setattr(tt, "TunerEngine", constructor)
+        tab._resume_session(sid)
+        assert tab._engine is None
+        constructor.assert_not_called()
+
+    def test_resume_refuses_missing_topology(self, db, monkeypatch):
+        sid = _seed_session(db)
+        tab = _tab(db=db, topology=None, smu=_smu())
+        tab._resume_session(sid)
+        assert tab._engine is None
+

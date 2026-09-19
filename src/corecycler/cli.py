@@ -44,35 +44,42 @@ Running the binary with no command opens the GUI.
 
 
 def cli_main(argv: list[str]) -> int:
+    if argv in (["--help"], ["-h"]) or (
+        len(argv) == 2 and argv[0] in ("doctor", "status", "tune", "resume") and argv[1] in ("--help", "-h")
+    ):
+        print(USAGE)
+        return EXIT_COMPLETED
+    if not argv:
+        print(USAGE, file=sys.stderr)
+        return EXIT_REFUSED
     command = argv[0]
+    args = argv[1:]
+    if command in ("doctor", "status") and args:
+        print(f"corecycler {command}: unexpected arguments", file=sys.stderr)
+        return EXIT_REFUSED
     if command == "doctor":
         return cmd_doctor()
     if command == "status":
         return cmd_status()
     if command == "tune":
-        config_path = _flag_value(argv[1:], "--config")
-        if config_path is _INVALID:
-            print("corecycler tune: --config requires a file path", file=sys.stderr)
+        if args and (len(args) != 2 or args[0] != "--config" or args[1].startswith("-")):
+            print("corecycler tune: expected --config FILE or no arguments", file=sys.stderr)
             return EXIT_REFUSED
-        return cmd_run(config_path=config_path, resume_id=None, auto_resume=False)
+        return cmd_run(config_path=args[1] if args else None, resume_id=None, auto_resume=False)
     if command == "resume":
-        rest = [a for a in argv[1:] if not a.startswith("-")]
-        if len(rest) > 1:
-            print("corecycler resume: at most one SESSION_ID", file=sys.stderr)
+        if len(args) > 1 or any(a.startswith("-") for a in args):
+            print("corecycler resume: expected one SESSION_ID or no arguments", file=sys.stderr)
             return EXIT_REFUSED
-        if rest:
+        if args:
             try:
-                session_id = int(rest[0])
+                session_id = int(args[0])
             except ValueError:
-                print(f"corecycler resume: invalid session id {rest[0]!r}", file=sys.stderr)
+                print(f"corecycler resume: invalid session id {args[0]!r}", file=sys.stderr)
                 return EXIT_REFUSED
             return cmd_run(config_path=None, resume_id=session_id, auto_resume=False)
         return cmd_run(config_path=None, resume_id=None, auto_resume=True)
     print(USAGE, file=sys.stderr)
     return EXIT_REFUSED
-
-
-_INVALID = object()
 
 
 def doctor_lines(resolutions: list[Resolution], unmet: list[str]) -> list[str]:
@@ -102,15 +109,6 @@ def cmd_doctor() -> int:
     for line in doctor_lines(resolutions, unmet):
         print(line)
     return EXIT_REFUSED if unmet else EXIT_COMPLETED
-
-
-def _flag_value(args: list[str], flag: str):
-    if flag not in args:
-        return None
-    i = args.index(flag)
-    if i + 1 >= len(args):
-        return _INVALID
-    return args[i + 1]
 
 
 def cmd_status(db=None) -> int:
@@ -182,22 +180,32 @@ def cmd_run(
     from corecycler.tuner.config import TunerConfig
     from corecycler.tuner.engine import TunerEngine
 
-    config = TunerConfig()
-    if config_path is not None:
-        try:
-            config = TunerConfig.from_json(Path(config_path).read_text())
-        except OSError as e:
-            print(f"corecycler: cannot read config: {e}", file=sys.stderr)
-            return EXIT_REFUSED
-    errors = config.validate()
-    if errors:
-        print("corecycler: invalid config: " + "; ".join(errors), file=sys.stderr)
-        return EXIT_REFUSED
-
     load_all()
     tools.load_configured_paths()
     if db is None:
         db = HistoryDB()
+    session = None
+    if resume_id is not None:
+        session = tp.get_session(db, resume_id)
+    elif auto_resume:
+        session = tp.pick_auto_resume_session(db)
+        if session is None:
+            sessions = db.list_resumable_tuner_sessions()
+            session = sessions[0] if sessions else None
+    if (resume_id is not None or auto_resume) and session is None:
+        print("corecycler: no resumable session", file=sys.stderr)
+        return EXIT_REFUSED
+    try:
+        if session is not None:
+            config = TunerConfig.from_json(session.config_json)
+        elif config_path is not None:
+            config = TunerConfig.from_json(Path(config_path).read_text())
+        else:
+            config = TunerConfig()
+    except (OSError, ValueError) as e:
+        print(f"corecycler: cannot read config: {e}", file=sys.stderr)
+        return EXIT_REFUSED
+
     if engine_factory is not None:
         engine = engine_factory(db, config)
     else:
@@ -279,16 +287,7 @@ def cmd_run(
     wake.timeout.connect(lambda: None)
     wake.start(SETTLE_POLL_MS)
 
-    if resume_id is not None:
-        engine.resume(resume_id)
-    elif auto_resume:
-        session = tp.pick_auto_resume_session(db)
-        if session is None:
-            sessions = db.list_resumable_tuner_sessions()
-            if not sessions:
-                print("corecycler: no resumable session", file=sys.stderr)
-                return EXIT_REFUSED
-            session = sessions[0]
+    if session is not None:
         engine.resume(session.id)
     else:
         engine.start()

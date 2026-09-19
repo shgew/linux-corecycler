@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys as _sys
+from functools import partial
 from pathlib import Path
 
 import pytest
@@ -39,7 +40,7 @@ def db():
 
 @pytest.fixture(autouse=True)
 def _isolated_lock(tmp_path, monkeypatch):
-    import corecycler.config.paths as paths
+    from corecycler.config import paths
 
     monkeypatch.setattr(paths, "user_home", lambda: tmp_path)
 
@@ -100,6 +101,33 @@ class TestArgHandling:
 
     def test_resume_rejects_multiple_ids(self):
         assert cli.cli_main(["resume", "1", "2"]) == cli.EXIT_REFUSED
+
+    @pytest.mark.parametrize("args", [["tune", "--help"], ["resume", "-h"], ["--help"]])
+    def test_help_never_starts_tuning(self, args, monkeypatch, capsys):
+        monkeypatch.setattr(cli, "cmd_run", lambda **kw: pytest.fail("help started tuning"))
+        assert cli.cli_main(args) == cli.EXIT_COMPLETED
+        assert "corecycler tune" in capsys.readouterr().out
+
+    @pytest.mark.parametrize("args", [
+        [], ["tune", "--confg", "safe.json"], ["tune", "--config", "--help"],
+        ["tune", "--config", "a.json", "--config", "b.json"], ["resume", "--unknown"],
+        ["doctor", "unexpected"], ["status", "unexpected"],
+    ])
+    def test_bad_arguments_never_start_tuning(self, args, monkeypatch):
+        monkeypatch.setattr(cli, "cmd_run", lambda **kw: pytest.fail("invalid arguments started tuning"))
+        assert cli.cli_main(args) == cli.EXIT_REFUSED
+
+    @pytest.mark.parametrize("args", [["tune"], ["resume"], ["resume", "1"]])
+    def test_valid_commands_preserve_paused_outcome(self, args, db, monkeypatch):
+        tp.create_session(db, TunerConfig(), "", "")
+        monkeypatch.setattr(cli, "cmd_run", partial(cli.cmd_run, db=db, engine_factory=lambda *_: FakeEngine("pauses")))
+        assert cli.cli_main(args) == cli.EXIT_PAUSED
+
+    def test_status_command_reports_sessions_without_starting_tuning(self, db, monkeypatch, capsys):
+        sid = tp.create_session(db, TunerConfig(), "", "")
+        monkeypatch.setattr(cli, "cmd_status", partial(cli.cmd_status, db=db))
+        assert cli.cli_main(["status"]) == cli.EXIT_COMPLETED
+        assert f"{sid}" in capsys.readouterr().out
 
 
 class TestStatus:
@@ -172,10 +200,10 @@ class TestRunOutcomes:
         code, _ = self._run(db, "refuses")
         assert code == cli.EXIT_REFUSED
 
-    def test_resume_by_id_reaches_engine(self, db):
+    def test_resume_of_missing_session_is_refused(self, db):
         code, eng = self._run(db, "completes", resume_id=7)
-        assert code == cli.EXIT_COMPLETED
-        assert eng.resumed_with == 7
+        assert code == cli.EXIT_REFUSED
+        assert eng is None
 
     def test_auto_resume_with_no_sessions_refused(self, db):
         code, eng = self._run(db, "completes", auto_resume=True)
@@ -198,6 +226,15 @@ class TestRunOutcomes:
         )
         assert code == cli.EXIT_REFUSED
 
+    @pytest.mark.parametrize("payload", ['{broken', '{"max_temperature_c": "80"}', '{"search_duration_seconds": NaN}'])
+    def test_corrupt_config_refused_before_engine_creation(self, db, tmp_path, payload):
+        bad = tmp_path / "cfg.json"
+        bad.write_text(payload)
+        assert cli.cmd_run(
+            str(bad), None, False,
+            engine_factory=lambda *_: pytest.fail("invalid config reached the engine"), db=db,
+        ) == cli.EXIT_REFUSED
+
     def test_second_instance_locked(self, db, tmp_path):
         from PySide6.QtCore import QLockFile
 
@@ -210,38 +247,6 @@ class TestRunOutcomes:
             assert code == cli.EXIT_LOCKED
         finally:
             held.unlock()
-
-
-class TestCliMainDispatch:
-    def test_status_dispatches(self, monkeypatch):
-        seen = []
-        monkeypatch.setattr(cli, "cmd_status", lambda: seen.append("s") or 0)
-        assert cli.cli_main(["status"]) == 0
-        assert seen == ["s"]
-
-    def test_tune_dispatches_with_no_config(self, monkeypatch):
-        seen = {}
-        monkeypatch.setattr(cli, "cmd_run", lambda **k: seen.update(k) or 0)
-        assert cli.cli_main(["tune"]) == 0
-        assert seen == {"config_path": None, "resume_id": None, "auto_resume": False}
-
-    def test_tune_forwards_config_path(self, monkeypatch):
-        seen = {}
-        monkeypatch.setattr(cli, "cmd_run", lambda **k: seen.update(k) or 0)
-        cli.cli_main(["tune", "--config", "/tmp/x.json"])
-        assert seen["config_path"] == "/tmp/x.json"
-
-    def test_resume_by_id_dispatches(self, monkeypatch):
-        seen = {}
-        monkeypatch.setattr(cli, "cmd_run", lambda **k: seen.update(k) or 0)
-        cli.cli_main(["resume", "7"])
-        assert seen["resume_id"] == 7 and seen["auto_resume"] is False
-
-    def test_resume_no_id_is_auto(self, monkeypatch):
-        seen = {}
-        monkeypatch.setattr(cli, "cmd_run", lambda **k: seen.update(k) or 0)
-        cli.cli_main(["resume"])
-        assert seen["resume_id"] is None and seen["auto_resume"] is True
 
 
 class TestBuildSmu:

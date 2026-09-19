@@ -215,25 +215,28 @@ class TestCheckMCE:
         assert len(events) == 1
         assert events[0].cpu == 12
 
-    def test_no_baseline_skips_detection(self):
-        det = ErrorDetector()  # baseline 0.0
-        with patch("subprocess.run", return_value=_dmesg_result("100.1 " + ZEN_BLOCK_STATUS)):
-            assert det.check_mce() == []
+    def test_missing_baseline_refuses_a_verdict(self):
+        with pytest.raises(RuntimeError, match="baseline"):
+            ErrorDetector().check_mce()
 
-    def test_dmesg_failure_returns_empty(self):
+    @pytest.mark.parametrize("failure", [
+        MagicMock(returncode=1, stdout="", stderr="Permission denied"),
+        subprocess.TimeoutExpired("dmesg", 5), FileNotFoundError("dmesg"),
+    ])
+    def test_unreadable_monitor_is_not_a_clean_poll(self, failure):
         det = _fresh_detector(baseline=100.0)
-        with patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
-            assert det.check_mce() == []
+        kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
+        with patch("subprocess.run", **kwargs), pytest.raises(RuntimeError, match="unavailable"):
+            det.check_mce()
 
-    def test_dmesg_timeout_returns_empty(self):
+    def test_final_poll_observes_errors_inside_the_rate_limit(self):
         det = _fresh_detector(baseline=100.0)
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("dmesg", 5)):
+        with patch("subprocess.run", side_effect=[
+            _dmesg_result(""), _dmesg_result(f"100.11 {ZEN_BLOCK_STATUS}\n"),
+        ]):
             assert det.check_mce() == []
-
-    def test_dmesg_missing_returns_empty(self):
-        det = _fresh_detector(baseline=100.0)
-        with patch("subprocess.run", side_effect=FileNotFoundError):
-            assert det.check_mce() == []
+            events = det.check_mce(force=True)
+        assert [(event.cpu, event.corrected) for event in events] == [(9, True)]
 
     def test_dmesg_runs_unfiltered_by_level(self):
         # AMD corrected-error lines sit below err/warn; a level filter hides
@@ -381,12 +384,12 @@ class TestGetDmesgTimestamp:
             assert _get_dmesg_raw_timestamp() == 0.0
 
     def test_timeout(self):
-        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("dmesg", 5)):
-            assert _get_dmesg_raw_timestamp() == 0.0
+        with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("dmesg", 5)), pytest.raises(RuntimeError):
+            _get_dmesg_raw_timestamp()
 
     def test_file_not_found(self):
-        with patch("subprocess.run", side_effect=FileNotFoundError):
-            assert _get_dmesg_raw_timestamp() == 0.0
+        with patch("subprocess.run", side_effect=FileNotFoundError), pytest.raises(RuntimeError):
+            _get_dmesg_raw_timestamp()
 
 
 # ===========================================================================
@@ -435,11 +438,10 @@ class TestHarvestAndDmesgDrift:
         assert any(e.raw_ts == 0.0 for e in events)
         assert all(e.cpu == 9 for e in events)
 
-    def test_dmesg_raw_timestamp_malformed_returns_zero(self):
-        """A dmesg last line whose first token is not a float yields a 0.0 baseline."""
+    def test_malformed_baseline_refuses_monitoring(self):
         fake = MagicMock(returncode=0, stdout="garbage more text\n", stderr="")
-        with patch("subprocess.run", return_value=fake):
-            assert _get_dmesg_raw_timestamp() == 0.0
+        with patch("subprocess.run", return_value=fake), pytest.raises(RuntimeError, match="baseline"):
+            _get_dmesg_raw_timestamp()
 
 
 class TestMalformedDmesgTimestamp:

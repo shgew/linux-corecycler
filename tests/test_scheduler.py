@@ -66,13 +66,17 @@ def make_topo(cores: dict[int, tuple[int, ...]] | None = None) -> CPUTopology:
 
 
 def make_scheduler(tmp_path, *, topo=None, backend=None, **config) -> CoreScheduler:
-    return CoreScheduler(
+    from tests.test_execution import FakeDetector
+
+    scheduler = CoreScheduler(
         topology=topo or make_topo(),
         backend=backend or RecordingBackend(),
         stress_config=StressConfig(),
         scheduler_config=SchedulerConfig(seconds_per_core=1, poll_interval=0.01, **config),
         work_dir=tmp_path / "work",
     )
+    scheduler.detector = FakeDetector()
+    return scheduler
 
 
 def ok(core_id: int) -> StressResult:
@@ -363,34 +367,34 @@ class TestRapidTransitions:
             return {one.core_id: ok(one.core_id) for one in lanes}
 
         ScriptedSupervisor.script = [timed_pass] * 40
-        passed, error = sched.run_rapid_transitions([0, 1], total_duration=0.1, load_seconds=0.03, idle_seconds=0.01)
-        assert passed is True and error is None
+        result = sched.run_rapid_transitions([0, 1], total_duration=0.1, load_seconds=0.03, idle_seconds=0.01)
+        assert result.passed and result.error_message is None
         assert sched.state == TestState.FINISHED
 
-    def test_a_failure_names_its_cycle(self, tmp_path):
+    def test_a_failure_preserves_its_classification(self, tmp_path):
         sched = make_scheduler(tmp_path)
 
         def timed_fail(sup, lanes, config_for, duration):
             time.sleep(0.02)
-            return {one.core_id: bad(one.core_id, "mprime crashed with SIGSEGV (exit -11)") for one in lanes}
+            return {one.core_id: StressResult(one.core_id, False, 0.02, "sensor unavailable", "thermal") for one in lanes}
 
         ScriptedSupervisor.script = [timed_fail]
-        passed, error = sched.run_rapid_transitions([0], total_duration=1.0, load_seconds=0.02)
-        assert passed is False
-        assert "rapid transition cycle 1" in error
+        result = sched.run_rapid_transitions([0], total_duration=1.0, load_seconds=0.02)
+        assert not result.passed
+        assert result.error_type == "thermal"
 
     def test_a_prior_stop_is_honored_without_running(self, tmp_path):
         sched = make_scheduler(tmp_path)
         sched.stop()
-        passed, error = sched.run_rapid_transitions([0], total_duration=5.0)
-        assert (passed, error) == (True, None)
+        result = sched.run_rapid_transitions([0], total_duration=5.0)
+        assert not result.passed and result.error_type == "killed"
         assert ScriptedSupervisor.created == []
 
     def test_unknown_cores_are_a_harness_error(self, tmp_path):
         sched = make_scheduler(tmp_path, topo=make_topo({0: (0,)}))
-        passed, error = sched.run_rapid_transitions([7], total_duration=0.1)
-        assert passed is False
-        assert "harness error" in error
+        result = sched.run_rapid_transitions([7], total_duration=0.1)
+        assert not result.passed
+        assert result.error_type == "startup"
 
     def test_an_idle_mce_ends_the_cycling(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
@@ -405,9 +409,9 @@ class TestRapidTransitions:
             return {one.core_id: ok(one.core_id) for one in lanes}
 
         ScriptedSupervisor.script = [timed_pass]
-        passed, error = sched.run_rapid_transitions([0], total_duration=1.0, load_seconds=0.02, idle_seconds=0.02)
-        assert passed is False
-        assert "idle phase of rapid transition cycle 1" in error
+        result = sched.run_rapid_transitions([0], total_duration=1.0, load_seconds=0.02, idle_seconds=0.02)
+        assert not result.passed
+        assert result.error_type == "mce"
 
 
 class TestSignalMarshallingAudit:

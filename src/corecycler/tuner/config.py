@@ -4,27 +4,24 @@ from __future__ import annotations
 
 import dataclasses
 import json
-import logging
+import math
 from dataclasses import asdict, dataclass
 
 
 def _json_value_ok(default: object, value: object) -> bool:
-    """True when a JSON-decoded value is type-compatible with a config field's
-    default. ``from_json`` uses this to DROP a wrong-typed field and fall back to
-    the safe default (fail closed), so a corrupted or hand-edited config_json can
-    never smuggle a None/str/int into a field the engine treats as an int/list/bool
-    -- which crashed both start() (via validate()) and resume() (which skips it)."""
     if isinstance(default, bool):
         return isinstance(value, bool)
-    if isinstance(default, (int, float)):
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if isinstance(default, int):
+        return isinstance(value, int) and not isinstance(value, bool)
+    if isinstance(default, float):
+        return isinstance(value, (int, float)) and not isinstance(value, bool) and (
+            not isinstance(value, float) or math.isfinite(value)
+        )
     if isinstance(default, str):
         return isinstance(value, str)
     if isinstance(default, list):
         return isinstance(value, list)
-    if default is None:  # the optional list field (cores_to_test)
-        return value is None or isinstance(value, list)
-    return True
+    return value is None or isinstance(value, list)
 
 
 @dataclass(slots=True)
@@ -155,31 +152,29 @@ class TunerConfig:
 
     @classmethod
     def from_json(cls, data: str) -> TunerConfig:
-        """Parse a config from JSON. Fails closed: malformed JSON, a non-object
-        payload, or any wrong-typed field (e.g. a corrupted or hand-edited DB row)
-        falls back to the safe default rather than raising, so start/resume/abort
-        never break on a bad config_json -- a None hardening_tiers or a str step no
-        longer crashes validate()/the engine; it reverts to the default."""
-        try:
-            d = json.loads(data)
-        except (json.JSONDecodeError, TypeError):
-            return cls()
+        """Reject malformed configuration rather than replacing requested safety limits."""
+        d = json.loads(data)
         if not isinstance(d, dict):
-            return cls()
-        defaults = cls()
-        clean = {k: v for k, v in d.items() if k in cls.__slots__ and _json_value_ok(getattr(defaults, k), v)}
-        dropped = sorted(set(d) - set(clean))
-        if dropped:
-            # Falling back silently would hide a corrupt config — name it.
-            logging.getLogger(__name__).warning(
-                "TunerConfig.from_json dropped unknown/invalid fields (defaults used instead): %s",
-                dropped,
-            )
-        return cls(**clean)
+            raise ValueError("tuner config must be a JSON object")
+        unknown = sorted(d.keys() - set(cls.__slots__))
+        if unknown:
+            raise ValueError(f"unknown tuner config fields: {', '.join(unknown)}")
+        config = cls(**d)
+        errors = config.validate()
+        if errors:
+            raise ValueError("; ".join(errors))
+        return config
 
     def validate(self) -> list[str]:
         """Return list of validation errors, empty if config is valid."""
-        errors = []
+        defaults = type(self)()
+        errors = [
+            f"{field.name} has an invalid type or non-finite value"
+            for field in dataclasses.fields(self)
+            if not _json_value_ok(getattr(defaults, field.name), getattr(self, field.name))
+        ]
+        if errors:
+            return errors
         if self.direction not in (-1, 1):
             errors.append(f"direction must be -1 or 1, got {self.direction}")
         if self.coarse_step < 1:
@@ -188,8 +183,13 @@ class TunerConfig:
             errors.append(f"fine_step must be >= 1, got {self.fine_step}")
         if self.fine_step > self.coarse_step:
             errors.append(f"fine_step ({self.fine_step}) must be <= coarse_step ({self.coarse_step})")
-        if self.cores_to_test is not None and len(self.cores_to_test) == 0:
-            errors.append("cores_to_test is empty — no cores to test")
+        if self.cores_to_test is not None:
+            if not self.cores_to_test:
+                errors.append("cores_to_test is empty - no cores to test")
+            elif any(type(core) is not int or core < 0 for core in self.cores_to_test):
+                errors.append("cores_to_test must contain non-negative integer core IDs")
+            elif len(set(self.cores_to_test)) != len(self.cores_to_test):
+                errors.append("cores_to_test contains duplicate core IDs")
         if self.search_duration_seconds < 1:
             errors.append("search_duration_seconds must be >= 1")
         if self.confirm_duration_seconds < 1:
@@ -217,10 +217,10 @@ class TunerConfig:
         for i, tier in enumerate(self.hardening_tiers):
             if not isinstance(tier, dict):
                 errors.append(f"hardening_tiers[{i}] must be a dict")
-            elif not all(k in tier for k in ("backend", "stress_mode", "fft_preset")):
-                errors.append(f"hardening_tiers[{i}] missing required keys: backend, stress_mode, fft_preset")
+            elif not all(isinstance(tier.get(k), str) for k in ("backend", "stress_mode", "fft_preset")):
+                errors.append(f"hardening_tiers[{i}] requires string backend, stress_mode, fft_preset")
             elif tier.get("profile") not in (None, "sustained", "spectrum"):
-                errors.append(f"hardening_tiers[{i}] profile must be sustained or spectrum")
+                errors.append(f"hardening_tiers[{i}].profile must be sustained or spectrum")
         if not 60 <= self.max_temperature_c <= 110:
             errors.append(f"max_temperature_c must be 60-110, got {self.max_temperature_c}")
         if self.over_temp_grace_seconds < 0:

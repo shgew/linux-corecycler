@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,7 +89,12 @@ def _probe_mechanism() -> str | None:
     cmd = [systemd_run, "--scope", "--quiet", "--collect", "-p", "AllowedCPUs=0"]
     if user_mode:
         cmd.insert(1, "--user")
-    cmd += ["--", "true"]
+    probe = (
+        "import os; "
+        "os.sched_setaffinity(0, range(os.cpu_count())); "
+        "print(','.join(map(str, sorted(os.sched_getaffinity(0)))))"
+    )
+    cmd += ["--", sys.executable, "-c", probe]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=_PROBE_TIMEOUT)
     except (subprocess.TimeoutExpired, OSError) as exc:
@@ -100,6 +106,9 @@ def _probe_mechanism() -> str | None:
             result.returncode,
             (result.stderr or result.stdout).strip()[:200],
         )
+        return None
+    if result.stdout.strip() != "0":
+        log.warning("containment probe escaped AllowedCPUs=0: %s", result.stdout.strip())
         return None
     return MECHANISM_USER if user_mode else MECHANISM_SYSTEM
 

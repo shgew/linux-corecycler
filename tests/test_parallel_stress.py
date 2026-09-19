@@ -39,6 +39,9 @@ class ScriptedSupervisor:
 
 @pytest.fixture(autouse=True)
 def scripted(monkeypatch):
+    from tests.test_execution import FakeDetector
+
+    monkeypatch.setattr(parallel_mod, "ErrorDetector", FakeDetector)
     ScriptedSupervisor.script = []
     ScriptedSupervisor.created = []
     monkeypatch.setattr(parallel_mod, "Supervisor", ScriptedSupervisor)

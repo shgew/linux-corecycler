@@ -1139,9 +1139,11 @@ class TestPropertyFuzz:
             )
 
             assert steps < 6000, f"no convergence: order={order} cliffs={cliffs} reboot={reboot_interval}"
-            assert eng.status in ("idle", "quarantined"), (
-                f"stuck in {eng.status}: order={order} cliffs={cliffs} hardening={hardening} reboot={reboot_interval}"
-            )
+            if eng.status == "paused":
+                assert any(cs.backoff_fail_bound == cs.baseline_offset for cs in eng.core_states.values())
+                assert tp.get_session(db, sid).status == "paused"
+            else:
+                assert eng.status in ("idle", "quarantined")
             resident = eng._smu.applied
             for c, (_stable, crash) in cliffs.items():
                 r = resident.get(c, 0)

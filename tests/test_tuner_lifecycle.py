@@ -95,7 +95,7 @@ class TestIsRunning:
             ("running", True),
             ("validating", True),
             ("hunting", True),
-            ("paused", False),
+            ("paused", True),
             ("idle", False),
             ("quarantined", False),
         ],
@@ -103,6 +103,7 @@ class TestIsRunning:
     def test_is_running_tracks_active_statuses(self, status, expected):
         tab = _tab()
         tab._engine = MagicMock()
+        tab._engine.test_in_flight = False
         tab._engine.status = status
         assert tab.is_running is expected
 

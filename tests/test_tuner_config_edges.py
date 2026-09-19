@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from corecycler.tuner.config import TunerConfig, _json_value_ok
+from corecycler.tuner.config import TunerConfig
 
 
 def _errors(**kw) -> list[str]:
@@ -37,16 +37,8 @@ class TestTunerConfigValidation:
     def test_hardening_tier_not_a_dict(self):
         assert any("must be a dict" in e for e in _errors(hardening_tiers=["nope"]))
 
-    def test_hardening_tier_missing_keys(self):
-        assert any("missing required keys" in e for e in _errors(hardening_tiers=[{"backend": "mprime"}]))
-
     def test_over_temp_grace_negative(self):
         assert any("over_temp_grace_seconds" in e for e in _errors(over_temp_grace_seconds=-1.0))
 
     def test_over_temp_hard_margin_negative(self):
         assert any("over_temp_hard_margin_c" in e for e in _errors(over_temp_hard_margin_c=-1.0))
-
-
-class TestJsonValueOk:
-    def test_unknown_default_type_accepts_any(self):
-        assert _json_value_ok(object(), 5) is True

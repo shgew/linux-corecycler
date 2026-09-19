@@ -13,6 +13,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -24,18 +25,12 @@ from corecycler.tuner.state import CoreState, TunerPhase  # noqa: E402
 
 
 class TestConfigJsonFailsClosed:
-    @settings(max_examples=400, deadline=None)
-    @given(s=st.text(max_size=200))
-    def test_from_json_never_raises(self, s):
-        cfg = TunerConfig.from_json(s)
-        assert isinstance(cfg, TunerConfig)
-
     @given(blob=st.one_of(st.lists(st.integers()), st.integers(), st.floats(allow_nan=False), st.booleans(), st.none()))
-    def test_non_object_json_yields_defaults(self, blob):
+    def test_non_object_json_is_rejected(self, blob):
         import json
 
-        cfg = TunerConfig.from_json(json.dumps(blob))
-        assert cfg == TunerConfig()
+        with pytest.raises(ValueError):
+            TunerConfig.from_json(json.dumps(blob))
 
     @settings(max_examples=200, deadline=None)
     @given(

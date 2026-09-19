@@ -80,6 +80,7 @@ class TunerTab(QWidget):
         self._smu = smu
         self._backend_factory = backend_factory
         self._engine: TunerEngine | None = None
+        self._external_test_running = False
         self._selected_core: int | None = None
 
         self._tuner_timer = QTimer(self)
@@ -465,6 +466,8 @@ class TunerTab(QWidget):
     # ------------------------------------------------------------------
 
     def _on_start(self) -> None:
+        if self._external_test_running:
+            return
         if not self._db or not self._topology:
             QMessageBox.warning(self, "Error", "Database or topology not available")
             return
@@ -622,6 +625,8 @@ class TunerTab(QWidget):
 
     def _resume_session(self, session_id: int) -> None:
         """Resume a specific tuner session by ID."""
+        if self._external_test_running:
+            return
         if not self._smu or not self._smu.is_available():
             QMessageBox.warning(
                 self,
@@ -632,10 +637,20 @@ class TunerTab(QWidget):
             )
             return
 
-        # Create engine if needed (cold start resume)
+        session = tp.get_session(self._db, session_id) if self._db else None
+        if session is None:
+            QMessageBox.warning(self, "Error", "Session not found")
+            return
+        try:
+            config = TunerConfig.from_json(session.config_json)
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Configuration", str(exc))
+            return
+        self._apply_config_to_ui(config)
+
         if self._engine is None:
-            if not self._db or not self._topology:
-                QMessageBox.warning(self, "Error", "Database or topology not available")
+            if not self._topology:
+                QMessageBox.warning(self, "Error", "CPU topology not available")
                 return
             backend = self._get_backend()
             if backend is None:
@@ -645,14 +660,9 @@ class TunerTab(QWidget):
                 topology=self._topology,
                 smu=self._smu,
                 backend=backend,
+                config=config,
             )
             self._wire_engine()
-
-        # The engine runs the session's SAVED config — mirror it into the
-        # config panel so the boxes show what is actually being executed.
-        session = tp.get_session(self._db, session_id) if self._db else None
-        if session is not None:
-            self._apply_config_to_ui(TunerConfig.from_json(session.config_json))
         log.info("Resuming tuner session %d with its saved config", session_id)
         for event in tp.get_events(self._db, session_id, limit=20):
             log.info(
@@ -689,6 +699,8 @@ class TunerTab(QWidget):
             self._tuner_timer.stop()
 
     def _on_validate(self) -> None:
+        if self._external_test_running:
+            return
         if not self._engine or not self._engine.session_id:
             return
         backend = self._get_backend()
@@ -1144,7 +1156,9 @@ class TunerTab(QWidget):
             self._resume_btn.setEnabled(True)
 
     def set_test_running(self, running: bool) -> None:
-        """Called by MainWindow to disable tuner Start when manual test is active."""
+        """Keep all tuner entry points unavailable during manual or memory stress."""
+        self._external_test_running = running
+        self.setEnabled(not running)
         if running:
             self._start_btn.setEnabled(False)
             self._start_btn.setToolTip("Manual test is running")
@@ -1165,4 +1179,8 @@ class TunerTab(QWidget):
 
     @property
     def is_running(self) -> bool:
-        return self._engine is not None and self._engine.status in ACTIVE_STATUSES
+        return self._engine is not None and (
+            self._engine.status in ACTIVE_STATUSES
+            or self._engine.status == "paused"
+            or self._engine.test_in_flight
+        )

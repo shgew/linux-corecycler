@@ -330,31 +330,33 @@ class Supervisor:
                     self.hooks.on_status(run.lane.core_id, now - start)
             self.stop_event.wait(self.poll_interval)
 
-    def _apply_mce_events(self, runs: list[_LaneRun], start: float) -> bool:
-        events = self.detector.check_mce()
-        if not events:
-            return False
+    def _apply_mce_events(self, runs: list[_LaneRun], start: float, *, force: bool = False) -> bool:
+        try:
+            events = self.detector.check_mce(force=force)
+        except RuntimeError as exc:
+            for run in runs:
+                if run.verdict is None or run.verdict.passed:
+                    self._fail(run, str(exc), start, error_type="startup")
+            self.stop_event.set()
+            return True
         self.observed.extend(events)
         cpu_to_run = {cpu: run for run in runs for cpu in run.lane.cpus}
         hit = False
         for event in events:
             if event.cpu == -1:
-                anchor = min((r for r in runs if r.verdict is None), default=None, key=lambda r: r.lane.core_id)
-                if anchor is not None:
-                    anchor.verdict = StressResult(
-                        core_id=anchor.lane.core_id,
-                        passed=False,
-                        duration_seconds=time.monotonic() - start,
-                        error_message=(f"Machine check without core attribution during {self.phase}: {event.message}"),
-                        error_type="mce_unattributed",
-                    )
-                    self.stop_event.set()
-                    hit = True
-                continue
-            run = cpu_to_run.get(event.cpu)
-            if run is not None and run.verdict is None:
-                self._fail(run, f"MCE during {self.phase}: {event.message}", start, error_type="mce")
+                run = min(
+                    (r for r in runs if r.verdict is None or r.verdict.passed),
+                    default=None,
+                    key=lambda r: r.lane.core_id,
+                )
+            else:
+                run = cpu_to_run.get(event.cpu)
+            if run is not None and (run.verdict is None or run.verdict.passed):
+                error_type = "mce_unattributed" if event.cpu == -1 else "mce"
+                self._fail(run, f"MCE during {self.phase}: {event.message}", start, error_type=error_type)
                 hit = True
+                if event.cpu == -1:
+                    self.stop_event.set()
         return hit
 
     def _poll_backend_errors(self, runs: list[_LaneRun], start: float) -> bool:
@@ -514,28 +516,7 @@ class Supervisor:
                 continue
             self._drain(run)
             kill_process_group(run.proc)
-        drained = self.detector.check_mce()
-        if drained:
-            self.observed.extend(drained)
-            cpu_to_run = {cpu: r for r in runs for cpu in r.lane.cpus}
-            for event in drained:
-                target = None
-                if event.cpu == -1:
-                    target = min(
-                        (r for r in runs if r.verdict is None or r.verdict.passed),
-                        default=None,
-                        key=lambda r: r.lane.core_id,
-                    )
-                else:
-                    target = cpu_to_run.get(event.cpu)
-                if target is not None and (target.verdict is None or target.verdict.passed):
-                    target.verdict = StressResult(
-                        core_id=target.lane.core_id,
-                        passed=False,
-                        duration_seconds=time.monotonic() - start,
-                        error_message=f"MCE during {self.phase}: {event.message}",
-                        error_type="mce" if event.cpu != -1 else "mce_unattributed",
-                    )
+        self._apply_mce_events(runs, start, force=True)
         elapsed = time.monotonic() - start
         interrupted = self.stop_event.is_set() and elapsed < duration
         for run in runs:
@@ -598,19 +579,26 @@ def watch_idle(
 ) -> str | None:
     own = set(cpus)
     start = time.monotonic()
-    while time.monotonic() - start < duration and not stop_event.is_set():
-        if not thermal.safe():
+    while True:
+        finished = time.monotonic() - start >= duration or stop_event.is_set()
+        thermal_stop = not finished and not thermal.safe()
+        if thermal_stop:
             stop_event.set()
-            return f"CPU temperature exceeded {thermal.max_temperature} C safety limit during {phase}"
-        events = detector.check_mce()
+        try:
+            events = detector.check_mce(force=finished or thermal_stop)
+        except RuntimeError as exc:
+            return str(exc)
         if events:
             observed.extend(events)
             for event in events:
                 if event.cpu == -1 or event.cpu in own:
                     return f"MCE during {phase}: {event.message}"
+        if thermal_stop:
+            return f"CPU temperature exceeded {thermal.max_temperature} C safety limit during {phase}"
+        if finished:
+            return None
         remaining = duration - (time.monotonic() - start)
         stop_event.wait(min(poll_interval, max(0.0, remaining)))
-    return None
 
 
 def classify_error(msg: str | None) -> str:
@@ -622,6 +610,7 @@ def classify_error(msg: str | None) -> str:
         or "verdict unavailable" in msg_lower
         or "harness error" in msg_lower
         or "containment fault" in msg_lower
+        or "kernel error monitor" in msg_lower
     ):
         return "startup"
     if "machine check without core attribution" in msg_lower:

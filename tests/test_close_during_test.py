@@ -88,6 +88,22 @@ class TestCloseDuringTest:
         _close(window)
         assert order == ["stop", "wait", "db-close"]
         close()
+    def test_close_aborts_a_paused_tuner_with_an_inflight_worker(self, window, no_modal):
+        engine = MagicMock()
+        engine.status = "paused"
+        engine.test_in_flight = True
+        window._tuner_tab._engine = engine
+        order = []
+        engine.abort.side_effect = lambda: order.append("abort")
+        close = window._history_db.close
+        window._history_db = MagicMock()
+        window._history_db.close.side_effect = lambda: order.append("db-close")
+        _answer(no_modal, "Yes")
+        event = _close(window)
+        assert event.accept.called
+        assert order == ["abort", "db-close"]
+        close()
+
 
     def test_answering_no_keeps_everything_alive(self, window, no_modal, db):
         window._worker = _running_worker()

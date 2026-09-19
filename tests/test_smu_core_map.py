@@ -493,7 +493,7 @@ class TestTunerEndToEndOnRenumbered:
 
 
 class TestOfflineCpusDisableGapProof:
-    def test_offline_with_vanished_core_reads_the_fuse_and_refuses(self):
+    def test_offline_topology_refuses_core_writes(self):
         smu = RyzenSMU(ZEN5, MagicMock())
         silicon = _FakeSilicon(smu, ZEN5, {0: set(range(8))})
         topo = _topo({c: 0 for c in (0, 1, 2, 4, 5, 6, 7)})
@@ -501,16 +501,17 @@ class TestOfflineCpusDisableGapProof:
         smu.set_topology(topo)
         assert smu.core_map_error is not None
         assert "offline" in smu.core_map_error
-        assert silicon.fuse_reads == [_fuse_addr(ZEN5, 0)]
+        assert silicon.writes == []
 
-    def test_offline_but_fuse_matches_still_maps(self):
+    def test_offline_whole_ccd_cannot_be_relabelled_as_ccd_zero(self):
         smu = RyzenSMU(VERMEER, MagicMock())
-        _FakeSilicon(smu, VERMEER, {0: REPORTED_5600X_LIVE_SLOTS})
-        topo = _topo({c: 0 for c in (0, 1, 4, 5, 6, 7)})
+        silicon = _FakeSilicon(smu, VERMEER, {0: set(range(8)), 1: set(range(8))})
+        topo = _topo({c: 0 for c in range(8, 16)})
         topo.cpus_all_online = False
         smu.set_topology(topo)
-        assert smu.core_map_error is None
-        assert smu.core_map == {0: (0, 0), 1: (0, 1), 4: (0, 4), 5: (0, 5), 6: (0, 6), 7: (0, 7)}
+        assert smu.core_map_error is not None
+        assert not smu.set_co_offset(8, -10)
+        assert silicon.writes == []
 
     def test_fully_online_gap_machine_still_skips_the_fuse(self):
         smu = RyzenSMU(ZEN5, MagicMock())

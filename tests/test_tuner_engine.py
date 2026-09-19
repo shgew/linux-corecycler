@@ -917,8 +917,7 @@ class TestBackoffAlgorithm:
         )
         eng._core_states = {0: cs}
         eng._advance_core(0, passed=False)
-        # Back off from -1: -1 - (-1)*1 = 0, which is baseline
-        assert cs.phase == TunerPhase.CONFIRMED
+        assert cs.phase == TunerPhase.BACKOFF_PRECONFIRM
         assert cs.best_offset == 0
 
     def test_binary_search_narrows_on_pass(self, db, simple_topology, mock_smu, mock_backend):
@@ -984,8 +983,7 @@ class TestBackoffAlgorithm:
         )
         eng._core_states = {0: cs}
         eng._advance_core(0, passed=False)
-        # -3 - (-1)*1 = -2 = baseline, so should settle at baseline
-        assert cs.phase == TunerPhase.CONFIRMED
+        assert cs.phase == TunerPhase.BACKOFF_PRECONFIRM
         assert cs.best_offset == -2
 
     def test_backoff_with_positive_direction(self, db, simple_topology, mock_smu, mock_backend):
@@ -1415,8 +1413,7 @@ class TestDeathSpiralPrevention:
         eng._session_id = tp.create_session(db, cfg, "", "")
         return eng
 
-    def test_time_budget_settles_core(self, db, simple_topology, mock_smu, mock_backend):
-        """Core exceeding time budget settles at best_offset."""
+    def test_time_budget_pauses_without_confirming(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, max_core_time_seconds=7200)
         cs = CoreState(
             core_id=0,
@@ -1431,12 +1428,11 @@ class TestDeathSpiralPrevention:
         settled = eng._check_time_budget(cs)
 
         assert settled is True
-        assert cs.phase == TunerPhase.CONFIRMED
-        assert cs.current_offset == -15  # settled at best_offset
-        assert cs.backoff_mode is False
+        assert cs.phase == TunerPhase.COARSE_SEARCH
+        assert cs.current_offset == -20
+        assert eng.status == "paused"
 
-    def test_time_budget_no_best_settles_at_baseline(self, db, simple_topology, mock_smu, mock_backend):
-        """Core with no best_offset settles at baseline when budget exceeded."""
+    def test_time_budget_without_evidence_does_not_invent_a_best(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, max_core_time_seconds=7200)
         cs = CoreState(
             core_id=0,
@@ -1451,8 +1447,9 @@ class TestDeathSpiralPrevention:
         settled = eng._check_time_budget(cs)
 
         assert settled is True
-        assert cs.phase == TunerPhase.CONFIRMED
-        assert cs.current_offset == 0  # settled at baseline_offset
+        assert cs.phase == TunerPhase.COARSE_SEARCH
+        assert cs.best_offset is None
+        assert eng.status == "paused"
 
     def test_time_budget_not_exceeded_returns_false(self, db, simple_topology, mock_smu, mock_backend):
         """Core under time budget returns False (not settled)."""
@@ -1767,8 +1764,7 @@ class TestHardeningTransitions:
         assert cs.best_offset == -7
         assert cs.hardening_tier_index == 1  # stays at T2
 
-    def test_hardening_backoff_at_baseline_settles(self, db, simple_topology, mock_smu, mock_backend):
-        """Hardening backoff reaching baseline settles core as HARDENED at baseline."""
+    def test_hardening_baseline_still_requires_a_pass(self, db, simple_topology, mock_smu, mock_backend):
         tiers = [
             {"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL"},
         ]
@@ -1783,10 +1779,10 @@ class TestHardeningTransitions:
         )
         eng._core_states = {0: cs}
         eng._advance_core(0, passed=False)
-        # Back off: -1 - ((-1)*1) = 0 = baseline → settle as HARDENED
-        assert cs.phase == TunerPhase.HARDENED
+        assert cs.phase == TunerPhase.HARDENING_T1
         assert cs.current_offset == 0
-        assert cs.best_offset == 0
+        eng._advance_core(0, passed=True)
+        assert cs.phase == TunerPhase.HARDENED
 
     def test_get_active_stress_config_returns_tier_during_hardening(self, db, simple_topology, mock_smu, mock_backend):
         """During hardening, _get_active_stress_config returns the tier's config."""
@@ -2226,7 +2222,6 @@ class TestStateMachineGaps:
 
     # Gap 4: Time budget expiry during BACKOFF_PRECONFIRM
     def test_time_budget_during_backoff_preconfirm(self, db, simple_topology, mock_smu, mock_backend):
-        """Time budget exceeded during backoff settles core immediately."""
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, max_core_time_seconds=100)
         cs = CoreState(
             core_id=0,
@@ -2239,8 +2234,8 @@ class TestStateMachineGaps:
         eng._core_states = {0: cs}
         settled = eng._check_time_budget(cs)
         assert settled is True
-        assert cs.phase == TunerPhase.CONFIRMED
-        assert cs.current_offset == -8  # settled at best_offset
+        assert cs.phase == TunerPhase.BACKOFF_PRECONFIRM
+        assert eng.status == "paused"
 
     # Gap 5: Binary search convergence at gap=0
     def test_binary_search_gap_zero(self, db, simple_topology, mock_smu, mock_backend):
@@ -2283,7 +2278,6 @@ class TestStateMachineGaps:
 
     # Gap 7: Hardening fail all the way to baseline
     def test_hardening_fail_converges_to_baseline(self, db, simple_topology, mock_smu, mock_backend):
-        """Repeated hardening failures back off until baseline → HARDENED."""
         tiers = [{"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL"}]
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, fine_step=1, hardening_tiers=tiers)
         cs = CoreState(
@@ -2296,14 +2290,16 @@ class TestStateMachineGaps:
         )
         eng._core_states = {0: cs}
 
-        # Fail 3 times: -3 → -2 → -1 → 0 (baseline) → HARDENED
         eng._advance_core(0, passed=False)
         assert cs.current_offset == -2
         eng._advance_core(0, passed=False)
         assert cs.current_offset == -1
         eng._advance_core(0, passed=False)
-        assert cs.phase == TunerPhase.HARDENED
+        assert cs.phase == TunerPhase.HARDENING_T1
         assert cs.current_offset == 0
+        eng._advance_core(0, passed=False)
+        assert eng.status == "paused"
+        assert cs.phase == TunerPhase.HARDENING_T1
 
     # Gap 8: 3+ hardening tiers (T1→T2→T1 label cycling)
     def test_three_hardening_tiers(self, db, simple_topology, mock_smu, mock_backend):
@@ -2695,15 +2691,16 @@ class TestSearchBoundsAndBackoffFloor:
             backoff_mode=True,
         )
         eng._core_states = {0: cs}
-        for _ in range(6):
-            if cs.phase in (TunerPhase.CONFIRMED, TunerPhase.HARDENED):
-                break
-            eng._advance_core(0, passed=False)
-            assert cs.best_offset == -20 or eng._is_more_aggressive(cs.best_offset, -20)
-        assert cs.phase == TunerPhase.CONFIRMED
-        assert cs.best_offset == -20  # settled at the proven floor, not weaker
+        eng._advance_core(0, passed=False)
+        eng._advance_core(0, passed=False)
+        assert cs.current_offset == -20
+        eng._advance_core(0, passed=True)
+        assert cs.phase == TunerPhase.BACKOFF_CONFIRMING
+        eng._advance_core(0, passed=True)
+        assert cs.phase == TunerPhase.HARDENING_T1
+        assert cs.best_offset == -20
 
-    def test_backoff_confirming_fail_respects_floor(self, db, simple_topology, mock_smu, mock_backend):
+    def test_backoff_confirmation_failure_invalidates_its_pass_bound(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, fine_step=1)
         cs = CoreState(
             core_id=0,
@@ -2716,9 +2713,10 @@ class TestSearchBoundsAndBackoffFloor:
         )
         eng._core_states = {0: cs}
         eng._advance_core(0, passed=False)
-        # backing off from -20 → -19 is below the -20 floor → settle at -20
-        assert cs.phase == TunerPhase.CONFIRMED
-        assert cs.best_offset == -20
+        assert cs.phase == TunerPhase.BACKOFF_PRECONFIRM
+        assert cs.current_offset == -19
+        assert cs.backoff_pass_bound is None
+        assert cs.backoff_fail_bound == -20
 
 
 class TestValidationThermal:

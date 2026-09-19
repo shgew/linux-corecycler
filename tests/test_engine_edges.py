@@ -52,7 +52,7 @@ class TestContainmentProbe:
             assert containment._probe_mechanism() is None
 
     def test_a_green_probe_names_the_user_mechanism(self):
-        good = SimpleNamespace(returncode=0, stdout="", stderr="")
+        good = SimpleNamespace(returncode=0, stdout="0\n", stderr="")
         with (
             patch.object(containment, "_systemd_run_path", return_value="/bin/systemd-run"),
             patch.object(containment.subprocess, "run", return_value=good),
@@ -61,13 +61,22 @@ class TestContainmentProbe:
             assert containment._probe_mechanism() == containment.MECHANISM_USER
 
     def test_a_green_probe_as_root_names_the_system_mechanism(self):
-        good = SimpleNamespace(returncode=0, stdout="", stderr="")
+        good = SimpleNamespace(returncode=0, stdout="0\n", stderr="")
         with (
             patch.object(containment, "_systemd_run_path", return_value="/bin/systemd-run"),
             patch.object(containment.subprocess, "run", return_value=good),
             patch.object(containment.os, "geteuid", return_value=0),
         ):
             assert containment._probe_mechanism() == containment.MECHANISM_SYSTEM
+
+    @pytest.mark.parametrize("observed", ["0,1,2,3\n", ""])
+    def test_successful_scope_without_enforcement_is_refused(self, observed):
+        result = SimpleNamespace(returncode=0, stdout=observed, stderr="")
+        with (
+            patch.object(containment, "_systemd_run_path", return_value="/bin/systemd-run"),
+            patch.object(containment.subprocess, "run", return_value=result),
+        ):
+            assert containment._probe_mechanism() is None
 
 
 class TestContainRefusals:
@@ -410,8 +419,8 @@ class TestSchedulerHookGlue:
             return {lanes[0].core_id: None}
 
         scripted.script = [stop_during]
-        passed, error = sched.run_rapid_transitions([0], total_duration=5.0, load_seconds=0.02)
-        assert (passed, error) == (True, None)
+        result = sched.run_rapid_transitions([0], total_duration=5.0, load_seconds=0.02)
+        assert not result.passed and result.error_type == "killed"
 
     def test_the_temperature_delegate_reads_through_the_engine(self, monkeypatch):
         monkeypatch.setattr(execution, "read_cpu_temperature", lambda: 33.5)

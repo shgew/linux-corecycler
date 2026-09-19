@@ -353,18 +353,19 @@ class CoreScheduler:
         total_duration: float = 600.0,
         load_seconds: float = 10.0,
         idle_seconds: float = 5.0,
-    ) -> tuple[bool, str | None]:
-        """Rapid load/idle cycling across cores — catches idle-to-boost instability."""
+    ) -> StressResult:
+        """Rapid load/idle cycling with the same classified verdict as sustained stress."""
         self.state = TestState.RUNNING
+        start = time.monotonic()
+        core_id = min(cores, default=-1)
         if self._stop_event.is_set():
             self.state = TestState.FINISHED
-            return True, None
+            return StressResult(core_id, False, 0.0, "Rapid transitions stopped", "killed")
         self.observed_mce = []
         self.detector.reset()
         self._thermal = self._new_thermal()
         core_work_dir = self.work_dir / "rapid_transition"
         core_work_dir.mkdir(parents=True, exist_ok=True)
-
         logical_ids = []
         for c in cores:
             core_info = self.topology.cores.get(c)
@@ -372,9 +373,10 @@ class CoreScheduler:
                 logical_ids.append(core_info.logical_cpus[0])
         if not logical_ids:
             self.state = TestState.FINISHED
-            return False, "Rapid transition harness error: no requested core is in the topology"
-        lane = Lane(core_id=min(cores), cpus=tuple(sorted(logical_ids)), work_dir=core_work_dir)
-
+            return StressResult(
+                core_id, False, 0.0, "Rapid transition harness error: no requested core is in the topology", "startup"
+            )
+        lane = Lane(core_id=core_id, cpus=tuple(sorted(logical_ids)), work_dir=core_work_dir)
         elapsed = 0.0
         cycle = 0
         try:
@@ -394,9 +396,11 @@ class CoreScheduler:
                 )[lane.core_id]
                 elapsed += time.monotonic() - segment_start
                 if verdict is not None and not verdict.passed:
-                    return False, (f"Failure during rapid transition cycle {cycle}: {verdict.error_message}")
+                    return verdict
                 if self._stop_event.is_set():
                     break
+                if verdict is None:
+                    return StressResult(core_id, False, elapsed, "Rapid transition verdict unavailable", "startup")
                 if elapsed < total_duration:
                     segment_start = time.monotonic()
                     idle_error = execution.watch_idle(
@@ -410,11 +414,13 @@ class CoreScheduler:
                     )
                     elapsed += time.monotonic() - segment_start
                     if idle_error:
-                        return False, idle_error
+                        return StressResult(core_id, False, elapsed, idle_error, execution.classify_error(idle_error))
         finally:
             self.backend.cleanup(core_work_dir)
             self.state = TestState.FINISHED
-        return True, None
+        if self._stop_event.is_set():
+            return StressResult(core_id, False, elapsed, "Rapid transitions stopped", "killed")
+        return StressResult(core_id, True, time.monotonic() - start)
 
     @staticmethod
     def _classify_error(msg: str | None) -> str:

@@ -8,7 +8,6 @@ error is logged, so counting them cannot detect anything.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import re
 import subprocess
@@ -109,7 +108,7 @@ class ErrorDetector:
     DMESG_MIN_INTERVAL: float = 5.0
 
     def __init__(self) -> None:
-        self._dmesg_baseline_ts: float = 0.0  # raw monotonic timestamp
+        self._dmesg_baseline_ts: float | None = None
         self._last_dmesg_time: float = 0.0
         self._seen: set[tuple[float, int, int]] = set()
 
@@ -119,63 +118,35 @@ class ErrorDetector:
         self._last_dmesg_time = 0.0
         self._seen.clear()
 
-    def check_mce(self) -> list[MCEEvent]:
-        """Return new MCE/kernel-error events since reset(), each exactly once.
-
-        Rate-limited: within DMESG_MIN_INTERVAL of the previous subprocess
-        call it returns [] instead of re-running dmesg; the event is delivered
-        on the first poll after the interval elapses.
-        """
+    def check_mce(self, *, force: bool = False) -> list[MCEEvent]:
+        """Consume new kernel errors; force a fresh read at observation boundaries."""
+        if self._dmesg_baseline_ts is None:
+            raise RuntimeError("kernel error monitor has no baseline")
         now = time.monotonic()
-        if now - self._last_dmesg_time < self.DMESG_MIN_INTERVAL:
+        if not force and now - self._last_dmesg_time < self.DMESG_MIN_INTERVAL:
             return []
+        output = _read_dmesg()
         self._last_dmesg_time = now
-
-        # No baseline means old and new lines are indistinguishable — treating
-        # boot-time history as fresh errors would fail every first test.
-        if self._dmesg_baseline_ts <= 0:
-            return []
-
         events: list[MCEEvent] = []
-        try:
-            # No --level filter: AMD decoded corrected-error lines are logged
-            # below err/warn and a level filter silently hides them; the line
-            # classifier is the filter.
-            result = subprocess.run(
-                [tools.command_name("dmesg"), "--time-format=raw"],
-                capture_output=True,
-                text=True,
-                timeout=5,
-            )
-            if result.returncode != 0:
-                return []
-            for line in result.stdout.splitlines():
-                ts_match = re.match(r"\s*\[?\s*([\d.]+)\]?\s?", line)
-                if not ts_match:
-                    continue
-                try:
-                    raw_ts = float(ts_match.group(1))
-                except ValueError:
-                    continue
-                if raw_ts <= self._dmesg_baseline_ts:
-                    continue
-                event = classify_mce_line(line[ts_match.end() :])
-                if event is None:
-                    continue
-                event.raw_ts = raw_ts
-                key = (raw_ts, event.cpu, event.bank)
-                if key in self._seen:
-                    continue
-                self._seen.add(key)
-                events.append(event)
-        except (subprocess.TimeoutExpired, FileNotFoundError, OSError, PermissionError) as exc:
-            log.debug("dmesg check failed: %s", exc)
-            return events
-        log.debug(
-            "dmesg poll: %d new event(s)%s",
-            len(events),
-            "".join(f" [cpu={e.cpu} bank={e.bank} ce={e.corrected}]" for e in events),
-        )
+        for line in output.splitlines():
+            ts_match = re.match(r"\s*\[?\s*([\d.]+)\]?\s?", line)
+            if not ts_match:
+                continue
+            try:
+                raw_ts = float(ts_match.group(1))
+            except ValueError:
+                continue
+            if raw_ts <= self._dmesg_baseline_ts:
+                continue
+            event = classify_mce_line(line[ts_match.end() :])
+            if event is None:
+                continue
+            event.raw_ts = raw_ts
+            key = (raw_ts, event.cpu, event.bank)
+            if key in self._seen:
+                continue
+            self._seen.add(key)
+            events.append(event)
         return events
 
 
@@ -353,20 +324,31 @@ def _is_kernel_error_line(line_lower: str) -> bool:
     return any(ind in line_lower for ind in indicators)
 
 
-def _get_dmesg_raw_timestamp() -> float:
-    """Get the latest dmesg raw monotonic timestamp for baseline filtering."""
-    with contextlib.suppress(subprocess.TimeoutExpired, FileNotFoundError, OSError, PermissionError):
+def _read_dmesg() -> str:
+    try:
         result = subprocess.run(
             [tools.command_name("dmesg"), "--time-format=raw"],
             capture_output=True,
             text=True,
             timeout=5,
         )
-        lines = result.stdout.strip().splitlines()
-        if lines:
-            ts_str = lines[-1].split()[0] if lines[-1] else ""
-            try:
-                return float(ts_str.strip("[]"))
-            except ValueError:
-                return 0.0
-    return 0.0
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        raise RuntimeError(f"kernel error monitor unavailable: {exc}") from exc
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"kernel error monitor unavailable: dmesg exited {result.returncode}: {result.stderr.strip()}"
+        )
+    return result.stdout
+
+
+def _get_dmesg_raw_timestamp() -> float:
+    lines = _read_dmesg().strip().splitlines()
+    if not lines:
+        return 0.0
+    match = re.match(r"\s*\[?\s*([\d.]+)", lines[-1])
+    if match is None:
+        raise RuntimeError("kernel error monitor has an unreadable baseline")
+    try:
+        return float(match.group(1))
+    except ValueError as exc:
+        raise RuntimeError("kernel error monitor has an unreadable baseline") from exc

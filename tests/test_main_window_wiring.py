@@ -201,6 +201,15 @@ class TestConstruction:
         assert not any("MSR" in text for text in warnings)
         win._history_db = None
 
+    def test_unwritable_smu_is_reported_before_tuning(self, monkeypatch, tmp_path, db):
+        from PySide6.QtWidgets import QLabel
+
+        monkeypatch.setattr(os, "access", lambda *_: False)
+        win = _build(monkeypatch, tmp_path, db=db)
+        warnings = [label.text() for label in win._status_bar.findChildren(QLabel)]
+        assert any("Curve Optimizer (SMU)" in text for text in warnings)
+        win._history_db = None
+
 
 class TestStartTest:
     def _ready(self, window, monkeypatch, *, available=True):

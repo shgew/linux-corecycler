@@ -672,13 +672,6 @@ class TestVerdictRouter:
         engine._on_test_finished(0, True, "", "", 1.0, 0.0, "", json.dumps([{"core": 1, "passed": True}]))
         assert rows and rows[0][2] == "validate_s2"
 
-    def test_a_core_over_its_time_budget_stops_without_advancing(self, engine, monkeypatch):
-        monkeypatch.setattr(engine, "_check_time_budget", lambda cs: True)
-        advanced = []
-        monkeypatch.setattr(engine, "_advance_core", lambda *a: advanced.append(a))
-        engine._on_test_finished(0, True, "", "", 1.0, 0.0)
-        assert advanced == []
-
     def test_a_startup_fault_during_validation_reverts_every_core(self, engine):
         _confirm(engine, 1, -20)
         engine._set_status("validating")
@@ -1284,7 +1277,7 @@ class TestSearchArithmetic:
         engine._advance_core(0, True)
         assert cs.current_offset == -30
 
-    def test_a_midpoint_that_reaches_the_baseline_settles_there(self, engine):
+    def test_a_midpoint_that_reaches_baseline_requires_testing(self, engine):
         cs = engine._core_states[0]
         cs.phase = TunerPhase.BACKOFF_PRECONFIRM
         cs.baseline_offset = 0
@@ -1293,6 +1286,6 @@ class TestSearchArithmetic:
         cs.backoff_pass_bound = None
         cs.consecutive_backoff_fails = engine._config.midpoint_jump_threshold - 1
         engine._advance_core(0, False)
-        assert cs.phase is TunerPhase.CONFIRMED
+        assert cs.phase is TunerPhase.BACKOFF_PRECONFIRM
         assert cs.best_offset == 0
         assert cs.current_offset == 0

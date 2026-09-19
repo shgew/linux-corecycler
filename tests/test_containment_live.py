@@ -13,6 +13,8 @@ import time
 
 import pytest
 
+from _contract_hw import require
+
 from corecycler.engine import containment, execution
 
 pytestmark = pytest.mark.contract
@@ -21,8 +23,10 @@ ALLOWED = (0, 1)
 
 
 def _require_mechanism() -> None:
-    if containment.available_mechanism(refresh=True) is None:
-        pytest.skip("no systemd cgroup scope available on this host")
+    require(
+        containment.available_mechanism(refresh=True) is not None,
+        "no enforcing systemd cgroup cpuset available on this host",
+    )
 
 
 def test_a_contained_child_cannot_escape_its_cpuset():

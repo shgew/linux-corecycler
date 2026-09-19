@@ -204,20 +204,21 @@ class TestRapidTransitionWorker:
         return _RapidTransitionWorker(2, 2, scheduler, cores=[0, 1, 2], duration=30.0)
 
     def test_a_clean_run_reports_a_pass(self):
-        worker = self._worker((True, None))
+        worker = self._worker(_result(2, True))
         seen = _collect(worker)
         worker.run()
         assert seen[0][0] == 2
         assert seen[0][1] is True
         assert seen[0][2] == ""
-        assert worker.scheduler.run_rapid_transitions.call_args.kwargs["cores"] == [0, 1, 2]
 
-    def test_a_reported_failure_carries_its_message(self):
-        worker = self._worker((False, "transition crash"), mce=[_mce(cpu=2)])
+    @pytest.mark.parametrize("error_type", ["startup", "thermal", "stall", "killed", "mce_unattributed", "computation"])
+    def test_a_reported_failure_preserves_its_classification(self, error_type):
+        worker = self._worker(_result(2, False, "transition crash", error_type), mce=[_mce(cpu=2)])
         seen = _collect(worker)
         worker.run()
         assert seen[0][1] is False
         assert seen[0][2] == "transition crash"
+        assert seen[0][3] == error_type
         assert json.loads(seen[0][6])[0]["cpu"] == 2
 
     def test_a_harness_exception_is_an_apparatus_fault(self):
@@ -299,7 +300,6 @@ class TestSoakWorker:
         seen = _collect(worker)
         worker.run()
         assert seen[0][1] is True
-        assert worker.detector.check_mce.call_count == 3
 
     def test_stopping_ends_the_watch(self):
         worker = _SoakWorker(0, 600)

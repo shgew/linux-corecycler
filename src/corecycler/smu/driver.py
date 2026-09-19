@@ -157,7 +157,6 @@ class RyzenSMU:
         self._core_map: dict[int, tuple[int, int]] | None = None
         self._core_map_error: str | None = None
         self._known_core_ids: list[int] | None = None
-        self._offline_hint = ""
 
     def set_topology(self, topology) -> None:
         """Discover how OS core ids map onto SMU (CCD, physical slot) addresses.
@@ -216,7 +215,9 @@ class RyzenSMU:
             self._core_map_error = None
             return
         fully_online = getattr(topology, "cpus_all_online", True) is not False
-        self._offline_hint = "" if fully_online else " (some present CPUs are offline — online all cores for CO tuning)"
+        if not fully_online:
+            self._core_map_error = "some present CPUs are offline; online all cores before CO tuning"
+            return
         core_map: dict[int, tuple[int, int]] = {}
         try:
             for encode_ccd in sorted(groups):
@@ -320,7 +321,7 @@ class RyzenSMU:
                 f"address is verified for {self.commands.generation.name}, so "
                 f"the fused-off slots cannot be located -- per-core CO stays "
                 f"disabled instead of writing to the wrong cores; please report "
-                f"this output{self._offline_hint}"
+                "this output"
             )
         ok, msg = self.check_smn_readable()
         if not ok:
@@ -345,7 +346,7 @@ class RyzenSMU:
             f"core-disable fuse disagrees with the OS: fuse {fuse & 0xFF:#04x} "
             f"leaves {len(live)} live slots {live} but the OS reports {want} "
             f"cores -- per-core CO stays disabled instead of writing to the "
-            f"wrong cores; please report this output{self._offline_hint}"
+            "wrong cores; please report this output"
         )
 
     @property

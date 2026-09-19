@@ -288,16 +288,16 @@ class _RapidTransitionWorker(_TunerWorker):
     def run(self) -> None:
         try:
             start = time.monotonic()
-            passed, error = self.scheduler.run_rapid_transitions(
+            result = self.scheduler.run_rapid_transitions(
                 cores=self._cores,
                 total_duration=self._duration,
             )
             elapsed = time.monotonic() - start
             self.finished.emit(
                 self._core_id,
-                passed,
-                error or "",
-                "",
+                result.passed,
+                result.error_message or "",
+                result.error_type or "",
                 elapsed,
                 0.0,
                 _serialize_mce(self.scheduler.observed_mce),
@@ -395,6 +395,8 @@ class _SoakWorker(QThread):
                 if events:
                     break
                 self._stop.wait(5.0)
+            if not events:
+                events.extend(self.detector.check_mce(force=True))
             elapsed = time.monotonic() - start
             if events:
                 self.finished.emit(
@@ -555,7 +557,7 @@ class TunerEngine(QObject):
 
         # A tuning session is meaningless when per-core CO addressing is
         # refused: every write would fail and every result would be noise.
-        map_err = core_map_blocked(self._smu)
+        map_err = self._co_access_error()
         if map_err is not None:
             self.log_message.emit(f"Cannot start: per-core CO is unavailable — {map_err}")
             return
@@ -614,6 +616,33 @@ class TunerEngine(QObject):
 
         self._run_next()
 
+    def _co_access_error(self) -> str | None:
+        if getattr(self._smu, "dry_run", False) is True:
+            return "SMU Dry Run is enabled; disable it before tuning"
+        return core_map_blocked(self._smu)
+
+    def _load_saved_config(self, config_json: str) -> bool:
+        try:
+            config = TunerConfig.from_json(config_json)
+        except ValueError as exc:
+            self.log_message.emit(f"Invalid tuner config: {exc}")
+            return False
+        if config.backend != self._config.backend:
+            load_all()
+            try:
+                backend = get_backend(config.backend)
+            except KeyError:
+                self.log_message.emit(f"Unknown saved backend: {config.backend}")
+                return False
+            if not backend.is_available():
+                self.log_message.emit(f"Saved backend unavailable: {config.backend}")
+                return False
+            self._backend = backend
+        self._config = config
+        if self._smu is not None:
+            self._config.clamp_max_offset(self._smu.commands.co_range)
+        return True
+
     def resume(self, session_id: int) -> None:
         """Resume a crashed/paused session: attribute any crash from evidence
         first, then restore baselines, then continue where the cursor points."""
@@ -641,22 +670,12 @@ class TunerEngine(QObject):
             self.log_message.emit(f"Session {session_id} not found")
             return
 
-        self._config = TunerConfig.from_json(session.config_json)
-        if self._smu is not None:
-            self._config.clamp_max_offset(self._smu.commands.co_range)
-
-        # Fail closed on a corrupted/hand-edited config_json: from_json only
-        # rejects wrong TYPES, so a well-typed but out-of-range value (e.g.
-        # coarse_step=0, which makes the search non-convergent) survives it.
-        # start() rejects those; resume must too.
-        errors = self._config.validate()
-        if errors:
-            self.log_message.emit(f"Invalid tuner config: {'; '.join(errors)}")
+        if not self._load_saved_config(session.config_json):
             return
 
         # start() refuses on an unusable per-core CO map; a resumed session
         # would otherwise grind through refused writes as apparatus faults.
-        map_err = core_map_blocked(self._smu)
+        map_err = self._co_access_error()
         if map_err is not None:
             self.log_message.emit(f"Cannot resume: per-core CO is unavailable — {map_err}")
             return
@@ -817,7 +836,7 @@ class TunerEngine(QObject):
             rebooted
             and not crashed
             and not pending_hunt
-            and session.status == "validating"
+            and (session.status == "validating" or session.validation_stage > 0)
             and not last_boot_ended_cleanly()
         )
         if unattributed_incident:
@@ -940,7 +959,7 @@ class TunerEngine(QObject):
         if self._worker is not None and self._worker.isRunning():
             self.log_message.emit("Validate ignored: a test is still running — wait for it to finish.")
             return
-        map_err = core_map_blocked(self._smu)
+        map_err = self._co_access_error()
         if map_err is not None:
             self.log_message.emit(f"Cannot validate: per-core CO is unavailable — {map_err}")
             return
@@ -961,15 +980,9 @@ class TunerEngine(QObject):
             return
 
         session = tp.get_session(self._db, session_id)
-        if session:
-            self._config = TunerConfig.from_json(session.config_json)
-            if self._smu is not None:
-                self._config.clamp_max_offset(self._smu.commands.co_range)
-            # Fail closed on a corrupted config_json, exactly as resume()/start().
-            errors = self._config.validate()
-            if errors:
-                self.log_message.emit(f"Invalid tuner config: {'; '.join(errors)}")
-                return
+        if session and not self._load_saved_config(session.config_json):
+            return
+        tp.set_validation_position(self._db, session_id, 0, 0, 0, False, "[]")
 
         # Reset confirmed cores to "confirming" for re-validation
         self._core_states = tp.load_core_states(self._db, session_id)
@@ -1027,16 +1040,13 @@ class TunerEngine(QObject):
                     # Alternate between T1/T2 labels for any number of tiers
                     cs.phase = TunerPhase.HARDENING_T1 if next_tier % 2 == 0 else TunerPhase.HARDENING_T2
             else:
-                # Back off linearly by fine_step
-                new_offset = cs.current_offset - (direction * cfg.fine_step)
-                if self._at_or_past_baseline(new_offset, cs):
-                    cs.current_offset = cs.baseline_offset
-                    cs.best_offset = cs.baseline_offset
-                    cs.phase = TunerPhase.HARDENED
+                if self._at_or_past_baseline(cs.current_offset, cs):
+                    self.log_message.emit(f"Core {core_id}: hardening failed at baseline; pausing without a verdict")
+                    self.pause()
                 else:
-                    cs.current_offset = new_offset
-                    cs.best_offset = new_offset
-                    # Stay at current tier (T2 fail retries T2, not T1)
+                    new_offset = cs.current_offset - direction * cfg.fine_step
+                    cs.current_offset = cs.baseline_offset if self._at_or_past_baseline(new_offset, cs) else new_offset
+                    cs.best_offset = cs.current_offset
             # Persist
             if self._session_id:
                 tp.save_core_state(self._db, self._session_id, cs)
@@ -1052,6 +1062,23 @@ class TunerEngine(QObject):
             TunerPhase.BACKOFF_CONFIRMING,
         ):
             cs.best_offset = cs.baseline_offset
+
+        if not passed and cs.phase in (TunerPhase.BACKOFF_PRECONFIRM, TunerPhase.BACKOFF_CONFIRMING):
+            if cs.backoff_fail_bound is None or self._is_more_aggressive(cs.backoff_fail_bound, cs.current_offset):
+                cs.backoff_fail_bound = cs.current_offset
+            if cs.backoff_pass_bound is not None and not self._is_more_aggressive(
+                cs.current_offset, cs.backoff_pass_bound
+            ):
+                cs.backoff_pass_bound = None
+
+        if not passed and cs.phase in (
+            TunerPhase.CONFIRMING, TunerPhase.BACKOFF_PRECONFIRM, TunerPhase.BACKOFF_CONFIRMING,
+        ) and self._at_or_past_baseline(cs.current_offset, cs):
+            self.log_message.emit(f"Core {core_id}: baseline failed; pausing without confirmation")
+            self.pause()
+            if self._session_id:
+                tp.save_core_state(self._db, self._session_id, cs)
+            return
 
         # Contradictory-evidence guard: a PASS at/beyond the recorded fail
         # bound must never widen the bounds — failures outrank passes for
@@ -1135,10 +1162,9 @@ class TunerEngine(QObject):
                     cs.phase = TunerPhase.CONFIRMING
                     cs.current_offset = cs.best_offset
                 else:
-                    # No passing value found at all — mark confirmed at start
-                    cs.phase = TunerPhase.CONFIRMED
-                    cs.best_offset = cfg.start_offset
-                    cs.current_offset = cfg.start_offset
+                    cs.phase = TunerPhase.CONFIRMING
+                    cs.best_offset = cs.baseline_offset
+                    cs.current_offset = cs.baseline_offset
 
             case TunerPhase.CONFIRMING:
                 if passed:
@@ -1160,8 +1186,7 @@ class TunerEngine(QObject):
                 if cs.best_offset is not None:
                     new_best = cs.best_offset - direction * cfg.fine_step
                     if self._at_or_past_baseline(new_best, cs):
-                        # Can't back off further
-                        cs.phase = TunerPhase.CONFIRMED
+                        cs.phase = TunerPhase.BACKOFF_PRECONFIRM
                         cs.best_offset = cs.baseline_offset
                         cs.current_offset = cs.baseline_offset
                     else:
@@ -1172,7 +1197,7 @@ class TunerEngine(QObject):
                         cs.confirm_attempts = 0
                         cs.consecutive_backoff_fails = 0
                 else:
-                    cs.phase = TunerPhase.CONFIRMED
+                    cs.phase = TunerPhase.BACKOFF_PRECONFIRM
                     cs.best_offset = cs.baseline_offset
                     cs.current_offset = cs.baseline_offset
 
@@ -1187,11 +1212,9 @@ class TunerEngine(QObject):
                         # Binary search active — jump to midpoint
                         gap = abs(cs.backoff_fail_bound - cs.backoff_pass_bound)
                         if gap <= cfg.fine_step:
-                            # Converged: settle at the PROVEN pass bound, never an
-                            # untested midpoint.
                             cs.best_offset = cs.backoff_pass_bound
                             cs.current_offset = cs.backoff_pass_bound
-                            cs.phase = TunerPhase.CONFIRMED
+                            cs.phase = TunerPhase.BACKOFF_CONFIRMING
                         else:
                             # Probe the midpoint as current ONLY; best stays at the
                             # proven pass bound until the midpoint itself passes.
@@ -1212,11 +1235,11 @@ class TunerEngine(QObject):
                         midpoint = cs.best_offset - direction * (abs(cs.best_offset - cs.baseline_offset) // 2)
                         floor = self._backoff_floor(cs, midpoint)
                         if floor is not None:
-                            cs.phase = TunerPhase.CONFIRMED
+                            cs.phase = TunerPhase.BACKOFF_CONFIRMING
                             cs.best_offset = floor
                             cs.current_offset = floor
                         elif self._at_or_past_baseline(midpoint, cs) or midpoint == cs.best_offset:
-                            cs.phase = TunerPhase.CONFIRMED
+                            cs.phase = TunerPhase.BACKOFF_PRECONFIRM
                             cs.best_offset = cs.baseline_offset
                             cs.current_offset = cs.baseline_offset
                         else:
@@ -1228,11 +1251,11 @@ class TunerEngine(QObject):
                         new_offset = cs.best_offset - direction * cfg.fine_step
                         floor = self._backoff_floor(cs, new_offset)
                         if floor is not None:
-                            cs.phase = TunerPhase.CONFIRMED
+                            cs.phase = TunerPhase.BACKOFF_CONFIRMING
                             cs.best_offset = floor
                             cs.current_offset = floor
                         elif self._at_or_past_baseline(new_offset, cs):
-                            cs.phase = TunerPhase.CONFIRMED
+                            cs.phase = TunerPhase.BACKOFF_PRECONFIRM
                             cs.best_offset = cs.baseline_offset
                             cs.current_offset = cs.baseline_offset
                         else:
@@ -1274,11 +1297,11 @@ class TunerEngine(QObject):
                     new_offset = cs.best_offset - direction * cfg.fine_step
                     floor = self._backoff_floor(cs, new_offset)
                     if floor is not None:
-                        cs.phase = TunerPhase.CONFIRMED
+                        cs.phase = TunerPhase.BACKOFF_CONFIRMING
                         cs.best_offset = floor
                         cs.current_offset = floor
                     elif self._at_or_past_baseline(new_offset, cs):
-                        cs.phase = TunerPhase.CONFIRMED
+                        cs.phase = TunerPhase.BACKOFF_PRECONFIRM
                         cs.best_offset = cs.baseline_offset
                         cs.current_offset = cs.baseline_offset
                     else:
@@ -1303,7 +1326,10 @@ class TunerEngine(QObject):
             return False
         step_back = fb - self._config.direction * self._config.fine_step
         if self._at_or_past_baseline(step_back, cs):
-            cs.phase = TunerPhase.CONFIRMED
+            cs.phase = TunerPhase.BACKOFF_PRECONFIRM
+            if self._at_or_past_baseline(fb, cs):
+                self.log_message.emit(f"Core {cs.core_id}: baseline contradicts a known failure; pausing")
+                self.pause()
             cs.best_offset = cs.baseline_offset
             cs.current_offset = cs.baseline_offset
         else:
@@ -1368,6 +1394,18 @@ class TunerEngine(QObject):
         # TIGHTEN it, otherwise the search oscillates forever.
         if cs.backoff_fail_bound is None or not self._is_more_aggressive(crashed_offset, cs.backoff_fail_bound):
             cs.backoff_fail_bound = crashed_offset
+        if cs.backoff_pass_bound is not None and not self._is_more_aggressive(
+            crashed_offset, cs.backoff_pass_bound
+        ):
+            cs.backoff_pass_bound = None
+        if self._session_id is not None:
+            session = tp.get_session(self._db, self._session_id)
+            if session is not None and session.validation_stage > 0:
+                self._validation_dirty = True
+                tp.set_validation_position(
+                    self._db, self._session_id, session.validation_stage, session.validation_index,
+                    session.validation_half, True, session.validation_requeue,
+                )
         # Back off by crash_penalty_steps (or the caller's override)
         penalty = (steps if steps is not None else self._config.crash_penalty_steps) * self._config.fine_step
         new_offset = crashed_offset - (self._config.direction * penalty)
@@ -1573,7 +1611,7 @@ class TunerEngine(QObject):
             tp.set_unattributed_crashes(self._db, session_id, 0)
         else:
             in_test = [cs for cs in self._core_states.values() if cs.in_test]
-            ambiguous = session.status == "validating" or len(in_test) > 1
+            ambiguous = session.status == "validating" or session.validation_stage > 0 or len(in_test) > 1
             if in_test and not ambiguous:
                 crashed = self._penalize_cores(in_test, "single in-test core, isolation mode")
             elif in_test:
@@ -2052,20 +2090,15 @@ class TunerEngine(QObject):
         )
 
     def _check_time_budget(self, cs: CoreState) -> bool:
-        """Check if core has exceeded its time budget. Returns True if settled."""
-        if cs.cumulative_test_time <= self._config.max_core_time_seconds:
+        """Pause an inconclusive search instead of manufacturing confirmation."""
+        if cs.cumulative_test_time <= self._config.max_core_time_seconds or cs.phase in (
+            TunerPhase.CONFIRMED, TunerPhase.HARDENED,
+        ):
             return False
-        settled_offset = cs.best_offset if cs.best_offset is not None else cs.baseline_offset
-        cs.current_offset = settled_offset
-        cs.phase = TunerPhase.CONFIRMED
-        cs.backoff_mode = False
-        logging.warning(
-            "Core %d: time budget exceeded (%.0fs > %ds) — settled at %d",
-            cs.core_id,
-            cs.cumulative_test_time,
-            self._config.max_core_time_seconds,
-            settled_offset,
+        self.log_message.emit(
+            f"Core {cs.core_id}: time budget exceeded without confirmation; pausing for review"
         )
+        self.pause()
         return True
 
     def _accumulate_test_time(self, cs: CoreState, duration: float) -> None:
@@ -2489,9 +2522,8 @@ class TunerEngine(QObject):
         # reported core) before advancing.
         self._clear_cores_under_stress()
 
-        # Kernel events observed during the test that name OTHER cores are
-        # evidence about those cores, independent of this test's verdict.
-        foreign = self._foreign_mce_by_core(-1 if self._soaking else core_id, mce_json)
+        lacks_verdict = error_type in ("startup", "thermal")
+        foreign = self._foreign_mce_by_core(-1 if self._soaking or lacks_verdict else core_id, mce_json)
 
         # A start-time/environment failure (missing binary, scheduler
         # construction error, harness exception) is not a stability verdict —
@@ -2500,6 +2532,8 @@ class TunerEngine(QObject):
         # crash-resume streak is reset. Persist the cleared in_test flag and
         # revert the never-tested offset, then pause with the reason.
         if not passed and error_type == "startup":
+            if foreign:
+                self._apply_foreign_evidence(foreign)
             if self._session_id:
                 tp.save_core_state(self._db, self._session_id, cs)
             if self._status == "validating":
@@ -2543,6 +2577,11 @@ class TunerEngine(QObject):
         # transient. Cool down and retry. Handled for the search flow,
         # validation, and hunt slots alike.
         if not passed and error_type == "thermal":
+            if foreign:
+                self._apply_foreign_evidence(foreign)
+                if self._validation_stage > 0:
+                    self._validation_stage_exit_to_search()
+                    return
             if self._hunting:
                 self._validation_thermal_aborts += 1
                 if self._validation_thermal_aborts > self._config.max_thermal_retries:
@@ -2735,13 +2774,10 @@ class TunerEngine(QObject):
 
         cs = self._core_states[core_id]
         self._accumulate_test_time(cs, duration)
+        self._advance_core(core_id, passed)
         if self._check_time_budget(cs):
             tp.save_core_state(self._db, self._session_id, cs)
-            QTimer.singleShot(0, self._run_next)
             return
-
-        # Advance state machine
-        self._advance_core(core_id, passed)
 
         # Continue with the next test on a fresh event-loop stack (matches the
         # validation path) so a synchronous start failure cannot recurse back
@@ -2972,7 +3008,7 @@ class TunerEngine(QObject):
         # already validating), enter multi-core validation instead of completing.
         if (
             self._config.auto_validate
-            and self._status != "validating"
+            and self._validation_stage == 0
             and len(profile) > 1  # single-core has nothing to cross-validate
         ):
             self.log_message.emit(f"All {len(profile)} cores confirmed — entering multi-core validation")
@@ -3066,7 +3102,7 @@ class TunerEngine(QObject):
             self._validation_stage = min(resume_from.validation_stage, 6)
             self._validation_core_index = max(0, min(resume_from.validation_index, len(self._validation_core_order)))
             self._validation_half_index = max(0, min(resume_from.validation_half, len(self._validation_halves)))
-            self._validation_dirty = resume_from.validation_dirty
+            self._validation_dirty = self._validation_dirty or resume_from.validation_dirty
             try:
                 raw = json.loads(resume_from.validation_requeue)
             except (json.JSONDecodeError, TypeError):
@@ -3234,6 +3270,10 @@ class TunerEngine(QObject):
             cores_to_test=cores,
             stop_on_error=True,
             cycle_count=1,
+            max_temperature=self._config.max_temperature_c,
+            over_temp_grace_seconds=self._config.over_temp_grace_seconds,
+            over_temp_hard_margin=self._config.over_temp_hard_margin_c,
+            require_thermal_sensor=not self._config.allow_missing_thermal_sensor,
         )
         try:
             scheduler = CoreScheduler(
@@ -3734,6 +3774,7 @@ class TunerEngine(QObject):
 
     def _validation_stage_exit_to_search(self) -> None:
         """Leave validation so demoted cores re-earn; the cursor stays put."""
+        self._validation_stage = 0
         self._set_status("running")
         if self._session_id:
             tp.update_session_status(self._db, self._session_id, "running")
@@ -3802,6 +3843,9 @@ class TunerEngine(QObject):
         """
         if self._smu is None:
             return False
+        if getattr(self._smu, "dry_run", False) is True:
+            raise RuntimeError("Disable SMU Dry Run before tuning; simulated writes cannot prove offsets")
+        self._co_applied[core_id] = None
         survived = not self._is_more_aggressive(value, self._co_survived.get(core_id, 0))
         if self._session_id is not None:
             tp.journal_co_intent(self._db, self._session_id, core_id, value, survived)

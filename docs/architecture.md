@@ -11,7 +11,17 @@ phases, watches for containment escapes, stalls, and thermal trips, parses backe
 output, and refuses to launch when a backend's config is absent rather than letting the
 tool fall back to a full-machine default. Processes run in their own process group for
 clean teardown; a launch with no available cgroup mechanism is refused, never run
-uncontained.
+uncontained. The scope probe tries to widen its affinity and requires the effective
+mask to remain CPU 0; merely accepting AllowedCPUs is not sufficient.
+
+Unreadable live kernel logs are environment faults, not empty error sets. Stress,
+idle, and soak windows force a closing MCE read before issuing a verdict. Transition
+loads use the same classified results and thermal policy as sustained loads.
+
+The tuner refuses simulated SMU writes and CPU maps with offline present CPUs.
+A cached offset becomes unknown before a hardware write, so failed readback cannot
+suppress later restoration. Manual/memory stress and tuner actions are exclusive;
+a paused tuner retains ownership until resumed or aborted, including on window close.
 
 ## Source layout
 

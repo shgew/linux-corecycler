@@ -9,6 +9,25 @@ following [Keep a Changelog](https://keepachangelog.com/) and
 Current version: 0.0.1. A per-core CPU stability tester and AMD PBO Curve
 Optimizer tuner for Linux, packaged as a NixOS module with an overlay.
 
+### Fixed (2026-09-19 tuning safety review)
+
+- Require real confirmation and hardening at fallback offsets, including stock
+  and inherited baselines. Contradicted pass bounds lose their credit; time
+  limits and baseline failures pause rather than certify an unproven profile.
+- Refuse unreadable live kernel logs and force a final MCE read before a verdict.
+  Rapid transitions preserve failure classification and the configured thermal
+  policy. Named hardware errors survive simultaneous thermal/environment faults.
+- Verify that the systemd scope actually restricts affinity before launching
+  stress. Refuse CO access when offline CPUs make CCD addressing ambiguous.
+- Restore uncertain hardware after partially successful SMU writes. Reject
+  tuner dry-run mode, lock every GUI tuner entry point during external stress,
+  and retain paused-session ownership through shutdown.
+- Resume with the saved backend, preserve validation crash-attribution context
+  and clean-pass debt, and run staged validation after explicit reconfirmation.
+- Treat CLI help as help and refuse unknown arguments, malformed JSON, unknown
+  config keys, fractional integer settings, and non-finite values instead of
+  silently substituting defaults.
+
 ### Added (2026-09-19 the machine stays awake for the whole run)
 
 - A run now holds a logind `sleep:idle` lock for as long as it lasts, so the

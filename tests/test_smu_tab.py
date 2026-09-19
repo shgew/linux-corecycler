@@ -68,8 +68,17 @@ class TestTunerLock:
         assert tab._tuner_active is True
         assert not tab._apply_all_btn.isEnabled()
         assert not tab._reset_btn.isEnabled()
+        assert not tab._dry_run_cb.isEnabled()
         for spin in tab._spinboxes.values():
             assert not spin.isEnabled()
+
+    def test_stopping_tuner_does_not_unlock_an_unavailable_smu(self):
+        tab = _tab()
+        tab._smu = None
+        tab.set_tuner_running(False)
+        assert not tab._apply_all_btn.isEnabled()
+        assert not tab._reset_btn.isEnabled()
+        assert not tab._restore_btn.isEnabled()
 
     def test_tuner_stopped_reenables_writes(self):
         tab = _tab()
@@ -81,6 +90,7 @@ class TestTunerLock:
         tab.set_tuner_running(False)
         assert tab._tuner_active is False
         assert tab._apply_all_btn.isEnabled()
+        assert tab._dry_run_cb.isEnabled()
         for spin in tab._spinboxes.values():
             assert spin.isEnabled()
 

@@ -90,7 +90,7 @@ class FakeDetector:
     def reset(self) -> None:
         pass
 
-    def check_mce(self):
+    def check_mce(self, *, force=False):
         if self.batches:
             return self.batches.pop(0)
         return []
