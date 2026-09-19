@@ -32,6 +32,7 @@ from corecycler.engine.execution import busy_fraction as _busy_fraction
 from corecycler.engine.execution import cpu_times as _read_cpu_times
 from corecycler.engine.parallel import ParallelStress
 from corecycler.engine.scheduler import CoreScheduler, SchedulerConfig
+from corecycler.inhibit import SleepInhibitor
 from corecycler.monitor.msr import MSRReader
 from corecycler.smu.driver import core_map_blocked
 
@@ -48,6 +49,10 @@ if TYPE_CHECKING:
     from corecycler.smu.driver import RyzenSMU
 
 log = logging.getLogger(__name__)
+
+# Statuses in which the session is waiting on a human, not on hardware: the
+# machine may sleep again.
+DORMANT_STATUSES = frozenset({"idle", "paused", "quarantined"})
 
 
 def _has_unattributed_mce(mce_json: str) -> bool:
@@ -459,6 +464,7 @@ class TunerEngine(QObject):
         self._session_id: int | None = None
         self._core_states: dict[int, CoreState] = {}
         self._status: str = "idle"
+        self._sleep = SleepInhibitor("Curve Optimizer tuning session running")
         self._paused = False
         self._abort_requested = False
         self._consecutive_start_failures = 0
@@ -3772,6 +3778,10 @@ class TunerEngine(QObject):
 
     def _set_status(self, status: str) -> None:
         self._status = status
+        if status in DORMANT_STATUSES:
+            self._sleep.release()
+        else:
+            self._sleep.hold()
         self.status_changed.emit(status)
 
     def _emit_progress(self) -> None:

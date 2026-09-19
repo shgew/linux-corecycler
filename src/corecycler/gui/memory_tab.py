@@ -29,6 +29,7 @@ from corecycler.engine import execution
 from corecycler.engine.backends.base import KILLED_BY_US_CODES
 from corecycler.engine.backends.stressapptest import default_memory_mb
 from corecycler.gui.style import theme
+from corecycler.inhibit import SleepInhibitor
 from corecycler.monitor.memory import DIMMInfo, SPD5118Reader, read_dimm_info
 from corecycler.smu.pmtable import PMTableReader, compute_fclk_uclk_ratio
 
@@ -72,19 +73,20 @@ class _StressWorker(QThread):
                 self.done.emit(False, f"Unknown tool: {self._tool}")
                 return
 
-            self._process = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                preexec_fn=execution.make_preexec(),
-            )
-            try:
-                stdout, stderr = self._process.communicate(timeout=seconds + 60)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(OSError, ProcessLookupError):
-                    os.killpg(os.getpgid(self._process.pid), sig.SIGKILL)
-                stdout, stderr = self._process.communicate()
+            with SleepInhibitor("memory stress test running"):
+                self._process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    preexec_fn=execution.make_preexec(),
+                )
+                try:
+                    stdout, stderr = self._process.communicate(timeout=seconds + 60)
+                except subprocess.TimeoutExpired:
+                    with contextlib.suppress(OSError, ProcessLookupError):
+                        os.killpg(os.getpgid(self._process.pid), sig.SIGKILL)
+                    stdout, stderr = self._process.communicate()
 
             if self._tool == "stressapptest":
                 passed = "Status: PASS" in stdout

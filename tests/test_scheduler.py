@@ -169,6 +169,19 @@ class TestRunOrchestration:
         assert all(s.iterations == 1 for s in sched.core_status.values())
         assert sched.work_dir.is_dir()
 
+    def test_the_machine_may_not_suspend_while_cores_are_under_test(self, tmp_path, sleep_lock):
+        sched = make_scheduler(tmp_path, cores_to_test=[0])
+        held: list[bool] = []
+
+        def observe(sup, lanes, config_for, duration):
+            held.append(sleep_lock.held)
+            return {one.core_id: ok(one.core_id) for one in lanes}
+
+        ScriptedSupervisor.script = [observe]
+        sched.run()
+        assert held == [True]
+        assert not sleep_lock.held
+
     def test_one_thread_means_one_logical_cpu(self, tmp_path):
         sched = make_scheduler(tmp_path)
         seen: list[tuple[tuple[int, ...], int]] = []

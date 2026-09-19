@@ -9,6 +9,19 @@ following [Keep a Changelog](https://keepachangelog.com/) and
 Current version: 0.0.1. A per-core CPU stability tester and AMD PBO Curve
 Optimizer tuner for Linux, packaged as a NixOS module with an overlay.
 
+### Added (2026-09-19 the machine stays awake for the whole run)
+
+- A run now holds a logind `sleep:idle` lock for as long as it lasts, so the
+  desktop's idle timer cannot suspend the machine mid-test. Hours of tuning
+  look idle to logind - nobody touches the keyboard, and an idle soak runs no
+  load at all - and a suspend there loses the session with an unproven Curve
+  Optimizer offset still resident. The lock is held across a whole tuner
+  session (released only when it goes idle, paused or quarantined), around a
+  manual per-core run, and around a memory stress run; nested holders share one
+  lock. `systemd-inhibit` joins the optional tools `corecycler doctor` reports,
+  and a machine without it runs exactly as before, unprotected, with a debug
+  line saying so.
+
 ### Changed (2026-08-18 the app renders in the desktop's own colors)
 
 - CoreCycler no longer paints its own chrome. The 250-line hardcoded dark

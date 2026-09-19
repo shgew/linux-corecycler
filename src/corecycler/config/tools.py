@@ -134,6 +134,12 @@ TOOLS: dict[str, ExternalTool] = {
             names=("journalctl",),
         ),
         ExternalTool(
+            key="systemd-inhibit",
+            kind=OPTIONAL,
+            package="systemd",
+            names=("systemd-inhibit",),
+        ),
+        ExternalTool(
             key="notify-send",
             kind=OPTIONAL,
             package="libnotify",

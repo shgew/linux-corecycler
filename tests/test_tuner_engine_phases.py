@@ -971,6 +971,40 @@ class TestEvidenceGuards:
         assert engine._cores_under_stress == []
 
 
+class TestSuspendInhibition:
+    """A session is hours of an idle-looking machine: it must stay awake."""
+
+    def _engine(self, db, tmp_path, monkeypatch):
+        instance = TunerEngine(
+            db=db,
+            topology=_topo(),
+            smu=_smu(),
+            backend=_backend(),
+            config=_config(),
+            work_dir=tmp_path,
+        )
+        monkeypatch.setattr(instance, "_start_worker", MagicMock())
+        monkeypatch.setattr(eng.QTimer, "singleShot", lambda _ms, fn: None)
+        return instance
+
+    def test_a_started_session_keeps_the_machine_awake(self, db, tmp_path, monkeypatch, sleep_lock):
+        instance = self._engine(db, tmp_path, monkeypatch)
+        instance.start()
+        assert sleep_lock.held
+
+    def test_a_pause_lets_it_sleep_again(self, db, tmp_path, monkeypatch, sleep_lock):
+        instance = self._engine(db, tmp_path, monkeypatch)
+        instance.start()
+        instance.pause()
+        assert not sleep_lock.held
+
+    def test_a_finished_session_lets_it_sleep_again(self, db, tmp_path, monkeypatch, sleep_lock):
+        instance = self._engine(db, tmp_path, monkeypatch)
+        instance.start()
+        instance.abort()
+        assert not sleep_lock.held
+
+
 class TestLifecycleGuards:
     def test_pause_is_ignored_for_a_quarantined_session(self, engine):
         tp.update_session_status(engine._db, engine._session_id, "quarantined")

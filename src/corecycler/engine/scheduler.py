@@ -15,6 +15,7 @@ from corecycler.engine import execution
 from corecycler.engine.backends.base import StressConfig, StressResult
 from corecycler.engine.detector import ErrorDetector, MCEEvent
 from corecycler.engine.execution import Lane, SuperviseHooks, Supervisor, ThermalWatch
+from corecycler.inhibit import SleepInhibitor
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -137,18 +138,19 @@ class CoreScheduler:
 
         cores = self._get_test_cores()
         try:
-            for cycle in range(self.config.cycle_count):
-                self._current_cycle = cycle
-                if self._stop_event.is_set():
-                    break
-                for core_id in cores:
+            with SleepInhibitor("per-core stability test running"):
+                for cycle in range(self.config.cycle_count):
+                    self._current_cycle = cycle
                     if self._stop_event.is_set():
                         break
-                    self._test_core(core_id, cycle)
-                    if self.config.idle_between_cores > 0 and not self._stop_event.is_set():
-                        self._idle_phase(core_id, self.config.idle_between_cores, "inter-core idle")
-                for cb in self.on_cycle_complete:
-                    cb(cycle)
+                    for core_id in cores:
+                        if self._stop_event.is_set():
+                            break
+                        self._test_core(core_id, cycle)
+                        if self.config.idle_between_cores > 0 and not self._stop_event.is_set():
+                            self._idle_phase(core_id, self.config.idle_between_cores, "inter-core idle")
+                    for cb in self.on_cycle_complete:
+                        cb(cycle)
         finally:
             self.state = TestState.FINISHED
             for cb in self.on_test_complete:

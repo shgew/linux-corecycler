@@ -657,6 +657,38 @@ def tool_search_roots(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def no_real_sleep_inhibitor(monkeypatch):
+    """No test may hold a real logind lock, and none may inherit another's.
+
+    The suite runs on developer machines where systemd-inhibit is on PATH, so
+    spawning is stubbed out and the shared lock starts every test fresh. The
+    inhibitor's own tests replace these again.
+    """
+    from corecycler import inhibit
+
+    monkeypatch.setattr(inhibit, "_spawn", lambda reason: None)
+    monkeypatch.setattr(inhibit, "_shared", inhibit._SharedLock())
+
+
+@pytest.fixture
+def sleep_lock(no_real_sleep_inhibitor, monkeypatch):
+    """The shared inhibitor with a parked stand-in for systemd-inhibit.
+
+    `.held` answers whether the machine is currently kept awake.
+    """
+    from corecycler import inhibit
+
+    class Parked:
+        stdin = None
+
+        def wait(self, timeout=None):
+            return 0
+
+    monkeypatch.setattr(inhibit, "_spawn", lambda reason: Parked())
+    return inhibit._shared
+
+
+@pytest.fixture(autouse=True)
 def no_blocking_dialogs(monkeypatch):
     """A modal dialog in a test hangs the suite forever -- fail loudly instead.
 
