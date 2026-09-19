@@ -150,6 +150,29 @@ sudo .venv/bin/python src/corecycler/main.py
 Install stress backends and kernel modules separately (below). Requires Python 3.12+
 and PySide6 >= 6.7.
 
+## CPU containment
+
+Non-root stress testing requires the cgroup v2 `cpuset` controller to be delegated
+to the systemd user manager. Accepting `AllowedCPUs=` is not enough: without that
+controller, a user scope can still run on every CPU. CoreCycler verifies enforcement
+before launching a workload and refuses an ineffective scope.
+
+The NixOS module adds `Delegate=cpuset` to `user@.service`, preserving systemd's
+existing delegated controllers. This is enabled with `services.corecycler.enable`,
+independently of device access or the MSR capability launcher. Rebuild NixOS and
+start a fresh user manager by rebooting or fully ending all user sessions.
+
+On other systemd distributions, install a system-level drop-in at
+`/etc/systemd/system/user@.service.d/90-corecycler-cpuset.conf`:
+
+```ini
+[Service]
+Delegate=cpuset
+```
+
+Run `sudo systemctl daemon-reload`, then start a fresh user manager as above. Do
+not restart `user@.service` while using the desktop: that terminates its processes.
+
 ## Device access
 
 Stress testing and temperature monitoring work as your own user. Everything that reads a

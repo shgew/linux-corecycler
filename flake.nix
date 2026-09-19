@@ -273,6 +273,11 @@
               };
             }
             // inputs.nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+              user-containment = import ./nix/containment-test.nix {
+                pkgs = b.pkgs;
+                corecyclerModule = import ./nix/module.nix { inherit (inputs) self; };
+              };
+
               # The out-of-tree modules compile against the user's own kernel, so an
               # upstream header move is a user-visible FTBFS nothing here would catch.
               # Both ends of the range nixpkgs offers are built on purpose.

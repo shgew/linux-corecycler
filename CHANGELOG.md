@@ -11,6 +11,9 @@ Optimizer tuner for Linux, packaged as a NixOS module with an overlay.
 
 ### Fixed (2026-09-19 tuning safety review)
 
+- Delegate the cpuset controller to systemd user managers in the NixOS module,
+  making non-root CPU containment enforceable. A booted VM regression checks
+  actual affinity-widening attempts and preservation of existing controllers.
 - Require real confirmation and hardening at fallback offsets, including stock
   and inherited baselines. Contradicted pass bounds lose their credit; time
   limits and baseline failures pause rather than certify an unproven profile.

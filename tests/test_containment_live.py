@@ -13,9 +13,8 @@ import time
 
 import pytest
 
-from _contract_hw import require
-
 from corecycler.engine import containment, execution
+from tests._contract_hw import require
 
 pytestmark = pytest.mark.contract
 

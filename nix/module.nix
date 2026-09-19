@@ -144,6 +144,8 @@ in
       }
     ];
 
+    systemd.services."user@".serviceConfig.Delegate = "cpuset";
+
     environment.systemPackages = [ package ];
 
     # Login autostart: the app itself enforces the guards (mid-run sessions

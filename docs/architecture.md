@@ -12,7 +12,8 @@ output, and refuses to launch when a backend's config is absent rather than lett
 tool fall back to a full-machine default. Processes run in their own process group for
 clean teardown; a launch with no available cgroup mechanism is refused, never run
 uncontained. The scope probe tries to widen its affinity and requires the effective
-mask to remain CPU 0; merely accepting AllowedCPUs is not sufficient.
+mask to remain CPU 0; merely accepting AllowedCPUs is not sufficient. Non-root
+launches require [cpuset delegation](installation.md#cpu-containment).
 
 Unreadable live kernel logs are environment faults, not empty error sets. Stress,
 idle, and soak windows force a closing MCE read before issuing a verdict. Transition
