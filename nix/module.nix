@@ -25,6 +25,9 @@ let
   inherit (pkgs.stdenv.hostPlatform) system;
   package =
     if cfg.unfreeBackends then self.packages.${system}.full else self.packages.${system}.default;
+  # The MSR launcher only exists when the group that may execute it does.
+  msrWrapper = cfg.deviceAccess && cfg.msrAccess;
+  launcher = if msrWrapper then "/run/wrappers/bin/corecycler" else lib.getExe package;
   zenpowerPkg = pkgs.callPackage ./zenpower.nix {
     inherit (config.boot.kernelPackages) kernel;
   };
@@ -117,6 +120,12 @@ in
       description = "Username to grant device access to (added to the corecycler group). Required when deviceAccess is true.";
     };
 
+    msrAccess = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = "Whether to install `/run/wrappers/bin/corecycler`, a setcap launcher holding CAP_SYS_RAWIO. `msr_open` in the kernel demands that capability before it looks at the file mode, so the group and udev rule of deviceAccess do not by themselves make `/dev/cpu/*/msr` readable: without this launcher, clock stretch detection, per-core RAPL power and MSR package power stay root-only. The application clears the ambient set at startup, so no stress payload inherits the capability. Only the corecycler group may execute the launcher, because a launcher a user can run is a launcher whose interpreter environment they control -- the same trust the SMU mailbox already requires of that group. Requires deviceAccess.";
+    };
+
     autoResume = {
       enable = lib.mkEnableOption "resuming the active tuner session automatically after login (freeze-and-continue without clicks). Runs sudo-less via the corecycler device-access group.";
       delaySeconds = lib.mkOption {
@@ -144,7 +153,7 @@ in
         [Desktop Entry]
         Type=Application
         Name=CoreCycler auto-resume
-        Exec=${lib.getExe package} --auto-resume ${toString cfg.autoResume.delaySeconds}
+        Exec=${launcher} --auto-resume ${toString cfg.autoResume.delaySeconds}
         X-GNOME-Autostart-enabled=true
       '';
     };
@@ -160,6 +169,19 @@ in
     services.udev.extraRules = lib.mkIf cfg.deviceAccess ''
       SUBSYSTEM=="msr", KERNEL=="msr[0-9]*", GROUP="corecycler", MODE="0640"
     '';
+
+    # A /dev/cpu/N/msr open is refused without CAP_SYS_RAWIO whatever the file
+    # mode says, so the group read above is only reachable through a setcap
+    # launcher. The wrapper raises the capability into the ambient set, the one
+    # set that survives the exec of an interpreted entry point; the application
+    # empties that set before it spawns anything.
+    security.wrappers.corecycler = lib.mkIf msrWrapper {
+      owner = "root";
+      group = "corecycler";
+      permissions = "u+rx,g+x,o-rwx";
+      capabilities = "cap_sys_rawio+p";
+      source = lib.getExe package;
+    };
 
     # --- Kernel modules ---
     # In-tree modules loaded via boot.kernelModules, out-of-tree via extraModulePackages

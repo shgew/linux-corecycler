@@ -295,9 +295,9 @@ class TunerTab(QWidget):
         self._stretch_threshold_spin.setValue(3.0)
         self._stretch_threshold_spin.setSuffix("%")
         self._stretch_threshold_spin.setToolTip(
-            "Clock stretch threshold — if APERF/MPERF stretch exceeds this %\n"
+            "Clock stretch threshold - if APERF/MPERF stretch exceeds this %\n"
             "during a test, mark it as FAIL even if stress test passed.\n"
-            "0 = disabled. 3% = recommended. Requires root (MSR access)."
+            "0 = disabled. 3% = recommended. Needs MSR access (CAP_SYS_RAWIO)."
         )
 
         # Check MSR availability and warn if unavailable
@@ -313,8 +313,9 @@ class TunerTab(QWidget):
         if not msr_available:
             self._stretch_threshold_spin.setEnabled(False)
             self._stretch_threshold_spin.setToolTip(
-                "MSR access unavailable — clock stretch detection disabled.\n"
-                "Requires msr kernel module and read permission on /dev/cpu/*/msr."
+                "MSR access unavailable - clock stretch detection disabled.\n"
+                "Needs the msr kernel module and CAP_SYS_RAWIO: launch through the\n"
+                "setcap launcher (services.corecycler.msrAccess on NixOS) or run as root."
             )
             self._stretch_threshold_spin.setStyleSheet(f"color: {theme.COLOR_MUTED};")
 
