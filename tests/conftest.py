@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import struct
+import subprocess
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -686,6 +687,32 @@ def sleep_lock(no_real_sleep_inhibitor, monkeypatch):
 
     monkeypatch.setattr(inhibit, "_spawn", lambda reason: Parked())
     return inhibit._shared
+
+
+@pytest.fixture(autouse=True)
+def no_desktop_notifications(monkeypatch):
+    """No test may pop a real toast on the developer's desktop.
+
+    notify-send sits on the PATH of any desktop machine and the headless
+    outcome path reads the user's own settings file, so an ordinary cmd_run
+    test fires a genuine notification. Stand in for the single call that
+    spawns the binary and hand back the argv that would have gone out; the
+    notifier's own tests replace this again.
+    """
+    from corecycler import notify
+
+    dispatched: list[list[str]] = []
+
+    def run(argv, **_kwargs):
+        dispatched.append([str(a) for a in argv])
+        return subprocess.CompletedProcess(argv, 0, b"", b"")
+
+    monkeypatch.setattr(
+        notify,
+        "subprocess",
+        SimpleNamespace(run=run, TimeoutExpired=subprocess.TimeoutExpired),
+    )
+    return dispatched
 
 
 @pytest.fixture(autouse=True)

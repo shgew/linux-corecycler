@@ -549,6 +549,20 @@ class TestNotifyOutcome:
         cli._notify_outcome(cli.EXIT_COMPLETED)
         assert "notification failed" in capsys.readouterr().err
 
+    def test_an_outcome_is_captured_by_the_guard_not_sent_to_the_desktop(
+        self, monkeypatch, on_path, no_desktop_notifications
+    ):
+        from types import SimpleNamespace
+
+        on_path({"notify-send": "/usr/bin/notify-send"})
+        monkeypatch.setattr(cli, "load_settings", lambda: SimpleNamespace(notify_on_completion=True))
+        cli._notify_outcome(cli.EXIT_QUARANTINED)
+        assert len(no_desktop_notifications) == 1
+        argv = no_desktop_notifications[0]
+        assert argv[0] == "/usr/bin/notify-send"
+        assert "critical" in argv
+        assert "Tuning quarantined" in argv
+
 
 class TestDoctor:
     def _resolutions(self, present):

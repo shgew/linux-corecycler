@@ -9,6 +9,8 @@ the color values themselves.
 from __future__ import annotations
 
 import sys as _sys
+from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -267,28 +269,51 @@ class TestThemeIsLiveNotFrozen:
             _ = style.theme.COLOR_INVENTED
 
 
+class _FakeDesktop:
+    """A desktop whose color scheme the test owns.
+
+    The real QStyleHints cannot be forced: XCB ignores setColorScheme, so
+    driving the app itself would make the assertions follow whichever theme
+    the developer happens to run.
+    """
+
+    def __init__(self, palette, scheme, widgets):
+        self._palette = palette
+        self._scheme = scheme
+        self._widgets = widgets
+        self._slots = []
+        self.colorSchemeChanged = SimpleNamespace(connect=self._slots.append)
+
+    def styleHints(self):
+        return self
+
+    def colorScheme(self):
+        return self._scheme
+
+    def palette(self):
+        return self._palette
+
+    def allWidgets(self):
+        return self._widgets
+
+    def change(self, palette, scheme):
+        self._palette, self._scheme = palette, scheme
+        for slot in list(self._slots):
+            slot(scheme)
+
+
 class TestFollowingTheDesktop:
     def test_takes_the_desktop_scheme_at_start_and_again_when_it_changes(self):
-        from PySide6.QtWidgets import QApplication, QWidget
-
-        app = QApplication.instance() or QApplication([])
-        original = QPalette(app.palette())
-        probe = QWidget()
+        widget = MagicMock()
+        desktop = _FakeDesktop(BREEZE_DARK, Qt.ColorScheme.Dark, [widget])
         try:
-            style.follow(app)
-            assert style.theme.scheme == style.scheme_for(app.styleHints().colorScheme(), app.palette())
-
-            app.setPalette(BREEZE_DARK)
-            app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Dark)
+            style.follow(desktop)
             assert style.theme.scheme == style.DARK
             assert BREEZE_DARK.color(QPalette.ColorRole.Base).name() == style.theme.BG_PANEL_DARK
 
-            app.setPalette(BREEZE_LIGHT)
-            app.styleHints().colorSchemeChanged.emit(Qt.ColorScheme.Light)
+            desktop.change(BREEZE_LIGHT, Qt.ColorScheme.Light)
             assert style.theme.scheme == style.LIGHT
             assert BREEZE_LIGHT.color(QPalette.ColorRole.Base).name() == style.theme.BG_PANEL_DARK
+            assert widget.update.called
         finally:
-            app.styleHints().colorSchemeChanged.disconnect()
-            app.setPalette(original)
-            probe.deleteLater()
             style.use_scheme(style.LIGHT, QPalette())
