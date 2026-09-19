@@ -54,6 +54,7 @@ services.corecycler = {
 | `spd5118` | bool | `false` | Load spd5118 + i2c_dev for DDR5 DIMM temperature monitoring |
 | `deviceAccess` | bool | `true` | Grant `deviceAccessUser` access to MSR/SMU sysfs without sudo |
 | `deviceAccessUser` | string | `""` | Username for device access (required when `deviceAccess` is true) |
+| `msrAccess` | bool | `true` | Install `/run/wrappers/bin/corecycler`, a setcap launcher holding CAP_SYS_RAWIO, the capability an MSR open requires (corecycler group only) |
 | `autoResume.enable` | bool | `false` | Resume the active tuner session after login, sudo-less via the device-access group |
 | `autoResume.delaySeconds` | int | `120` | Settle time after login before that resume runs |
 
@@ -179,8 +180,24 @@ The better option: a GUI then runs as your own user, in your own session, with y
 settings and file ownership.
 
 On NixOS the module does it -- set `deviceAccess = true` (the default) and
-`deviceAccessUser` to your username. On other distros there are three parts. The group,
-the MSR udev rule and unrestricted `dmesg`:
+`deviceAccessUser` to your username.
+
+One part of this is not a permission at all. `msr_open` in the kernel starts with
+`if (!capable(CAP_SYS_RAWIO)) return -EPERM;`, before any file mode is consulted, so the
+group and the udev rule below never make `/dev/cpu/*/msr` readable on their own: the
+process itself has to hold the capability. `msrAccess` (on by default with `deviceAccess`)
+installs a setcap launcher at `/run/wrappers/bin/corecycler`, which comes first in `PATH`,
+so a terminal run and the desktop entry both pick it up. It raises CAP_SYS_RAWIO into the
+ambient set, the only set that survives the exec of an interpreted entry point, and the
+application empties that set at startup so no stress payload inherits it. Only the
+corecycler group may execute the launcher: whoever can run it controls the interpreter
+environment it starts, which is the trust the SMU mailbox already asks of that group.
+Anyone outside the group finds that launcher in `PATH` and may not execute it, so on a
+shared machine they run `/run/current-system/sw/bin/corecycler` instead and get everything
+except the MSR metrics. Set `msrAccess = false` to remove the launcher entirely.
+
+On other distros there are three parts. The group, the MSR udev rule and unrestricted
+`dmesg`:
 
 ```bash
 sudo groupadd -f corecycler && sudo usermod -aG corecycler "$USER"
@@ -193,6 +210,22 @@ sudo sysctl --system && sudo udevadm control --reload && sudo modprobe msr
 Then the SMU permissions oneshot, which is under
 [ryzen_smu kernel module](#ryzen_smu-kernel-module) because it has to be ordered after the
 module loads. Log out and back in for the group to take effect.
+
+That covers everything except MSR, which still needs the capability. Without a NixOS-style
+wrapper the practical way is to grant it to the interpreter of a dedicated virtualenv,
+kept executable only by the corecycler group:
+
+```bash
+sudo cp --remove-destination "$(readlink -f .venv/bin/python3)" .venv/bin/python3
+sudo chown root:corecycler .venv/bin/python3
+sudo chmod 0750 .venv/bin/python3
+sudo setcap cap_sys_rawio+ep .venv/bin/python3
+```
+
+Treat that interpreter as privileged: file capabilities are ignored on `nosuid` mounts, and
+anyone who can execute it gets CAP_SYS_RAWIO with a Python environment of their choosing.
+A shared virtualenv or a system-wide `python3` is the wrong target. Running as root is the
+simpler answer if that trade does not suit you.
 
 ### Or run as root
 

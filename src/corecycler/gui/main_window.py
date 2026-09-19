@@ -281,10 +281,12 @@ class MainWindow(QMainWindow):
         self._status_bar.addWidget(self._status_msg)
 
         missing: list[str] = []
+        msr_missing = False
         try:
             fd = os.open("/dev/cpu/0/msr", os.O_RDONLY)
             os.close(fd)
-        except (OSError, PermissionError):
+        except OSError:
+            msr_missing = True
             missing.append("MSR (clock stretch, per-core power, package power)")
         if not Path("/sys/kernel/ryzen_smu_drv/smu_args").exists() or not os.access(
             "/sys/kernel/ryzen_smu_drv/smu_args", os.W_OK
@@ -292,8 +294,14 @@ class MainWindow(QMainWindow):
             missing.append("Curve Optimizer (SMU)")
         if missing:
             priv_label = QLabel(
-                "  ⚠ " + " and ".join(missing) + " unavailable — check device permissions or run as root"
+                "  ⚠ " + " and ".join(missing) + " unavailable - check device permissions or run as root"
             )
+            if msr_missing:
+                priv_label.setToolTip(
+                    "Opening /dev/cpu/N/msr needs CAP_SYS_RAWIO, which no file mode or group can "
+                    "grant. Launch through the setcap launcher (services.corecycler.msrAccess on "
+                    "NixOS installs it at /run/wrappers/bin/corecycler) or run as root."
+                )
             priv_label.setStyleSheet(f"color: {theme.COLOR_WARN_SOFT}; font: 10px monospace;")
             self._status_bar.addPermanentWidget(priv_label)
 

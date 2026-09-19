@@ -74,6 +74,16 @@ being asked is exactly what sudo's `secure_path` exists to prevent.
 
 - A dedicated `corecycler` system group provides device access without sudo.
 - **MSR:** `MODE="0640"` — root read/write, group read-only, world none.
+- **CAP_SYS_RAWIO:** that file mode alone grants nothing. `msr_open` in the kernel refuses
+  the open outright unless the caller holds CAP_SYS_RAWIO, so `msrAccess` installs
+  `/run/wrappers/bin/corecycler`, a setcap launcher owned `root:corecycler` and executable
+  by that group only. A launcher reached through the ambient set does not run in
+  secure-exec mode, so whoever may execute it also chooses the interpreter environment it
+  starts (`PYTHONPATH` is honoured): executing the launcher is worth the capability itself.
+  Grant the group only to a user already trusted with the SMU mailbox. The application
+  empties the ambient and inheritable sets at startup (`capabilities.confine()`), so no
+  stress payload it spawns inherits the capability; when the ambient set cannot be cleared,
+  every capability is dropped instead and MSR telemetry stays off.
 - **SMU sysfs:** `0660 root:corecycler` — group read/write (enables CO writes without root).
 - Any user in the `corecycler` group can send arbitrary SMU commands, not limited to CO.
 - **SMN (`smn`):** also `0660 root:corecycler`. Reading an SMN register is a *write* of its

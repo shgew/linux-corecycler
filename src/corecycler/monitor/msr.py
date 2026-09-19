@@ -1,6 +1,8 @@
 """Safe read-only MSR (Model-Specific Register) access for AMD Zen CPUs.
 
-Reads from /dev/cpu/N/msr — requires root and the 'msr' kernel module.
+Reads from /dev/cpu/N/msr - needs the 'msr' kernel module and CAP_SYS_RAWIO,
+which the kernel demands on open before it looks at the file mode (root, or
+the setcap launcher; see corecycler.capabilities).
 ALL operations are strictly read-only. No MSR writes are ever performed.
 """
 

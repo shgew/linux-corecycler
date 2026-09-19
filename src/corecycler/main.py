@@ -303,6 +303,12 @@ def main() -> int:
 
     setup_logging()
 
+    # A setcap launcher may have handed this process CAP_SYS_RAWIO for MSR
+    # reads; no stress payload it spawns may inherit it.
+    from corecycler import capabilities
+
+    capabilities.confine()
+
     argv = sys.argv[1:]
     if argv and argv[0] in ("-h", "--help"):
         from corecycler.cli import USAGE
