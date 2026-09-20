@@ -903,3 +903,4 @@ class TestContainment:
 
     def test_an_unreadable_proc_observes_nothing(self, tmp_path):
         assert containment.observed_tree_cpus(4242, proc_base=tmp_path / "gone") == set()
+
