@@ -154,15 +154,30 @@ def run_one(supervisor: Supervisor, one: Lane, duration: float):
     return supervisor.run([one], lambda _lane: StressConfig(), duration)[one.core_id]
 
 
+def wait_for(marker: Path, timeout: float = 60.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+
 class TestVerdictProvenance:
-    def test_stdout_error_survives_deadline_cleanup(self, tmp_path):
-        backend = FakeBackend(_child("import time; print('FATAL ERROR', flush=True); time.sleep(60)"))
+    def test_stdout_error_survives_cleanup(self, tmp_path):
+        printed = tmp_path / "printed"
+        backend = FakeBackend(
+            _child(f"import time; print('FATAL ERROR', flush=True); open('{printed}', 'w').close(); time.sleep(60)")
+        )
         backend.parse_output = lambda out, err, rc: (
             "FATAL ERROR" not in out,
             "FATAL ERROR" if "FATAL ERROR" in out else None,
         )
-        supervisor, _, _ = make_supervisor(backend)
-        verdict = run_one(supervisor, lane(tmp_path), 0.3)
+        stop = threading.Event()
+
+        def stop_once_printed(_core, _elapsed):
+            wait_for(printed)
+            stop.set()
+
+        supervisor, _, _ = make_supervisor(backend, stop_event=stop, hooks=SuperviseHooks(on_status=stop_once_printed))
+        verdict = run_one(supervisor, lane(tmp_path), 30.0)
         assert verdict is not None and not verdict.passed
         assert verdict.error_type == "computation"
 
@@ -410,8 +425,13 @@ class TestVerdicts:
     def test_no_stress_process_outlives_the_run(self, tmp_path):
         marker = tmp_path / "pid"
         backend = FakeBackend(_child(f"import os, time; open('{marker}', 'w').write(str(os.getpid())); time.sleep(30)"))
-        supervisor, stop, _ = make_supervisor(backend)
-        threading.Timer(0.2, stop.set).start()
+        stop = threading.Event()
+
+        def stop_once_running(_core, _elapsed):
+            wait_for(marker)
+            stop.set()
+
+        supervisor, _, _ = make_supervisor(backend, stop_event=stop, hooks=SuperviseHooks(on_status=stop_once_running))
         run_one(supervisor, lane(tmp_path), 10.0)
         pid = int(marker.read_text())
         deadline = time.monotonic() + 3
