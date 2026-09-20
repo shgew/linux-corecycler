@@ -288,6 +288,59 @@ class TestForensicAttribution:
 
 
 class TestCrashHunt:
+    def test_completed_hunt_slot_is_not_in_flight_after_reload(self, db, topo_dual_ccd_x3d, mock_backend):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_hardened_validating(eng, db, BEST, BASELINES)
+        eng._clear_all_in_test()
+        eng._start_worker = lambda *a, **k: None
+        eng._start_hunt()
+        core_id = tp.get_session(db, eng._session_id).hunting_core
+
+        eng._on_test_finished(core_id, True, "", "", 60.0, 0.0)
+
+        persisted = tp.load_core_states(db, eng._session_id)
+        assert not any(cs.in_test for cs in persisted.values())
+        assert tp.get_session(db, eng._session_id).hunting_core is None
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_fruitless_hunt_leaves_stock_without_changing_learned_offsets(
+        self, db, topo_dual_ccd_x3d, mock_backend, dry_run
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1)
+        _seed_hardened_validating(eng, db, BEST, BASELINES)
+        eng._co_applied = dict(BEST)
+        eng._smu.written = dict(BEST)
+        eng._hunting = True
+        if dry_run:
+            eng._smu = None
+
+        eng._end_hunt_fruitless()
+
+        assert eng.status == "paused"
+        if not dry_run:
+            assert eng._smu.written == dict.fromkeys(BEST, 0)
+        assert tp.journal_values(db, eng._session_id) == (BEST if dry_run else dict.fromkeys(BEST, 0))
+        persisted = tp.load_core_states(db, eng._session_id)
+        assert {c: cs.best_offset for c, cs in persisted.items()} == BEST
+        assert not any(cs.in_test for cs in persisted.values())
+
+    def test_fruitless_hunt_cannot_resume_validation_after_stock_restore_fails(
+        self, db, topo_dual_ccd_x3d, mock_backend
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_hardened_validating(eng, db, BEST, BASELINES)
+        eng._co_applied = dict(BEST)
+        eng._smu.written = dict(BEST)
+        eng._smu.set_co_offset = lambda core, value: False
+        eng._hunting = True
+        continued = []
+        eng._enter_auto_validation = lambda profile, **kw: continued.append(profile)
+
+        eng._end_hunt_fruitless()
+
+        assert eng.status == "paused"
+        assert continued == []
+
     def test_hunt_orders_by_suspicion_and_isolates_first_suspect(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         _seed_hardened_validating(eng, db, BEST, BASELINES)
@@ -309,7 +362,6 @@ class TestCrashHunt:
         eng._start_worker = lambda *a, **k: None  # no real worker threads
         eng._start_hunt()
 
-        assert eng._hunt_queue[0:0] == []  # first suspect already popped
         assert eng.status == "hunting"
         # First slot: core 5 at its tuned value, every other core at stock.
         assert eng._smu.written[5] == -30

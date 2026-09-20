@@ -47,6 +47,7 @@ def _seed(db, topo, backend, **cfg):
     _seed_hardened_validating(eng, db, BEST, BASELINES)
     for cs in eng._core_states.values():
         cs.in_test = False
+        tp.save_core_state(db, eng._session_id, cs)
     eng._set_status("validating")
     eng._validation_core_order = list(ORDER)
     eng.solo = []
@@ -193,6 +194,8 @@ class TestEnduranceCrashHunt:
             lambda name: backend_names.append(name) or mock_backend,
         )
 
+        queued = []
+        monkeypatch.setattr(engine_module.QTimer, "singleShot", lambda _ms, fn: queued.append(fn))
         eng._start_hunt()
 
         hunted_core, _logical_cpu, scheduler = worker_type.call_args.args
@@ -205,6 +208,37 @@ class TestEnduranceCrashHunt:
         assert scheduler.config.seconds_per_core >= 1200
         assert eng._smu.written[hunted_core] == BEST[hunted_core]
         assert all(eng._smu.written[core] == 0 for core in ORDER if core != hunted_core)
+
+        eng._on_test_finished(hunted_core, True, "", "", 1200.0, 0.0)
+        assert not any(cs.in_test for cs in tp.load_core_states(db, eng._session_id).values())
+        queued.pop(0)()
+        spectrum_core, _logical_cpu, scheduler = worker_type.call_args.args
+        assert spectrum_core == hunted_core
+        assert scheduler.stress_config.mode is StressMode.AVX2
+        assert scheduler.stress_config.fft_preset is FFTPreset.LARGE
+        assert scheduler.stress_config.threads == 1
+        assert scheduler.config.variable_load is True
+        assert scheduler.config.idle_stability_test > 0
+        assert scheduler.config.seconds_per_core == eng._config.spectrum_slot_seconds
+        assert tp.get_session(db, eng._session_id).hunting_core == hunted_core
+        assert all(eng._smu.written[core] == 0 for core in ORDER if core != hunted_core)
+
+        eng._on_test_finished(hunted_core, False, "thermal stop", "thermal", 1.0, 0.0)
+        queued.pop(0)()
+        retry_core, _logical_cpu, scheduler = worker_type.call_args.args
+        assert retry_core == hunted_core
+        assert scheduler.config.variable_load is True
+        assert eng._smu.written[hunted_core] == BEST[hunted_core]
+
+        eng._on_test_finished(hunted_core, True, "", "", 60.0, 0.0)
+        rows = tp.get_test_log(db, eng._session_id, hunted_core)
+        assert [row["profile"] for row in rows] == ["sustained", "spectrum"]
+        queued.pop(0)()
+        next_core, _logical_cpu, scheduler = worker_type.call_args.args
+        assert next_core != hunted_core
+        assert scheduler.config.variable_load is False
+        assert eng._smu.written[hunted_core] == 0
+        assert {c for c, cs in tp.load_core_states(db, eng._session_id).items() if cs.in_test} == {next_core}
 
 
 class TestAllCoreWorkloadLaunch:

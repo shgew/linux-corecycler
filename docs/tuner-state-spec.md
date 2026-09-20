@@ -96,8 +96,12 @@ Evidence outranks policy; a guess is never written. Priority order:
    penalize NOBODY; run the isolated crash hunt - per-core
    slots at the tuned value with all other cores at stock, most suspect
    first (prior MCE rows, crash history, deepest undervolt). A slot failure
-   convicts its core. After `max_unattributed_crash_hunts` fruitless hunts
-   in a row the session pauses for the owner.
+   convicts its core. Completed slots clear their persisted in-test markers before
+   another slot starts. A fruitless hunt restores every participating core to
+   stock without changing learned offsets; a failed restoration pauses and never
+   resumes validation. After `max_unattributed_crash_hunts` fruitless hunts in a
+   row the session pauses for the owner. Isolated passes do not prove that the
+   combined offset profile is stable.
 
 Cross-core MCE evidence during a live test uses `_apply_crash_penalty` with
 `steps=1, count_crash=False` for corrected errors (one-step backoff, re-earn
@@ -122,5 +126,10 @@ Crash attribution treats stage 9 exactly like any other validation stage: the
 isolated hunt runs and nobody is convicted by guess. `unattributed_crashes`
 resets to 0 after every round that completed with no back-off. Endurance hunts
 replay the interrupted workload and at least its original duration in isolation.
+A sustained replay is followed on the same isolated core by a load/idle spectrum
+slot of `spectrum_slot_seconds`, using the same backend, mode, FFT preset and
+thread count. Thermal and apparatus retries remain in the interrupted sub-slot;
+only both passes advance to the next core. A workload that already uses the
+spectrum profile needs no duplicate spectrum slot.
 Hunt passes and non-verdict stops retain the resume-crash streak; a passing
 non-hunt test or a convicted hunt backoff clears it.

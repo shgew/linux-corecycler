@@ -516,6 +516,7 @@ class TunerEngine(QObject):
         self._hunt_queue: list[int] = []
         self._hunt_workload: dict | None = None
         self._hunt_duration = self._config.hunt_slot_seconds
+        self._hunt_spectrum = False
         self._soaking = False
         # Post-reboot kernel-journal harvest, injectable for tests.
         self._forensics = harvest_kernel_mce
@@ -1943,6 +1944,8 @@ class TunerEngine(QObject):
             reverse=True,
         )
         self._hunt_workload = None
+        self._hunt_spectrum = False
+        self._clear_all_in_test()
         self._hunt_duration = self._config.hunt_slot_seconds
         session = tp.get_session(self._db, self._session_id) if self._session_id is not None else None
         if session is not None and session.validation_stage == 9:
@@ -1960,6 +1963,31 @@ class TunerEngine(QObject):
         )
         self._run_next_hunt_slot()
 
+    def _restore_hunt_stock(self, *, exclude: int | None = None) -> bool:
+        if self._smu is None:
+            return True
+        for core_id in self._core_states:
+            if core_id == exclude or self._co_applied.get(core_id) == 0:
+                continue
+            try:
+                ok = self._apply_co(core_id, 0)
+            except Exception as e:
+                self.log_message.emit(
+                    f"Hunt: failed to restore core {core_id} to stock: {e}. "
+                    "Pausing with hardware state uncertain; reboot before further tuning."
+                )
+                self.pause()
+                return False
+            if not ok:
+                self.log_message.emit(
+                    f"Hunt: stock write rejected for core {core_id}. "
+                    "Pausing with hardware state uncertain; reboot before further tuning."
+                )
+                self.pause()
+                return False
+            self._co_applied[core_id] = 0
+        return True
+
     def _run_next_hunt_slot(self) -> None:
         if self._abort_requested or self._paused:
             return
@@ -1970,25 +1998,9 @@ class TunerEngine(QObject):
         cs = self._core_states[core_id]
         target = cs.best_offset if cs.best_offset is not None else cs.baseline_offset
 
+        if not self._restore_hunt_stock(exclude=core_id):
+            return
         if self._smu is not None:
-            for other_id in self._core_states:
-                if other_id == core_id or self._co_applied.get(other_id) == 0:
-                    continue
-                try:
-                    ok = self._apply_co(other_id, 0)
-                except Exception as e:
-                    self.log_message.emit(
-                        f"Hunt: failed to set core {other_id} to stock: {e}. Pausing (SMU issue, not a verdict)."
-                    )
-                    self.pause()
-                    return
-                if not ok:
-                    self.log_message.emit(
-                        f"Hunt: stock write rejected for core {other_id}. Pausing (SMU issue, not a verdict)."
-                    )
-                    self.pause()
-                    return
-                self._co_applied[other_id] = 0
             try:
                 ok = self._apply_co(core_id, target)
             except Exception as e:
@@ -2008,32 +2020,38 @@ class TunerEngine(QObject):
         if self._session_id is not None:
             tp.set_hunting_core(self._db, self._session_id, core_id)
         cs.current_offset = target
-        cs.in_test = True
-        tp.save_core_state(self._db, self._session_id, cs)
+        self._mark_cores_under_stress([core_id])
         self._last_tested_core = core_id
         self._emit_progress()
-        spectrum = self._hunt_workload is None or self._hunt_workload.get("profile") == "spectrum"
+        spectrum = (
+            self._hunt_spectrum or self._hunt_workload is None or self._hunt_workload.get("profile") == "spectrum"
+        )
+        duration = self._config.spectrum_slot_seconds if self._hunt_spectrum else self._hunt_duration
         backend, mode, fft, threads = self._get_active_stress_config(cs)
         label = tp.workload_label(backend, mode, fft, threads, "spectrum" if spectrum else "sustained")
         self.log_message.emit(
-            f"Hunt slot: core {core_id} at {target}, all other cores at stock; {label} for {self._hunt_duration}s"
+            f"Hunt slot: core {core_id} at {target}, all other cores at stock; {label} for {duration}s"
         )
-        self._start_worker(core_id, self._hunt_duration, spectrum=spectrum)
+        self._start_worker(core_id, duration, spectrum=spectrum)
 
     def _end_hunt_fruitless(self) -> None:
         """Every hunt slot passed — the crash stays honestly unattributed."""
         self._hunting = False
         if self._session_id is None:
             return
+        self._clear_all_in_test()
         tp.set_hunting_core(self._db, self._session_id, None)
+        if not self._restore_hunt_stock():
+            return
         n = tp.get_unattributed_crashes(self._db, self._session_id) + 1
         tp.set_unattributed_crashes(self._db, self._session_id, n)
         if n >= self._config.max_unattributed_crash_hunts:
             self.log_message.emit(
-                f"Crash hunt found no culprit ({n} unattributed crash(es) in a "
-                f"row). Pausing for your call instead of guessing: check the "
-                f"kernel journal around the freeze, consider PSU/memory/"
-                f"thermals, or lower max_offset, then Resume."
+                f"Crash hunt found no culprit ({n} unattributed crash(es) in a row). "
+                "Isolated tests passing does not rule out combined-offset or idle instability. "
+                "All hunt offsets restored to stock; learned offsets are unchanged. "
+                "Pausing without assigning blame. Review the kernel journal, memory, PSU and cooling "
+                "before explicitly resuming the unchanged profile."
             )
             self.pause()
             return
@@ -2053,6 +2071,10 @@ class TunerEngine(QObject):
             # loud non-CO warning, handled (not penalized) by evidence logic.
             self._apply_foreign_evidence(foreign)
         if passed:
+            if self._hunt_workload is not None and self._hunt_workload.get("profile") != "spectrum":
+                self._hunt_spectrum = not self._hunt_spectrum
+                if self._hunt_spectrum:
+                    self._hunt_queue.insert(0, core_id)
             QTimer.singleShot(0, self._run_next_hunt_slot)
             return
 

@@ -9,6 +9,16 @@ following [Keep a Changelog](https://keepachangelog.com/) and
 Current version: 0.0.1. A per-core CPU stability tester and AMD PBO Curve
 Optimizer tuner for Linux, packaged as a NixOS module with an overlay.
 
+### Fixed (2026-09-20 inconclusive crash hunts)
+
+- Persist completion of hunt slots so stale in-test flags cannot manufacture
+  another crash attribution after a later reboot.
+- Restore all hunt offsets to stock before leaving an inconclusive hunt, keeping
+  learned offsets intact and refusing to continue if a stock write fails.
+- Follow sustained endurance replays with an isolated load/idle spectrum slot
+  before moving to the next core. Passing isolated tests does not certify the
+  combined offset profile; repeated inconclusive hunts still pause without guessing.
+
 ### Fixed (2026-09-20 autonomous search audit)
 
 - Preserve real failure bounds during midpoint backoff, search the first failed
