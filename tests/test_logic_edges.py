@@ -9,7 +9,6 @@ from unittest.mock import MagicMock
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from corecycler.engine.backends.base import StressBackend, StressConfig
-from corecycler.engine.backends.mprime import MprimeBackend
 from corecycler.engine.backends.stressapptest import StressapptestBackend
 from corecycler.tuner import persistence
 

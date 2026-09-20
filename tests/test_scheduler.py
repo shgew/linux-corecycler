@@ -376,7 +376,10 @@ class TestRapidTransitions:
 
         def timed_fail(sup, lanes, config_for, duration):
             time.sleep(0.02)
-            return {one.core_id: StressResult(one.core_id, False, 0.02, "sensor unavailable", "thermal") for one in lanes}
+            return {
+                one.core_id: StressResult(one.core_id, False, 0.02, "sensor unavailable", "thermal")
+                for one in lanes
+            }
 
         ScriptedSupervisor.script = [timed_fail]
         result = sched.run_rapid_transitions([0], total_duration=1.0, load_seconds=0.02)
