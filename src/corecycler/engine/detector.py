@@ -8,6 +8,7 @@ error is logged, so counting them cannot detect anything.
 
 from __future__ import annotations
 
+import json
 import logging
 import re
 import subprocess
@@ -18,6 +19,9 @@ from datetime import UTC, datetime
 from corecycler.config import tools
 
 log = logging.getLogger(__name__)
+
+_JOURNAL_STOPPED_MESSAGE_ID = "d93fb3c9c24d451a97cea615ce59c00b"
+_BOOT_ID_RE = re.compile(r"(?:[0-9a-fA-F]{32}|[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})")
 
 
 @dataclass(slots=True)
@@ -150,21 +154,24 @@ class ErrorDetector:
         return events
 
 
-def harvest_kernel_mce(since_utc_iso: str, timeout: float = 15.0) -> tuple[list[MCEEvent], bool]:
-    """Read MCE/kernel-error events from the systemd journal since a UTC ISO
-    timestamp — across reboots, so it covers the boot(s) a hard crash killed.
+def harvest_kernel_mce(
+    since_utc_iso: str,
+    timeout: float = 15.0,
+    *,
+    boot_id: str = "",
+) -> tuple[list[MCEEvent], bool]:
+    """Read MCE/kernel-error events from one exact boot since a UTC ISO timestamp.
 
-    Returns (events, harvest_ok). harvest_ok False means the journal could
-    not be read at all (journalctl missing, unreadable, bad timestamp) — the
-    caller must treat the crash as unattributed, never as a clean bill.
+    Returns (events, harvest_ok). harvest_ok False means the identified boot's
+    journal could not be read (missing/invalid identity, journalctl failure, or
+    bad timestamp). The caller must treat that as unattributed, never as a
+    clean bill.
     """
     since = _iso_to_journal_since(since_utc_iso)
-    if since is None:
+    boot = _normalize_boot_id(boot_id)
+    if since is None or boot is None:
         return [], False
     try:
-        # _TRANSPORT=kernel, NOT -k: -k implies --boot (current boot only),
-        # which silently hides the crashed boot's MCE lines — the entire
-        # point of this harvest.
         result = subprocess.run(
             [
                 tools.command_name("journalctl"),
@@ -174,6 +181,8 @@ def harvest_kernel_mce(since_utc_iso: str, timeout: float = 15.0) -> tuple[list[
                 "short-unix",
                 "--since",
                 since,
+                "--boot",
+                boot,
                 "_TRANSPORT=kernel",
             ],
             capture_output=True,
@@ -213,25 +222,31 @@ def harvest_kernel_mce(since_utc_iso: str, timeout: float = 15.0) -> tuple[list[
     return events, True
 
 
-def last_boot_ended_cleanly(timeout: float = 15.0) -> bool:
-    """True when the previous boot ended in an orderly shutdown.
+def last_boot_ended_cleanly(timeout: float = 15.0, *, boot_id: str = "") -> bool:
+    """True when the identified boot has trusted orderly-shutdown evidence.
 
-    Journald writes a final "Journal stopped" record on every clean shutdown;
-    a freeze or hard reset leaves the boot's journal without one. Fail closed:
-    any read problem returns False — an unproven shutdown is treated as dirty.
+    Restricting the probe by boot and trusted journal fields prevents a later
+    boot, initrd handoff, or arbitrary message text from being mistaken for a
+    system shutdown. Any missing identity or read/parse problem fails closed.
     """
+    boot = _normalize_boot_id(boot_id)
+    if boot is None:
+        return False
     try:
         result = subprocess.run(
             [
                 tools.command_name("journalctl"),
                 "-q",
                 "--no-pager",
-                "-b",
-                "-1",
+                "--boot",
+                boot,
                 "-n",
-                "25",
+                "1",
                 "-o",
-                "cat",
+                "json",
+                f"MESSAGE_ID={_JOURNAL_STOPPED_MESSAGE_ID}",
+                "_RUNTIME_SCOPE=system",
+                "_SYSTEMD_UNIT=systemd-journald.service",
             ],
             capture_output=True,
             text=True,
@@ -242,7 +257,28 @@ def last_boot_ended_cleanly(timeout: float = 15.0) -> bool:
         return False
     if result.returncode != 0:
         return False
-    return "Journal stopped" in result.stdout or "Shutting down." in result.stdout
+    for line in result.stdout.splitlines():
+        try:
+            record = json.loads(line)
+        except (json.JSONDecodeError, TypeError):
+            return False
+        if not isinstance(record, dict):
+            return False
+        if (
+            record.get("_BOOT_ID") == boot
+            and record.get("MESSAGE_ID") == _JOURNAL_STOPPED_MESSAGE_ID
+            and record.get("_RUNTIME_SCOPE") == "system"
+            and record.get("_SYSTEMD_UNIT") == "systemd-journald.service"
+        ):
+            return True
+    return False
+
+
+def _normalize_boot_id(boot_id: str) -> str | None:
+    """Return journalctl's 32-hex boot ID form, or None for invalid input."""
+    if not isinstance(boot_id, str) or _BOOT_ID_RE.fullmatch(boot_id) is None:
+        return None
+    return boot_id.replace("-", "").lower()
 
 
 def _iso_to_journal_since(iso_ts: str) -> str | None:
@@ -253,7 +289,7 @@ def _iso_to_journal_since(iso_ts: str) -> str | None:
         return None
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return dt.astimezone(UTC).strftime("%Y-%m-%d %H:%M:%S.%f UTC")
 
 
 def _is_mce_error_line(line_lower: str) -> bool:

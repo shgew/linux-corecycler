@@ -30,6 +30,27 @@ def db():
 
 
 class TestTunerSessions:
+    def test_v16_recovery_boot_is_taken_from_last_event_not_wall_clock(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        db = HistoryDB(path)
+        sid = create_session(db, TunerConfig(), "", "")
+        empty = create_session(db, TunerConfig(), "", "")
+        db.insert_tuner_event(sid, "older boot", "old")
+        db.insert_tuner_event(sid, "last execution", "latest")
+        db._execute_raw("UPDATE tuner_events SET timestamp='2099-01-01' WHERE boot_id='old'")
+        db._execute_raw("ALTER TABLE tuner_sessions DROP COLUMN boot_id")
+        db._execute_raw("UPDATE schema_version SET version=16")
+        db.close()
+
+        reopened = HistoryDB(path)
+        assert reopened.get_tuner_session(sid).boot_id == "latest"
+        assert reopened.get_tuner_session(empty).boot_id == ""
+        reopened.set_session_boot(sid, "resumed")
+        reopened.close()
+        reopened = HistoryDB(path)
+        assert reopened.get_tuner_session(sid).boot_id == "resumed"
+        reopened.close()
+
     def test_create_and_get_session(self, db):
         cfg = TunerConfig(coarse_step=10)
         sid = create_session(db, cfg, "BIOS-1.0", "Ryzen 9 9950X3D")

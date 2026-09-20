@@ -9,6 +9,17 @@ following [Keep a Changelog](https://keepachangelog.com/) and
 Current version: 0.0.1. A per-core CPU stability tester and AMD PBO Curve
 Optimizer tuner for Linux, packaged as a NixOS module with an overlay.
 
+### Fixed (2026-09-20 reboot recovery)
+
+- Detect session reboots by persisted boot identity, with a timestamp fallback for
+  legacy history. Configuration overrides and resume-time repairs no longer hide
+  crashes or move the forensic window into the new boot.
+- Scope hardware-error and orderly-shutdown evidence to the session's exact boot.
+  Initrd journal stops are not clean shutdowns; unavailable evidence pauses before
+  CO writes. Stock and out-of-scope hardware errors never convict another core.
+- Replay the interrupted endurance workload and duration in isolated crash hunts.
+  Hunt passes and non-verdict stops no longer erase the repeated-crash counter.
+
 ### Fixed (2026-09-19 tuning safety review)
 
 - Delegate the cpuset controller to systemd user managers in the NixOS module,

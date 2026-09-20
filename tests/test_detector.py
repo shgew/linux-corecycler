@@ -5,6 +5,7 @@ The AMD Zen fixtures below are REAL kernel lines, verbatim.
 
 from __future__ import annotations
 
+import json
 import subprocess
 import sys
 import time
@@ -26,6 +27,10 @@ from corecycler.engine.detector import (
     harvest_kernel_mce,
     last_boot_ended_cleanly,
 )
+
+BOOT_ID = "11111111111111111111111111111111"
+OTHER_BOOT_ID = "22222222222222222222222222222222"
+JOURNAL_STOPPED_MESSAGE_ID = "d93fb3c9c24d451a97cea615ce59c00b"
 
 # Real AMD Zen 5 decoded MCA block (kernel: prefix stripped), one error event.
 ZEN_BLOCK_HEADER = "mce: [Hardware Error]: Machine check events logged"
@@ -256,7 +261,7 @@ class TestCheckMCE:
 
 
 # ===========================================================================
-# harvest_kernel_mce — cross-boot journal forensics
+# harvest_kernel_mce - exact-boot journal forensics
 # ===========================================================================
 
 JOURNAL_FIXTURE = (
@@ -270,55 +275,64 @@ JOURNAL_FIXTURE = (
 
 
 class TestHarvestKernelMCE:
-    def test_parses_events_across_block(self):
+    def test_parses_events_from_identified_boot(self):
         with patch("subprocess.run", return_value=_dmesg_result(JOURNAL_FIXTURE)):
-            events, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00")
+            events, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00", boot_id=BOOT_ID)
         assert ok is True
         assert [(e.cpu, e.corrected) for e in events] == [(9, True), (12, False)]
 
-    def test_since_is_passed_in_utc(self):
+    def test_query_is_bound_to_exact_boot_and_fractional_cutoff(self):
         with patch("subprocess.run", return_value=_dmesg_result("")) as mock_run:
-            _, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00")
+            _, ok = harvest_kernel_mce("2026-07-16T15:47:30.123456+00:00", boot_id=BOOT_ID)
         assert ok is True
         args = mock_run.call_args[0][0]
-        assert args[args.index("--since") + 1] == "2026-07-16 15:47:30 UTC"
+        assert args[args.index("--since") + 1] == "2026-07-16 15:47:30.123456 UTC"
+        assert args[args.index("--boot") + 1] == BOOT_ID
 
     def test_naive_timestamp_treated_as_utc(self):
-        assert _iso_to_journal_since("2026-07-16T15:47:30") == "2026-07-16 15:47:30 UTC"
+        assert _iso_to_journal_since("2026-07-16T15:47:30") == "2026-07-16 15:47:30.000000 UTC"
 
     def test_offset_timestamp_converted(self):
-        assert _iso_to_journal_since("2026-07-16T17:47:30+02:00") == "2026-07-16 15:47:30 UTC"
+        assert _iso_to_journal_since("2026-07-16T17:47:30+02:00") == "2026-07-16 15:47:30.000000 UTC"
 
     def test_bad_timestamp_fails_closed(self):
-        events, ok = harvest_kernel_mce("not-a-timestamp")
+        events, ok = harvest_kernel_mce("not-a-timestamp", boot_id=BOOT_ID)
         assert events == []
         assert ok is False
+
+    @pytest.mark.parametrize("boot_id", ["", "not-a-boot", "1" * 31])
+    def test_missing_or_invalid_boot_id_fails_closed_without_query(self, boot_id):
+        with patch("subprocess.run") as mock_run:
+            events, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00", boot_id=boot_id)
+        assert events == []
+        assert ok is False
+        mock_run.assert_not_called()
 
     def test_journalctl_missing_fails_closed(self):
         with patch("subprocess.run", side_effect=FileNotFoundError):
-            events, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00")
+            events, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00", boot_id=BOOT_ID)
         assert events == []
         assert ok is False
 
-    def test_journalctl_error_fails_closed(self):
+    def test_target_boot_unavailable_fails_closed(self):
         with patch(
             "subprocess.run",
-            return_value=MagicMock(returncode=1, stdout="", stderr="boom"),
+            return_value=MagicMock(returncode=1, stdout="", stderr="No journal boot entry found"),
         ):
-            events, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00")
+            events, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00", boot_id=BOOT_ID)
         assert events == []
         assert ok is False
 
-    def test_empty_journal_is_ok_and_empty(self):
+    def test_empty_target_boot_journal_is_ok_and_empty(self):
         with patch("subprocess.run", return_value=_dmesg_result("")):
-            events, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00")
+            events, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00", boot_id=BOOT_ID)
         assert events == []
         assert ok is True
 
     def test_non_kernel_lines_ignored(self):
         out = "1789586900.1 host systemd[1]: mce: [Hardware Error]: CPU 3 Bank 5: x\n"
         with patch("subprocess.run", return_value=_dmesg_result(out)):
-            events, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00")
+            events, ok = harvest_kernel_mce("2026-07-16T15:47:30+00:00", boot_id=BOOT_ID)
         assert events == []
         assert ok is True
 
@@ -398,28 +412,54 @@ class TestGetDmesgTimestamp:
 
 
 class TestLastBootEndedCleanly:
-    def test_clean_shutdown_detected(self):
-        tail = "some line\nJournal stopped\n"
-        with patch("subprocess.run", return_value=_dmesg_result(tail)):
-            assert last_boot_ended_cleanly() is True
+    @staticmethod
+    def _shutdown_record(*, boot_id=BOOT_ID, runtime_scope="system"):
+        return json.dumps(
+            {
+                "_BOOT_ID": boot_id,
+                "MESSAGE_ID": JOURNAL_STOPPED_MESSAGE_ID,
+                "_RUNTIME_SCOPE": runtime_scope,
+                "_SYSTEMD_UNIT": "systemd-journald.service",
+                "MESSAGE": "Journal stopped",
+            }
+        )
 
-    def test_pid1_shutdown_marker_detected(self):
-        tail = "unmounting\nShutting down.\n"
-        with patch("subprocess.run", return_value=_dmesg_result(tail)):
-            assert last_boot_ended_cleanly() is True
+    def test_exact_boot_system_journal_shutdown_detected(self):
+        with patch("subprocess.run", return_value=_dmesg_result(self._shutdown_record())) as mock_run:
+            assert last_boot_ended_cleanly(boot_id=BOOT_ID) is True
+        args = mock_run.call_args[0][0]
+        assert args[args.index("--boot") + 1] == BOOT_ID
+        assert f"MESSAGE_ID={JOURNAL_STOPPED_MESSAGE_ID}" in args
+        assert "_RUNTIME_SCOPE=system" in args
 
-    def test_abrupt_end_is_dirty(self):
-        tail = "lmstudio.service: Failed with result 'exit-code'.\n"
-        with patch("subprocess.run", return_value=_dmesg_result(tail)):
-            assert last_boot_ended_cleanly() is False
+    def test_initrd_journal_stop_is_not_clean_shutdown_evidence(self):
+        output = self._shutdown_record(runtime_scope="initrd")
+        with patch("subprocess.run", return_value=_dmesg_result(output)):
+            assert last_boot_ended_cleanly(boot_id=BOOT_ID) is False
 
-    def test_unreadable_journal_fails_closed(self):
+    def test_shutdown_marker_from_another_boot_is_rejected(self):
+        output = self._shutdown_record(boot_id=OTHER_BOOT_ID)
+        with patch("subprocess.run", return_value=_dmesg_result(output)):
+            assert last_boot_ended_cleanly(boot_id=BOOT_ID) is False
+
+    @pytest.mark.parametrize("text", ["Journal stopped", "Shutting down.", "[]"])
+    def test_unstructured_text_marker_is_not_evidence(self, text):
+        with patch("subprocess.run", return_value=_dmesg_result(text)):
+            assert last_boot_ended_cleanly(boot_id=BOOT_ID) is False
+
+    @pytest.mark.parametrize("boot_id", ["", "not-a-boot"])
+    def test_missing_or_invalid_boot_id_fails_closed_without_query(self, boot_id):
+        with patch("subprocess.run") as mock_run:
+            assert last_boot_ended_cleanly(boot_id=boot_id) is False
+        mock_run.assert_not_called()
+
+    def test_unreadable_or_missing_target_boot_fails_closed(self):
         with patch("subprocess.run", side_effect=FileNotFoundError):
-            assert last_boot_ended_cleanly() is False
+            assert last_boot_ended_cleanly(boot_id=BOOT_ID) is False
         with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("journalctl", 5)):
-            assert last_boot_ended_cleanly() is False
+            assert last_boot_ended_cleanly(boot_id=BOOT_ID) is False
         with patch("subprocess.run", return_value=MagicMock(returncode=1, stdout="", stderr="")):
-            assert last_boot_ended_cleanly() is False
+            assert last_boot_ended_cleanly(boot_id=BOOT_ID) is False
 
 
 class TestHarvestAndDmesgDrift:
@@ -432,7 +472,7 @@ class TestHarvestAndDmesgDrift:
         stdout = "\n".join([good, dup, bad_ts]) + "\n"
         fake = MagicMock(returncode=0, stdout=stdout, stderr="")
         with patch("subprocess.run", return_value=fake):
-            events, ok = harvest_kernel_mce("2026-07-24T00:00:00")
+            events, ok = harvest_kernel_mce("2026-07-24T00:00:00", boot_id=BOOT_ID)
         assert ok is True
         assert len(events) == 2
         assert any(e.raw_ts == 0.0 for e in events)

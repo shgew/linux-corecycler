@@ -155,6 +155,58 @@ class TestSlotDispatch:
         assert eng.status == "paused"
 
 
+class TestEnduranceCrashHunt:
+    def test_replays_the_persisted_endurance_workload_and_duration(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        eng = _seed(db, topo_dual_ccd_x3d, mock_backend)
+        workload = {
+            "backend": "mprime",
+            "stress_mode": "AVX2",
+            "fft_preset": "LARGE",
+            "threads": 1,
+            "profile": "sustained",
+        }
+        eng._config.backend = "stress-ng"
+        eng._config.stress_mode = "SSE"
+        eng._config.fft_preset = "SMALL"
+        eng._config.endurance_workloads = [eng._config.endurance_workloads[0], workload]
+        eng._config.hunt_slot_seconds = 60
+        eng._config.endurance_slot_seconds = 600
+        tp.set_validation_position(db, eng._session_id, 9, 0, 0, False, "[]")
+        tp.set_endurance_position(db, eng._session_id, 1, 1, 2)
+
+        # Resume starts with zeroed in-memory cursors.  The hunt must recover its
+        # source workload from the persisted endurance position, not these values.
+        eng._validation_stage = 0
+        eng._endurance_round = 0
+        eng._endurance_workload = 0
+        eng._endurance_index = 0
+        del eng._start_worker
+        worker = MagicMock()
+        worker_type = MagicMock(return_value=worker)
+        monkeypatch.setattr(engine_module, "_TunerWorker", worker_type)
+        backend_names: list[str] = []
+        monkeypatch.setattr(
+            eng,
+            "_get_backend_for_name",
+            lambda name: backend_names.append(name) or mock_backend,
+        )
+
+        eng._start_hunt()
+
+        hunted_core, _logical_cpu, scheduler = worker_type.call_args.args
+        assert backend_names == ["mprime"]
+        assert scheduler.stress_config.mode is StressMode.AVX2
+        assert scheduler.stress_config.fft_preset is FFTPreset.LARGE
+        assert scheduler.stress_config.threads == 1
+        assert eng._worker_profile == "sustained"
+        assert scheduler.config.variable_load is False
+        assert scheduler.config.seconds_per_core >= 1200
+        assert eng._smu.written[hunted_core] == BEST[hunted_core]
+        assert all(eng._smu.written[core] == 0 for core in ORDER if core != hunted_core)
+
+
 class TestAllCoreWorkloadLaunch:
     """The all-core slot builds its stress config from the workload itself, so
     a 2-thread AVX2 slot is what actually runs, not the session's base load."""

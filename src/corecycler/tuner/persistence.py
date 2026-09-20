@@ -157,6 +157,10 @@ def set_endurance_position(db: HistoryDB, session_id: int, round_: int, workload
     db.set_endurance_position(session_id, round_, workload, index)
 
 
+def set_session_boot(db: HistoryDB, session_id: int, boot_id: str) -> None:
+    db.set_session_boot(session_id, boot_id)
+
+
 def update_session_config(db: HistoryDB, session_id: int, config_json: str) -> None:
     db.update_tuner_session_config(session_id, config_json)
 

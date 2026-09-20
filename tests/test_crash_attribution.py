@@ -112,7 +112,7 @@ class TestForensicAttribution:
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         session = _seed_hardened_validating(eng, db, BEST, BASELINES)
         # The kernel named cores 5 and 6 (corrected LS MCEs) before the freeze.
-        eng._forensics = lambda since, timeout=15.0: (
+        eng._forensics = lambda since, timeout=15.0, **kwargs: (
             [_event(5), _event(5), _event(6)],
             True,
         )
@@ -136,7 +136,7 @@ class TestForensicAttribution:
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         session = _seed_hardened_validating(eng, db, BEST, BASELINES)
         sibling = topo_dual_ccd_x3d.cores[3].logical_cpus[1]
-        eng._forensics = lambda since, timeout=15.0: ([_event(sibling)], True)
+        eng._forensics = lambda since, timeout=15.0, **kwargs: ([_event(sibling)], True)
 
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
 
@@ -147,7 +147,7 @@ class TestForensicAttribution:
         """A kernel panic line with no CPU proves a crash, names no core."""
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         session = _seed_hardened_validating(eng, db, BEST, BASELINES)
-        eng._forensics = lambda since, timeout=15.0: ([_event(-1)], True)
+        eng._forensics = lambda since, timeout=15.0, **kwargs: ([_event(-1)], True)
 
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
 
@@ -157,7 +157,7 @@ class TestForensicAttribution:
     def test_no_forensics_multi_core_requests_hunt_not_guess(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         session = _seed_hardened_validating(eng, db, BEST, BASELINES)
-        eng._forensics = lambda since, timeout=15.0: ([], True)
+        eng._forensics = lambda since, timeout=15.0, **kwargs: ([], True)
 
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
 
@@ -166,16 +166,88 @@ class TestForensicAttribution:
         assert all(cs.crash_count == 0 for cs in eng._core_states.values())
         assert all(not cs.in_test for cs in eng._core_states.values())
 
-    def test_forensics_unavailable_fails_closed_to_hunt(self, db, topo_dual_ccd_x3d, mock_backend):
-        """journalctl missing is NOT a clean bill — the hunt still runs."""
+    def test_forensics_unavailable_pauses_without_guessing(self, db, topo_dual_ccd_x3d, mock_backend):
+        """journalctl missing cannot prove an isolated core caused the reboot."""
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         session = _seed_hardened_validating(eng, db, BEST, BASELINES)
-        eng._forensics = lambda since, timeout=15.0: ([], False)
+        before = {
+            core: (cs.current_offset, cs.best_offset, cs.crash_count)
+            for core, cs in eng._core_states.items()
+        }
+        eng._forensics = lambda since, timeout=15.0, **kwargs: ([], False)
 
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
 
         assert crashed == []
-        assert pending_hunt is True
+        assert pending_hunt is False
+        assert eng.status == "paused"
+        after = {
+            core: (cs.current_offset, cs.best_offset, cs.crash_count)
+            for core, cs in eng._core_states.items()
+        }
+        assert after == before
+        assert eng._smu.written == {}
+
+    def test_mce_on_an_unselected_core_pauses_without_blame(self, db, topo_dual_ccd_x3d, mock_backend):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[0])
+        cs = CoreState(
+            core_id=0,
+            phase=TunerPhase.HARDENED,
+            current_offset=-41,
+            best_offset=-41,
+            baseline_offset=-15,
+            in_test=True,
+        )
+        eng._core_states = {0: cs}
+        tp.save_core_state(db, eng._session_id, cs)
+        db.update_tuner_session_status(eng._session_id, "validating")
+        db.set_hunting_core(eng._session_id, 0)
+        session = tp.get_session(db, eng._session_id)
+        outside_cpu = topo_dual_ccd_x3d.cores[1].logical_cpus[0]
+        eng._forensics = lambda since, timeout=15.0, **kwargs: ([_event(outside_cpu)], True)
+
+        crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
+
+        assert crashed == []
+        assert pending_hunt is False
+        assert eng.status == "paused"
+        assert (cs.current_offset, cs.best_offset, cs.crash_count) == (-41, -41, 0)
+        assert eng._smu.written == {}
+
+    def test_mce_on_a_stock_core_pauses_without_blame(self, db, topo_dual_ccd_x3d, mock_backend):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[0, 1])
+        eng._core_states = {
+            core: CoreState(
+                core_id=core,
+                phase=TunerPhase.HARDENED,
+                current_offset=BEST[core],
+                best_offset=BEST[core],
+                baseline_offset=BASELINES[core],
+                in_test=core == 0,
+            )
+            for core in (0, 1)
+        }
+        for cs in eng._core_states.values():
+            tp.save_core_state(db, eng._session_id, cs)
+        db.journal_co_intent(eng._session_id, 0, BEST[0], survived=True)
+        db.journal_co_intent(eng._session_id, 1, 0, survived=True)
+        db.update_tuner_session_status(eng._session_id, "validating")
+        db.set_hunting_core(eng._session_id, 0)
+        session = tp.get_session(db, eng._session_id)
+        stock_cpu = topo_dual_ccd_x3d.cores[1].logical_cpus[0]
+        eng._forensics = lambda since, timeout=15.0, **kwargs: ([_event(stock_cpu)], True)
+
+        crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
+
+        assert crashed == []
+        assert pending_hunt is False
+        assert eng.status == "paused"
+        after = {
+            core: (cs.current_offset, cs.best_offset, cs.crash_count)
+            for core, cs in eng._core_states.items()
+        }
+        assert after == {0: (BEST[0], BEST[0], 0), 1: (BEST[1], BEST[1], 0)}
+        assert eng._smu.written == {}
 
     def test_persisted_hunt_slot_is_proof_by_isolation(self, db, topo_dual_ccd_x3d, mock_backend):
         """A crash while one core was hunted alone (others at stock) convicts it."""
@@ -184,7 +256,7 @@ class TestForensicAttribution:
         db.set_hunting_core(eng._session_id, 5)
         db.set_unattributed_crashes(eng._session_id, 1)
         session = tp.get_session(db, eng._session_id)
-        eng._forensics = lambda since, timeout=15.0: ([], True)
+        eng._forensics = lambda since, timeout=15.0, **kwargs: ([], True)
 
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
 
@@ -206,7 +278,7 @@ class TestForensicAttribution:
         eng._core_states = {2: cs}
         tp.save_core_state(db, eng._session_id, cs)
         session = tp.get_session(db, eng._session_id)  # status: running
-        eng._forensics = lambda since, timeout=15.0: ([], True)
+        eng._forensics = lambda since, timeout=15.0, **kwargs: ([], True)
 
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
 
@@ -287,6 +359,66 @@ class TestCrashHunt:
         assert cs.crash_count == 0  # evidence-grade: nothing crashed
         assert tp.get_unattributed_crashes(db, eng._session_id) == 0
         assert eng._hunting is False
+
+
+class TestHuntCrashBreaker:
+    @staticmethod
+    def _active_hunt(eng, db, core_id=5):
+        _seed_hardened_validating(eng, db, BEST, BASELINES)
+        for cs in eng._core_states.values():
+            cs.in_test = False
+        eng._hunting = True
+        eng._hunt_queue = []
+        eng._co_applied[core_id] = eng._core_states[core_id].best_offset
+        tp.set_resume_crash_streak(db, eng._session_id, 2)
+        return eng._core_states[core_id]
+
+    def test_passing_hunt_slots_do_not_clear_the_resume_crash_streak(
+        self, db, topo_dual_ccd_x3d, mock_backend
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        self._active_hunt(eng, db)
+
+        eng._on_test_finished(5, True, "", "", 60.0, 0.0)
+
+        assert tp.get_resume_crash_streak(db, eng._session_id) == 2
+
+    @pytest.mark.parametrize("error_type", ["thermal", "stall", "killed", "mce_unattributed"])
+    def test_non_verdict_hunt_outcomes_preserve_the_streak_and_offset(
+        self, db, topo_dual_ccd_x3d, mock_backend, error_type
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        cs = self._active_hunt(eng, db)
+        before = (cs.current_offset, cs.best_offset, cs.backoff_fail_bound)
+
+        eng._on_test_finished(5, False, error_type, error_type, 1.0, 0.0)
+
+        assert tp.get_resume_crash_streak(db, eng._session_id) == 2
+        assert (cs.current_offset, cs.best_offset, cs.backoff_fail_bound) == before
+
+    def test_a_hunt_failure_that_backs_off_the_core_clears_the_streak(
+        self, db, topo_dual_ccd_x3d, mock_backend
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        cs = self._active_hunt(eng, db)
+        before = cs.current_offset
+
+        eng._on_test_finished(5, False, "failed", "computation", 1.0, 0.0)
+
+        assert cs.current_offset != before
+        assert tp.get_resume_crash_streak(db, eng._session_id) == 0
+
+    def test_a_non_hunt_pass_still_clears_the_streak(self, db, topo_dual_ccd_x3d, mock_backend):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        cs = CoreState(core_id=5, phase=TunerPhase.COARSE_SEARCH, current_offset=-20, baseline_offset=0)
+        eng._core_states = {5: cs}
+        tp.save_core_state(db, eng._session_id, cs)
+        tp.set_resume_crash_streak(db, eng._session_id, 2)
+        eng._run_next = lambda: None
+
+        eng._on_test_finished(5, True, "", "", 60.0, 0.0)
+
+        assert tp.get_resume_crash_streak(db, eng._session_id) == 0
 
 
 class TestForeignMceEvidence:

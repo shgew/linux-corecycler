@@ -72,14 +72,16 @@ def _has_unattributed_mce(mce_json: str) -> bool:
     return any(isinstance(item, dict) and item.get("cpu") == -1 for item in raw)
 
 
-def _rebooted_since(iso_ts: str | None, stat_path: str = "/proc/stat") -> bool:
-    """True when the machine booted AFTER the given ISO timestamp.
-
-    Resume uses this to tell a hard crash (reboot happened — penalize the
-    resident offsets) from a plain app exit mid-test (no reboot — penalizing
-    would walk proven-good offsets away). Fail closed: if either side cannot
-    be determined, assume a reboot so the crash detectors still run.
-    """
+def _rebooted_since(
+    iso_ts: str | None,
+    stat_path: str = "/proc/stat",
+    *,
+    previous_boot_id: str = "",
+    boot_id: str = "",
+) -> bool:
+    """Prefer boot identity; use the execution timestamp for legacy sessions."""
+    if previous_boot_id and boot_id:
+        return previous_boot_id != boot_id
     if not iso_ts:
         return True
     try:
@@ -512,6 +514,8 @@ class TunerEngine(QObject):
         # engine runs isolated per-core hunt slots instead of guessing.
         self._hunting = False
         self._hunt_queue: list[int] = []
+        self._hunt_workload: dict | None = None
+        self._hunt_duration = self._config.hunt_slot_seconds
         self._soaking = False
         # Post-reboot kernel-journal harvest, injectable for tests.
         self._forensics = harvest_kernel_mce
@@ -582,6 +586,7 @@ class TunerEngine(QObject):
             cpu_model=self._topology.model_name,
             context_id=context_id,
         )
+        tp.set_session_boot(self._db, self._session_id, self._boot_id)
 
         # Initialize core states
         cores = self._get_cores_to_test()
@@ -679,6 +684,8 @@ class TunerEngine(QObject):
         if session is None:
             self.log_message.emit(f"Session {session_id} not found")
             return
+        last_activity = self._db.latest_session_activity(session_id)
+        rebooted = _rebooted_since(last_activity, previous_boot_id=session.boot_id, boot_id=self._boot_id)
 
         if not self._load_saved_config(session.config_json):
             return
@@ -703,12 +710,11 @@ class TunerEngine(QObject):
         if session.status == "quarantined":
             self._reengage_quarantined(session_id)
 
-        # Evidence reconciliation before anything acts on the loaded state.
-        self._reconcile_confirmed_evidence()
-
-        # One reboot verdict drives the drift check, crash detection, and the
-        # baseline restore below — they must agree on what world they are in.
-        rebooted = _rebooted_since(self._db.latest_session_activity(session_id))
+        self.log_message.emit(
+            f"Resume recovery: {'reboot detected' if rebooted else 'same boot'} "
+            f"(previous={session.boot_id or 'unknown'}, current={self._boot_id or 'unknown'}; "
+            f"last execution={last_activity or 'unknown'})"
+        )
 
         # Check for CO drift — warn only when the SMU differs from what the
         # TUNER last wrote (the CO journal); validation deliberately leaves the
@@ -756,7 +762,9 @@ class TunerEngine(QObject):
         crashed: list[int] = []
         pending_hunt = False
         if rebooted:
-            crashed, pending_hunt = self._attribute_crash_after_reboot(session)
+            crashed, pending_hunt = self._attribute_crash_after_reboot(session, last_activity)
+            if self._paused:
+                return
         else:
             self._clear_all_in_test()
             if session.hunting_core is not None:
@@ -764,25 +772,21 @@ class TunerEngine(QObject):
                 # hunt is abandoned; validation will re-expose the instability.
                 tp.set_hunting_core(self._db, session_id, None)
 
+        self._reconcile_confirmed_evidence()
+        tp.set_session_boot(self._db, session_id, self._boot_id)
+
         if crashed or pending_hunt:
             for core_id in crashed:
                 self.log_message.emit(f"Core {core_id} crash detected — applied penalty backoff")
             self._set_status(
                 f"resumed after crash (cores: {crashed})" if crashed else "resumed after unattributed crash"
             )
-            # Circuit breaker: a resume that finds a fresh crash means the machine
-            # died again on re-engage. Count consecutive crash-resumes (reset to 0
-            # whenever a test completes — see _on_test_finished). After the
-            # configured threshold, stop trying: force every core to stock (CO=0),
-            # quarantine the session, and surface an honest unsafe verdict rather
-            # than re-applying a profile that keeps crashing on every boot.
+            # Only forward progress or a convicted hunt failure clears this streak.
             streak = tp.get_resume_crash_streak(self._db, session_id) + 1
             tp.set_resume_crash_streak(self._db, session_id, streak)
             if streak >= self._config.resume_crash_quarantine_threshold:
                 self._quarantine_session(streak)
                 return
-        else:
-            tp.set_resume_crash_streak(self._db, session_id, 0)
 
         # Step 2: Restore all cores to their baseline offsets.
         # After a crash and reboot, SMU SRAM is zeroed. Apply the known-stable
@@ -847,7 +851,7 @@ class TunerEngine(QObject):
             and not crashed
             and not pending_hunt
             and (session.status == "validating" or session.validation_stage > 0)
-            and not last_boot_ended_cleanly()
+            and not last_boot_ended_cleanly(boot_id=session.boot_id)
         )
         if unattributed_incident:
             n = tp.get_unattributed_crashes(self._db, session_id) + 1
@@ -992,6 +996,7 @@ class TunerEngine(QObject):
         session = tp.get_session(self._db, session_id)
         if session and not self._load_saved_config(session.config_json):
             return
+        tp.set_session_boot(self._db, session_id, self._boot_id)
         tp.set_validation_position(self._db, session_id, 0, 0, 0, False, "[]")
 
         # Reset confirmed cores to "confirming" for re-validation
@@ -1021,6 +1026,9 @@ class TunerEngine(QObject):
 
         ``threads`` None means every SMT sibling of the core.
         """
+        if self._hunting and self._hunt_workload is not None:
+            wl = self._hunt_workload
+            return wl["backend"], wl["stress_mode"], wl["fft_preset"], wl.get("threads")
         if self._validation_stage == 9 and not self._in_requeue:
             wl = self._config.endurance_workloads[self._endurance_workload]
             return wl["backend"], wl["stress_mode"], wl["fft_preset"], wl.get("threads")
@@ -1592,7 +1600,7 @@ class TunerEngine(QObject):
                 f"to re-confirm at {rollback}."
             )
 
-    def _attribute_crash_after_reboot(self, session) -> tuple[list[int], bool]:
+    def _attribute_crash_after_reboot(self, session, since: str | None = None) -> tuple[list[int], bool]:
         """Attribute a hard crash on the resume-after-reboot path.
 
         Returns (penalized_core_ids, pending_hunt). Evidence outranks policy:
@@ -1606,14 +1614,26 @@ class TunerEngine(QObject):
         session_id = self._session_id
         crashed: list[int] = []
         pending_hunt = False
-        forensic_events: list[MCEEvent] = []
-        since = self._db.latest_session_activity(session_id)
-        if since:
-            forensic_events, forensic_ok = self._forensics(since)
-            if not forensic_ok:
-                self.log_message.emit(
-                    "Kernel-journal forensics unavailable — falling back to in-test/journal attribution."
-                )
+        since = since or self._db.latest_session_activity(session_id)
+        forensic_events, forensics_ok = self._forensics(since or "", boot_id=session.boot_id)
+        if not forensics_ok:
+            self.log_message.emit(
+                "Kernel-journal forensics unavailable for the session boot. Pausing without reapplying CO."
+            )
+            self.pause()
+            return [], False
+        cpu_map = self._cpu_to_core()
+        residents = tp.journal_values(self._db, session_id)
+        if any(
+            ev.cpu >= 0
+            and (cpu_map.get(ev.cpu) not in self._core_states or residents.get(cpu_map.get(ev.cpu)) == 0)
+            for ev in forensic_events
+        ):
+            self.log_message.emit(
+                "Kernel evidence names a stock or unmapped core. Pausing without blaming a tuned offset."
+            )
+            self.pause()
+            return [], False
         forensic_by_core = self._events_by_core(forensic_events)
         if forensic_by_core:
             crashed = self._penalize_forensic_cores(forensic_by_core)
@@ -1959,14 +1979,21 @@ class TunerEngine(QObject):
             key=self._hunt_suspicion_key,
             reverse=True,
         )
+        self._hunt_workload = None
+        self._hunt_duration = self._config.hunt_slot_seconds
+        session = tp.get_session(self._db, self._session_id) if self._session_id is not None else None
+        if session is not None and session.validation_stage == 9:
+            self._endurance_round = max(0, session.endurance_round)
+            self._endurance_workload = min(session.endurance_workload, len(self._config.endurance_workloads) - 1)
+            self._hunt_workload = self._config.endurance_workloads[self._endurance_workload]
+            self._hunt_duration = max(self._hunt_duration, self._endurance_duration())
         self._hunt_queue = order
         self._hunting = True
         self._validation_stage = 0
         self._validation_thermal_aborts = 0
         self._set_status("hunting")
         self.log_message.emit(
-            f"Crash hunt: isolated per-core slots ({self._config.hunt_slot_seconds}s "
-            f"stress + transitions + idle each), most suspect first: {order}"
+            f"Crash hunt: isolated per-core slots ({self._hunt_duration}s), most suspect first: {order}"
         )
         self._run_next_hunt_slot()
 
@@ -2022,8 +2049,13 @@ class TunerEngine(QObject):
         tp.save_core_state(self._db, self._session_id, cs)
         self._last_tested_core = core_id
         self._emit_progress()
-        self.log_message.emit(f"Hunt slot: core {core_id} at {target}, all other cores at stock")
-        self._start_worker(core_id, self._config.hunt_slot_seconds, spectrum=True)
+        spectrum = self._hunt_workload is None or self._hunt_workload.get("profile") == "spectrum"
+        backend, mode, fft, threads = self._get_active_stress_config(cs)
+        label = tp.workload_label(backend, mode, fft, threads, "spectrum" if spectrum else "sustained")
+        self.log_message.emit(
+            f"Hunt slot: core {core_id} at {target}, all other cores at stock; {label} for {self._hunt_duration}s"
+        )
+        self._start_worker(core_id, self._hunt_duration, spectrum=spectrum)
 
     def _end_hunt_fruitless(self) -> None:
         """Every hunt slot passed — the crash stays honestly unattributed."""
@@ -2077,6 +2109,7 @@ class TunerEngine(QObject):
         tp.save_core_state(self._db, self._session_id, cs)
         self.core_state_changed.emit(cs.core_id, cs.phase, cs.current_offset)
         tp.set_unattributed_crashes(self._db, self._session_id, 0)
+        tp.set_resume_crash_streak(self._db, self._session_id, 0)
         self._hunting = False
         self._set_status("running")
         tp.update_session_status(self._db, self._session_id, "running")
@@ -2570,13 +2603,7 @@ class TunerEngine(QObject):
             self.pause()
             return
 
-        # Reaching this handler proves the machine survived the test — a hard
-        # system crash would have killed the process before the worker's finished
-        # signal could be delivered. So every CO value resident during this test
-        # is now proven not-a-hard-crash: mark the journal survived, widen the
-        # proven-safe envelope, and reset the resume-crash circuit breaker because
-        # forward progress was made. (Holds for thermal stops and detected stress
-        # failures too — both mean the box lived.)
+        # Survival alone does not prove progress past the slot that rebooted.
         if self._session_id is not None:
             # Cores the kernel just named stay un-survived: surviving the test
             # does not clear an error the hardware reported minutes ago. A
@@ -2592,8 +2619,6 @@ class TunerEngine(QObject):
                 for c, v in tp.journal_survived_values(self._db, self._session_id).items():
                     if self._is_more_aggressive(v, self._co_survived.get(c, 0)):
                         self._co_survived[c] = v
-            if tp.get_resume_crash_streak(self._db, self._session_id) != 0:
-                tp.set_resume_crash_streak(self._db, self._session_id, 0)
 
         # A thermal stop is not a stability verdict — advancing the state machine
         # or logging a fail here would push the offset the wrong way on a thermal
@@ -2696,6 +2721,8 @@ class TunerEngine(QObject):
                 threads=self._threads_for(core_id, requested_threads),
                 profile=self._worker_profile,
             )
+            if passed and not foreign and not self._hunting and tp.get_resume_crash_streak(self._db, self._session_id):
+                tp.set_resume_crash_streak(self._db, self._session_id, 0)
 
         if results_json and self._session_id and self._validation_stage in (2, 3, 6, 9):
             self._log_parallel_rows(core_id, results_json, log_phase)

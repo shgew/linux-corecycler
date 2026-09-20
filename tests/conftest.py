@@ -782,6 +782,7 @@ def assume_rebooted(monkeypatch):
     import corecycler.tuner.engine as engine_mod
 
     real = engine_mod._rebooted_since
+    monkeypatch.setattr(engine_mod, "_read_boot_id", lambda: "test-boot")
     monkeypatch.setattr(engine_mod, "_rebooted_since", lambda *a, **k: True)
     return real
 
@@ -795,7 +796,7 @@ def no_real_forensics(monkeypatch):
     """
     import corecycler.tuner.engine as engine_mod
 
-    monkeypatch.setattr(engine_mod, "harvest_kernel_mce", lambda since, timeout=15.0: ([], True))
+    monkeypatch.setattr(engine_mod, "harvest_kernel_mce", lambda since, timeout=15.0, **kwargs: ([], True))
 
 
 @pytest.fixture(autouse=True)
@@ -806,4 +807,4 @@ def assume_clean_shutdown(monkeypatch):
     """
     import corecycler.tuner.engine as engine_mod
 
-    monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0: True)
+    monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0, **kwargs: True)

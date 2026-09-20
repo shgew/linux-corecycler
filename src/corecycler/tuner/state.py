@@ -60,6 +60,7 @@ class TunerSession:
     id: int | None = None
     created_at: str = ""
     updated_at: str = ""
+    boot_id: str = ""
     status: str = "running"  # running, paused, completed, validating, aborted, quarantined
     bios_version: str = ""
     cpu_model: str = ""

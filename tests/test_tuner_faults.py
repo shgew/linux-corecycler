@@ -553,7 +553,7 @@ class TestJournalCatchesUnflaggedCrash:
         cs = eng._core_states[0]
         assert cs.crash_count == 1
         assert cs.current_offset == -9
-        assert tp.get_resume_crash_streak(db, sid) == 0
+        assert tp.get_resume_crash_streak(db, sid) == 1
 
     def test_zero_value_is_never_a_suspect(self, db, topo, smu, mock_backend):
         """CO=0 (stock) is axiomatically safe and must never be treated as a crash."""
@@ -1590,6 +1590,102 @@ class TestRebootGate:
     mid-test) — penalizing it would walk proven-good offsets away on every
     restart of the app."""
 
+    def test_config_override_cannot_hide_a_reboot(
+        self, db, topo, smu, mock_backend, monkeypatch, tmp_path, assume_rebooted
+    ):
+        from datetime import datetime, timedelta
+
+        old = (datetime.now(UTC) - timedelta(hours=1)).isoformat()
+        with patch.object(db, "_now_iso", return_value=old):
+            sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
+            tp.save_core_state(
+                db, sid, CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-30, in_test=True)
+            )
+            tp.journal_co_intent(db, sid, 0, -30, survived=False)
+        stat = tmp_path / "stat"
+        stat.write_text(f"btime {int(datetime.now(UTC).timestamp()) - 60}\n")
+        monkeypatch.setattr(
+            engine_mod, "_rebooted_since", lambda ts, **kw: assume_rebooted(ts, stat_path=str(stat), **kw)
+        )
+
+        tp.update_session_config(db, sid, TunerConfig(cores_to_test=[0], endurance=True).to_json())
+        eng = _resume_fresh(db, topo, smu, mock_backend, sid)
+
+        assert eng._core_states[0].crash_count == 1
+        assert eng._core_states[0].current_offset == -27
+        assert eng._core_states[0].backoff_fail_bound == -30
+
+    @pytest.mark.parametrize("previous_boot, timestamp, crashes", [
+        ("old-boot", "2099-01-01T00:00:00+00:00", 1),
+        ("test-boot", "2000-01-01T00:00:00+00:00", 0),
+    ])
+    def test_boot_identity_overrides_wall_clock_and_metadata(
+        self, db, topo, smu, mock_backend, monkeypatch, assume_rebooted, previous_boot, timestamp, crashes
+    ):
+        monkeypatch.setattr(engine_mod, "_rebooted_since", assume_rebooted)
+        with patch.object(db, "_now_iso", return_value=timestamp):
+            sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
+            tp.save_core_state(
+                db, sid, CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-30, in_test=True)
+            )
+            tp.journal_co_intent(db, sid, 0, -30, survived=False)
+        tp.set_session_boot(db, sid, previous_boot)
+        tp.update_session_config(db, sid, TunerConfig(cores_to_test=[0], endurance=True).to_json())
+
+        eng = _resume_fresh(db, topo, smu, mock_backend, sid)
+        assert eng._core_states[0].crash_count == crashes
+        assert eng._core_states[0].current_offset == -30 + 3 * crashes
+
+        again = _resume_fresh(db, topo, smu, mock_backend, sid)
+        assert again._core_states[0].crash_count == crashes
+        assert again._core_states[0].current_offset == eng._core_states[0].current_offset
+        assert tp.get_resume_crash_streak(db, sid) == crashes
+
+    def test_forensic_cutoff_survives_resume_evidence_repairs(self, db, topo, smu, mock_backend):
+        from corecycler.engine.detector import MCEEvent
+
+        old = "2026-01-01T00:00:00+00:00"
+        with patch.object(db, "_now_iso", return_value=old):
+            sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
+            tp.save_core_state(
+                db, sid, CoreState(core_id=0, phase=TunerPhase.HARDENED, current_offset=-30, best_offset=-30)
+            )
+            tp.journal_co_intent(db, sid, 0, -30, survived=True)
+        eng = make_engine(db, topo, smu, mock_backend)
+        event = MCEEvent(timestamp=0, cpu=0, bank=0, message="hardware error", corrected=False)
+        eng._forensics = lambda since, **kw: ([event] if since <= old else [], True)
+        with patch.object(eng, "_run_next"):
+            eng.resume(sid)
+        assert eng._core_states[0].crash_count == 1
+        assert eng._core_states[0].backoff_fail_bound == -30
+        assert not any(value == -30 for _, value in smu.writes)
+
+
+    def test_unreadable_forensics_preserves_recovery_until_it_can_be_read(
+        self, db, topo, smu, mock_backend, monkeypatch, assume_rebooted
+    ):
+        monkeypatch.setattr(engine_mod, "_rebooted_since", assume_rebooted)
+        sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
+        tp.set_session_boot(db, sid, "old-boot")
+        tp.save_core_state(
+            db, sid, CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-30, in_test=True)
+        )
+        tp.journal_co_intent(db, sid, 0, -30, survived=False)
+        eng = make_engine(db, topo, smu, mock_backend)
+        eng._forensics = lambda *a, **kw: ([], False)
+        with patch.object(eng, "_run_next"):
+            eng.resume(sid)
+        assert eng.status == "paused"
+        assert smu.writes == []
+        assert tp.get_session(db, sid).boot_id == "old-boot"
+        assert tp.load_core_states(db, sid)[0].in_test
+
+        resumed = _resume_fresh(db, topo, smu, mock_backend, sid)
+        assert resumed._core_states[0].crash_count == 1
+        assert resumed._core_states[0].current_offset == -27
+        assert tp.get_session(db, sid).boot_id == "test-boot"
+
+
     def test_no_reboot_clears_in_test_without_penalty(self, db, topo, smu, mock_backend, monkeypatch):
         import corecycler.tuner.engine as engine_mod
 
@@ -2210,7 +2306,7 @@ class TestUnattributedIncidentOnResume:
     def test_dirty_reboot_mid_validation_is_recorded(self, db, topo, smu, mock_backend, monkeypatch):
         import corecycler.tuner.engine as engine_mod
 
-        monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0: False)
+        monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0, **kwargs: False)
         sid = self._seed(db, {0: -10, 1: -12})
         eng = make_engine(db, topo, smu, mock_backend, cores_to_test=[0, 1])
         with patch.object(eng, "_run_next"), patch.object(eng, "_run_validation_next"):
@@ -2222,7 +2318,7 @@ class TestUnattributedIncidentOnResume:
     def test_repeat_dirty_reboots_pause_for_decision(self, db, topo, smu, mock_backend, monkeypatch):
         import corecycler.tuner.engine as engine_mod
 
-        monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0: False)
+        monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0, **kwargs: False)
         sid = self._seed(db, {0: -10}, unattributed=1)
         eng = make_engine(db, topo, smu, mock_backend, cores_to_test=[0])
         with patch.object(eng, "_run_next"), patch.object(eng, "_run_validation_next"):
@@ -2244,7 +2340,7 @@ class TestUnattributedIncidentOnResume:
         already covered by the journal/in_test detectors."""
         import corecycler.tuner.engine as engine_mod
 
-        monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0: False)
+        monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0, **kwargs: False)
         sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
         tp.save_core_state(
             db,

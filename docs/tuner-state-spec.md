@@ -71,12 +71,18 @@ penalty never overshoots past stock (CO=0).
 
 ## Crash attribution on resume (`_attribute_crash_after_reboot`)
 
+Reboot detection uses the persisted session boot ID before any resume-time repairs
+or narrative writes. Legacy sessions fall back to execution timestamps; metadata
+updates are not execution. Reopening within the same boot does not impose another
+crash penalty. Unavailable forensic history pauses before any CO restoration.
+
 Evidence outranks policy; a guess is never written. Priority order:
 
-1. Kernel-journal forensics (`journalctl _TRANSPORT=kernel` since the session's
-   last activity -- not `-k`, which implies the current boot and would hide the
-   crashed one): penalize exactly the cores the kernel's MCE lines name,
-   anchored at their journaled resident values.
+1. Kernel-journal forensics from the exact persisted session boot, since the last
+   execution checkpoint: penalize exactly the cores the kernel's MCE lines name,
+   anchored at their journaled resident values. Stock or out-of-scope core evidence
+   pauses without penalizing another core. Initrd journal-stop records do not prove
+   that a boot ended cleanly.
 2. A persisted hunt slot (`tuner_sessions.hunting_core`): the box died while
    one core was stressed alone with every other core at stock — proof by
    isolation.
@@ -111,4 +117,7 @@ doubling each round up to `endurance_slot_max_seconds`. A solo-slot failure is
 failure backs off the reported lane, re-tests it solo, then reruns the slot.
 Crash attribution treats stage 9 exactly like any other validation stage: the
 isolated hunt runs and nobody is convicted by guess. `unattributed_crashes`
-resets to 0 after every round that completed with no back-off.
+resets to 0 after every round that completed with no back-off. Endurance hunts
+replay the interrupted workload and at least its original duration in isolation.
+Hunt passes and non-verdict stops retain the resume-crash streak; a passing
+non-hunt test or a convicted hunt backoff clears it.

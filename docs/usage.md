@@ -134,19 +134,32 @@ configuration that crashes the machine. Three mechanisms enforce this:
    voltage). Crash backoff never settles past it, and if a core's *baseline* is what
    crashed, the baseline is descended toward 0 rather than re-applied -- so an unstable
    inherited baseline is escapable, not an infinite loop.
-3. **Resume-crash circuit breaker** -- consecutive crash-resumes with no surviving test
-   between them are counted (reset whenever any test completes). After
-   `resume_crash_quarantine_threshold` (default 3), the tuner forces every core to CO=0,
-   marks the session `quarantined` (never resumed automatically, and re-opened by hand
-   only after a warning -- it then re-engages on offsets the machine has already
-   survived, stock where it survived none), and surfaces an honest "unsafe on this
-   machine" verdict. A machine that keeps dying on resume is
-   bounded, not looped -- this holds during multi-core validation too.
+3. **Resume-crash circuit breaker** -- consecutive crash-resumes without a passing
+   non-hunt test are counted. Hunt passes, thermal stops, apparatus faults, and plain
+   app restarts do not clear the counter. Finding and backing off a hunt culprit does.
+   After `resume_crash_quarantine_threshold` (default 3), the tuner forces every core
+   to CO=0 and marks the session `quarantined`, never resumed automatically.
+   Reopening requires an explicit decision and retains only previously survived values.
 
 An interrupted session is detected on next launch and offered for resume; resume
 re-applies only journaled-safe baselines and re-engages one core at a time. A crash or
 pause during validation is recoverable: on resume the tuner restores the persisted
 validation cursor and continues at the exact stage and position it left off.
+
+Reboot detection compares the session's persisted Linux boot ID with the current
+boot, not configuration-save times or wall-clock changes. Older histories gain
+that ID from their last narrative event; sessions without one retain the timestamp
+fallback. Kernel evidence and orderly-shutdown checks refer to that exact boot,
+not simply the immediately previous boot. Unreadable or unidentified forensic
+history pauses before offsets are reapplied. Hardware errors at stock or on an
+unmapped/unselected core also pause without blaming another core.
+
+An ambiguous validation reboot triggers an isolated hunt, not an automatic penalty
+against whichever core was under load. During endurance, the hunt replays the
+interrupted workload's backend, instruction set, FFT size, thread count and load
+profile, for at least the interrupted slot's duration, with other cores at stock.
+A fruitless hunt does not prove the all-offsets-live profile stable; repeated
+unattributed incidents remain bounded by the configured pause/quarantine limits.
 
 ### State machine
 

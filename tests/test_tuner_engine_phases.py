@@ -1259,6 +1259,7 @@ class TestRemainingEvidencePaths:
 
         sid = engine._session_id
         _confirm(engine, 1, -20)
+        tp.journal_co_intent(engine._db, sid, 1, -20, survived=True)
         tp.set_hunting_core(engine._db, sid, 1)
         events = [MCEEvent(timestamp=1.0, cpu=1, bank=0, message="corrected", corrected=True)]
         monkeypatch.setattr(engine, "_forensics", lambda *_a, **_kw: (events, True))

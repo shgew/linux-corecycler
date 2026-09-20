@@ -162,7 +162,7 @@ class TelemetrySample:
 class HistoryDB:
     """Crash-safe SQLite database for test run history."""
 
-    SCHEMA_VERSION = 16
+    SCHEMA_VERSION = 17
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
@@ -339,7 +339,8 @@ CREATE TABLE IF NOT EXISTS tuner_sessions (
     validation_requeue  TEXT    NOT NULL DEFAULT '[]',
     endurance_round     INTEGER NOT NULL DEFAULT 0,
     endurance_workload  INTEGER NOT NULL DEFAULT 0,
-    endurance_index     INTEGER NOT NULL DEFAULT 0
+    endurance_index     INTEGER NOT NULL DEFAULT 0,
+    boot_id             TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tuner_core_states (
@@ -696,6 +697,15 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         )
         HistoryDB._add_columns(conn, "tuner_test_log", [("threads", "INTEGER"), ("profile", "TEXT")])
 
+    @staticmethod
+    def _migrate_v17(conn: sqlite3.Connection) -> None:
+        HistoryDB._add_columns(conn, "tuner_sessions", [("boot_id", "TEXT NOT NULL DEFAULT ''")])
+        conn.execute(
+            "UPDATE tuner_sessions SET boot_id=COALESCE("
+            "(SELECT boot_id FROM tuner_events WHERE session_id=tuner_sessions.id ORDER BY id DESC LIMIT 1), '') "
+            "WHERE boot_id=''"
+        )
+
     _MIGRATIONS: dict[int, str | callable] = {
         2: _migrate_v2,
         3: _DDL_MIGRATE_V3,
@@ -712,6 +722,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         14: _migrate_v14,
         15: _DDL_MIGRATE_V15,
         16: _migrate_v16,
+        17: _migrate_v17,
     }
 
     # ------------------------------------------------------------------
@@ -1324,16 +1335,11 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         return {r["core_id"]: r["value"] for r in rows}
 
     def latest_session_activity(self, session_id: int) -> str | None:
-        """Most recent write timestamp across all of a session's state.
-
-        Used on resume to decide whether the machine rebooted since the session
-        last ran — the difference between a hard crash (penalize the resident
-        offsets) and a plain app exit (penalizing would corrupt the search).
-        """
+        """Latest execution checkpoint, excluding configuration and status edits."""
         row = self.__conn.execute(
             """\
             SELECT MAX(ts) FROM (
-                SELECT updated_at AS ts FROM tuner_sessions WHERE id=?
+                SELECT created_at AS ts FROM tuner_sessions WHERE id=?
                 UNION ALL SELECT updated_at FROM tuner_core_states WHERE session_id=?
                 UNION ALL SELECT updated_at FROM tuner_co_journal WHERE session_id=?
                 UNION ALL SELECT tested_at FROM tuner_test_log WHERE session_id=?
@@ -1384,6 +1390,10 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             "endurance_index=?, updated_at=? WHERE id=?",
             (round_, workload, index, self._now_iso(), session_id),
         )
+
+    def set_session_boot(self, session_id: int, boot_id: str) -> None:
+        self.__conn.execute("UPDATE tuner_sessions SET boot_id=? WHERE id=?", (boot_id, session_id))
+        self.checkpoint()
 
     def update_tuner_session_config(self, session_id: int, config_json: str) -> None:
         self.__conn.execute(
@@ -1673,6 +1683,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             endurance_round=row["endurance_round"] or 0,
             endurance_workload=row["endurance_workload"] or 0,
             endurance_index=row["endurance_index"] or 0,
+            boot_id=row["boot_id"],
         )
 
     def _execute_raw(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
@@ -1894,6 +1905,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                     "endurance_round",
                     "endurance_workload",
                     "endurance_index",
+                    "boot_id",
                 ),
             )
             counts["tuner_sessions"] = len(maps["tuner_sessions"])
