@@ -263,8 +263,7 @@ def cmd_run(
         if session.status == "quarantined":
             print("corecycler: --config cannot be applied to a quarantined session", file=sys.stderr)
             return EXIT_REFUSED
-        tp.update_session_config(db, session.id, override.to_json())
-        print(f"corecycler: session {session.id} config replaced from {config_path}")
+
         config = override
 
     if engine_factory is not None:
@@ -298,6 +297,10 @@ def cmd_run(
             )
             return EXIT_REFUSED
         engine = TunerEngine(db=db, topology=topology, smu=smu, backend=backend, config=config)
+
+    if override is not None:
+        tp.update_session_config(db, session.id, override.to_json())
+        print(f"corecycler: session {session.id} config replaced from {config_path}")
 
     outcome: dict[str, int] = {}
 

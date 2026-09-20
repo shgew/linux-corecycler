@@ -8,6 +8,7 @@ import os
 import re
 import signal
 import subprocess
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,6 +20,7 @@ from corecycler.engine.backends.base import KILLED_BY_US_CODES, StressResult
 if TYPE_CHECKING:
     import threading
     from collections.abc import Callable
+    from typing import TextIO
 
     from corecycler.engine.backends.base import StressBackend, StressConfig
     from corecycler.engine.detector import ErrorDetector, MCEEvent
@@ -56,7 +58,10 @@ class _LaneRun:
     cgroup: str | None = None
     stdout: str = ""
     stderr: str = ""
-    drained: bool = False
+
+    we_killed: bool = False
+    stdout_file: TextIO | None = None
+    stderr_file: TextIO | None = None
 
     @property
     def running(self) -> bool:
@@ -162,24 +167,20 @@ def make_preexec():
 
 
 def kill_process_group(proc: subprocess.Popen) -> None:
-    if proc.poll() is None:
-        try:
-            pgid = os.getpgid(proc.pid)
-        except (OSError, ProcessLookupError):
-            pgid = None
-        if pgid is not None:
-            with contextlib.suppress(OSError, ProcessLookupError):
-                os.killpg(pgid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(OSError, ProcessLookupError):
-                    os.killpg(pgid, signal.SIGKILL)
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=2)
-        else:
-            with contextlib.suppress(Exception):
-                proc.wait(timeout=1)
+    try:
+        pgid = os.getpgid(proc.pid)
+    except ProcessLookupError:
+        pgid = proc.pid
+    if pgid != proc.pid:
+        raise RuntimeError("Refusing to signal an unowned process group")
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pgid, signal.SIGTERM)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=3)
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(pgid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=2)
     for stream in (proc.stdout, proc.stderr):
         if stream:
             with contextlib.suppress(OSError):
@@ -246,7 +247,6 @@ class Supervisor:
         self.phase = phase
         self.hooks = hooks or SuperviseHooks()
         self._containment_for = containment_for or containment.contain
-        self._we_killed = False
 
     def run(
         self,
@@ -256,15 +256,26 @@ class Supervisor:
     ) -> dict[int, StressResult | None]:
         runs = [_LaneRun(lane=lane) for lane in lanes]
         start = time.monotonic()
-        self._we_killed = False
-        try:
-            for run in runs:
-                if not self._launch(run, config_for(run.lane), start):
-                    break
-            if any(run.running for run in runs):
-                self._poll_until_done(runs, start, duration)
-        finally:
-            self._finish(runs, start, duration)
+
+        with contextlib.ExitStack() as resources:
+            try:
+                for run in runs:
+                    try:
+                        run.stdout_file = resources.enter_context(
+                            tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
+                        )
+                        run.stderr_file = resources.enter_context(
+                            tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
+                        )
+                    except OSError as exc:
+                        self._fail(run, f"Failed to start stress output capture: {exc}", start, error_type="startup")
+                        break
+                    if not self._launch(run, config_for(run.lane), start):
+                        break
+                if any(run.running for run in runs):
+                    self._poll_until_done(runs, start, duration)
+            finally:
+                self._finish(runs, start, duration)
         return {run.lane.core_id: run.verdict for run in runs}
 
     def _launch(self, run: _LaneRun, cfg: StressConfig, batch_start: float) -> bool:
@@ -283,8 +294,8 @@ class Supervisor:
         try:
             run.proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=run.stdout_file,
+                stderr=run.stderr_file,
                 text=True,
                 cwd=str(lane.work_dir),
                 preexec_fn=make_preexec(),
@@ -377,7 +388,9 @@ class Supervisor:
             rc = run.proc.poll()
             if rc is not None:
                 self._drain(run)
-                if not self._we_killed and rc in KILLED_BY_US_CODES:
+                if run.verdict is not None:
+                    return self.stop_on_first_failure
+                if not run.we_killed and rc in KILLED_BY_US_CODES:
                     self._fail(
                         run,
                         f"Stress process killed externally (code {rc}) — possible OOM or system issue",
@@ -408,6 +421,10 @@ class Supervisor:
                         error_type="startup",
                     )
                     return True
+                live_err = self.backend.poll_errors(run.lane.work_dir)
+                if live_err:
+                    self._fail(run, live_err, start)
+                    return self.stop_on_first_failure
                 passed, msg = self.backend.parse_output(run.stdout, run.stderr, rc)
                 if passed:
                     run.verdict = StressResult(
@@ -481,13 +498,18 @@ class Supervisor:
         return now - run.last_active > self.stall_timeout
 
     def _drain(self, run: _LaneRun) -> None:
-        if run.drained or run.proc is None:
-            return
+
         try:
-            run.stdout, run.stderr = run.proc.communicate(timeout=2)
-        except (subprocess.TimeoutExpired, ValueError, OSError):
-            run.stdout, run.stderr = run.stdout or "", run.stderr or ""
-        run.drained = True
+            if run.stdout_file is not None:
+                run.stdout_file.seek(0)
+                run.stdout = run.stdout_file.read()
+            if run.stderr_file is not None:
+                run.stderr_file.seek(0)
+                run.stderr = run.stderr_file.read()
+        except OSError as exc:
+            log.warning("core %d: captured stress output unavailable: %s", run.lane.core_id, exc)
+            if run.verdict is None or run.verdict.passed:
+                self._fail(run, f"Captured stress output unavailable: {exc}", run.started_at, error_type="startup")
 
     def _fail(
         self,
@@ -508,26 +530,30 @@ class Supervisor:
             self.stop_event.set()
 
     def _finish(self, runs: list[_LaneRun], start: float, duration: float) -> None:
-        for run in runs:
-            if run.proc is not None and run.proc.poll() is None:
-                self._we_killed = True
-        for run in runs:
-            if run.proc is None:
-                continue
-            self._drain(run)
-            kill_process_group(run.proc)
-        self._apply_mce_events(runs, start, force=True)
         elapsed = time.monotonic() - start
         interrupted = self.stop_event.is_set() and elapsed < duration
         for run in runs:
-            if run.verdict is None and run.proc is not None:
-                run.verdict = self._final_verdict(run, elapsed, interrupted)
+            if run.proc is None:
+                continue
+            run.we_killed = run.proc.poll() is None
+            try:
+                kill_process_group(run.proc)
+                if run.proc.poll() is None:
+                    raise RuntimeError("Stress process remains alive after termination")
+            except (OSError, RuntimeError) as exc:
+                self._fail(run, f"Failed to stop stress test: {exc}", start, error_type="startup")
+            self._drain(run)
+        self._apply_mce_events(runs, start, force=True)
+        for run in runs:
+            if run.proc is not None and (run.verdict is None or run.verdict.passed):
+                runtime = run.verdict.duration_seconds if run.verdict is not None else elapsed
+                run.verdict = self._final_verdict(run, runtime, interrupted and run.verdict is None)
         reap_zombies()
 
     def _final_verdict(self, run: _LaneRun, elapsed: float, interrupted: bool) -> StressResult | None:
         rc = run.proc.returncode if run.proc is not None else 0
         rc = rc if rc is not None else 0
-        if rc in KILLED_BY_US_CODES and not self._we_killed:
+        if rc in KILLED_BY_US_CODES and not run.we_killed:
             return StressResult(
                 core_id=run.lane.core_id,
                 passed=False,

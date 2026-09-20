@@ -285,7 +285,7 @@ class SMUTab(QWidget):
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No,
         )
-        return reply == QMessageBox.StandardButton.Yes
+        return reply == QMessageBox.StandardButton.Yes and not self._tuner_active
 
     # ------------------------------------------------------------------
     # Read / Write actions
@@ -329,7 +329,7 @@ class SMUTab(QWidget):
 
         value = spin.value()
 
-        if not self._confirm_co_write(f"Set core {core_id} CO offset to {value}."):
+        if not self._confirm_co_write(f"Set core {core_id} CO offset to {value}.") or self._tuner_active:
             return
 
         success = self._smu.set_co_offset(core_id, value)
@@ -353,7 +353,7 @@ class SMUTab(QWidget):
             return
 
         summary = ", ".join(f"C{cid}={spin.value()}" for cid, spin in sorted(self._spinboxes.items()))
-        if not self._confirm_co_write(f"Apply CO offsets to all cores:\n{summary}"):
+        if not self._confirm_co_write(f"Apply CO offsets to all cores:\n{summary}") or self._tuner_active:
             return
 
         self._apply_all_btn.setEnabled(False)
@@ -385,7 +385,7 @@ class SMUTab(QWidget):
             )
             return
 
-        if not self._confirm_co_write("Reset all Curve Optimizer offsets to 0."):
+        if not self._confirm_co_write("Reset all Curve Optimizer offsets to 0.") or self._tuner_active:
             return
 
         self._apply_all_btn.setEnabled(False)
@@ -412,7 +412,7 @@ class SMUTab(QWidget):
 
         num_cores = len(self._topology.cores)
         backup = self._smu.backup_co_offsets(num_cores)
-        self._restore_btn.setEnabled(True)
+        self._restore_btn.setEnabled(not self._tuner_active and self._smu.has_backup())
         QMessageBox.information(
             self,
             "Backup Complete",
@@ -426,7 +426,7 @@ class SMUTab(QWidget):
             QMessageBox.warning(self, "Error", "No backup available to restore.")
             return
 
-        if not self._confirm_co_write("Restore CO offsets from backup."):
+        if self._tuner_active or not self._confirm_co_write("Restore CO offsets from backup.") or self._tuner_active:
             return
 
         ok, failed = self._smu.restore_co_offsets()

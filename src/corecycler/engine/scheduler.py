@@ -271,6 +271,12 @@ class CoreScheduler:
                 passed = False
                 error_msg = idle_error
 
+        if passed and self._stop_event.is_set() and (self.config.variable_load or self.config.idle_stability_test > 0):
+            status.state = "pending"
+            status.current_phase = ""
+            self.backend.cleanup(lane.work_dir, preserve_on_error=False)
+            return
+
         elapsed = time.monotonic() - start_time
         status.elapsed_seconds = elapsed
         status.iterations += 1
@@ -301,7 +307,10 @@ class CoreScheduler:
             segment = min(interval, deadline - time.monotonic())
             if load_on:
                 verdict = supervisor.run([lane], lambda _lane: self.stress_config, segment)[lane.core_id]
-                if verdict is not None and not verdict.passed:
+                if verdict is None:
+                    self._stop_event.set()
+                    return True, None
+                if not verdict.passed:
                     if self.config.stop_on_error:
                         self._stop_event.set()
                     return False, verdict.error_message

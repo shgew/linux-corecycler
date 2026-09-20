@@ -205,6 +205,12 @@ class TestCommandConstruction:
         on_path({"setpriv": "/usr/bin/setpriv"})
         assert tools.command_name("setpriv") == "/usr/bin/setpriv"
 
+    def test_rejected_explicit_tool_never_falls_back_to_path(self, on_path, monkeypatch):
+        on_path({"setpriv": "/usr/bin/setpriv"})
+        monkeypatch.setenv("CORECYCLER_SETPRIV_BIN", "/missing/setpriv")
+        with pytest.raises(FileNotFoundError):
+            tools.command_name("setpriv")
+
     def test_absent_tool_keeps_its_name_so_exec_fails_naming_it(self, on_path):
         on_path({})
         assert tools.command_name("setpriv") == "setpriv"

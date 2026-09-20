@@ -1615,10 +1615,13 @@ class TestRebootGate:
         assert eng._core_states[0].current_offset == -27
         assert eng._core_states[0].backoff_fail_bound == -30
 
-    @pytest.mark.parametrize("previous_boot, timestamp, crashes", [
-        ("old-boot", "2099-01-01T00:00:00+00:00", 1),
-        ("test-boot", "2000-01-01T00:00:00+00:00", 0),
-    ])
+    @pytest.mark.parametrize(
+        "previous_boot, timestamp, crashes",
+        [
+            ("old-boot", "2099-01-01T00:00:00+00:00", 1),
+            ("test-boot", "2000-01-01T00:00:00+00:00", 0),
+        ],
+    )
     def test_boot_identity_overrides_wall_clock_and_metadata(
         self, db, topo, smu, mock_backend, monkeypatch, assume_rebooted, previous_boot, timestamp, crashes
     ):
@@ -1660,7 +1663,6 @@ class TestRebootGate:
         assert eng._core_states[0].backoff_fail_bound == -30
         assert not any(value == -30 for _, value in smu.writes)
 
-
     def test_unreadable_forensics_preserves_recovery_until_it_can_be_read(
         self, db, topo, smu, mock_backend, monkeypatch, assume_rebooted
     ):
@@ -1684,7 +1686,6 @@ class TestRebootGate:
         assert resumed._core_states[0].crash_count == 1
         assert resumed._core_states[0].current_offset == -27
         assert tp.get_session(db, sid).boot_id == "test-boot"
-
 
     def test_no_reboot_clears_in_test_without_penalty(self, db, topo, smu, mock_backend, monkeypatch):
         import corecycler.tuner.engine as engine_mod
@@ -1846,7 +1847,7 @@ class TestStartupFailureIsNotAVerdict:
 class TestApparatusBreaker:
     # The workload _on_test_finished records for a core outside hardening:
     # the session's own backend/mode/preset (TunerConfig defaults).
-    BASE = dict(backend="mprime", stress_mode="SSE", fft_preset="SMALL")
+    BASE = dict(backend="mprime", stress_mode="SSE", fft_preset="SMALL", threads=1, profile="sustained")
 
     def _seed(self, db, topo, smu, backend, streak_threshold=5, **core):
         sid = tp.create_session(
@@ -1891,28 +1892,20 @@ class TestApparatusBreaker:
             **(workload or self.BASE),
         )
 
-    def test_trips_rolls_back_to_evidence_and_pauses(self, db, topo, smu, mock_backend):
-        """The stale-results class: N consecutive FAILs at offsets the core has
-        already passed under the same workload, while every step adds voltage,
-        is physically implausible — the breaker must roll the core back to its
-        most aggressive PROVEN pass, clear poisoned bounds, and pause."""
+    def test_breaker_preserves_real_failure_evidence(self, db, topo, smu, mock_backend):
         eng, sid, cs = self._seed(db, topo, smu, mock_backend, streak_threshold=5)
         self._log(db, sid, -44, "confirm", True, duration=300.0)  # proven pass
         for off in (-24, -23, -22, -21):  # 4 prior fails
             self._log(db, sid, off, "backoff_preconfirm", False)
 
-        with patch.object(eng, "_run_next"), patch.object(eng, "_advance_core") as adv:
-            # the 5th consecutive fail crosses the threshold
-            eng._on_test_finished(0, False, "mprime error: FATAL ERROR", "computation", 122.0, 0.0)
-
+        with patch.object(eng, "_run_next"):
+            eng._on_test_finished(0, False, "mprime ERROR: FATAL ERROR", "computation", 122.0, 0.0)
         assert eng._status == "paused"
-        adv.assert_not_called()  # verdict not walked into the search
-        assert cs.best_offset == -44  # rolled back to proven evidence
-        assert cs.current_offset == -44
-        assert cs.phase == TunerPhase.CONFIRMING  # must re-earn confirmation
-        assert cs.backoff_fail_bound is None and cs.backoff_pass_bound is None
+        assert cs.backoff_fail_bound == -20
+        assert cs.current_offset > -20
         persisted = db.get_tuner_core_states(sid)[0]
-        assert persisted.best_offset == -44  # rollback is durable
+        assert persisted.backoff_fail_bound == -20
+        assert persisted.current_offset == cs.current_offset
 
     def test_below_threshold_does_not_trip(self, db, topo, smu, mock_backend):
         eng, sid, cs = self._seed(db, topo, smu, mock_backend, streak_threshold=5)
@@ -2058,9 +2051,7 @@ class TestNoRebootResidentOffset:
         assert smu.applied[0] == 0  # aggressive offset no longer resident
         assert eng._co_applied[0] == 0
 
-    def test_rebooted_zero_baseline_is_not_rewritten(self, db, topo, smu, mock_backend):
-        """After a real reboot SMU SRAM is zeroed — writing 0 again would be a
-        pointless hardware write. The journal alone records that 0 is resident."""
+    def test_reboot_does_not_hide_offsets_applied_by_another_tool(self, db, topo, smu, mock_backend):
         sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
         tp.save_core_state(
             db,
@@ -2072,9 +2063,9 @@ class TestNoRebootResidentOffset:
                 baseline_offset=0,
             ),
         )
-        # autouse fixture patches _rebooted_since -> True (reboot world)
+        smu.applied[0] = -30
         eng = _resume_fresh(db, topo, smu, mock_backend, sid)
-        assert (0, 0) not in smu.writes
+        assert smu.applied[0] == 0
         assert eng._co_applied[0] == 0
         assert db.journal_survived_values(sid).get(0) == 0
 

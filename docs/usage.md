@@ -5,7 +5,7 @@
 ## Quick start
 
 1. Launch CoreCycler (`corecycler` or `python src/corecycler/main.py`). Full monitoring
-   (clock stretch, per-core power, Curve Optimizer) needs access to the MSR and SMU
+   (active-clock ratio, per-core power, Curve Optimizer) needs access to the MSR and SMU
    devices: grant it to your user once ([Device access](installation.md#device-access))
    or launch with `sudo`. Without either it runs with reduced telemetry and a status-bar
    warning.
@@ -68,7 +68,8 @@ The Auto-Tuner automates the entire PBO Curve Optimizer search via runtime SMU w
 
 1. **Coarse search** -- from `start_offset` (default 0), step by `coarse_step`
    (default -5) toward `max_offset`, running a short test (`search_duration`, default
-   60s) per step. A pass goes more aggressive; a fail bounds the limit.
+   60s) per step. A pass goes more aggressive; a fail bounds the limit. If the first
+   coarse probe fails, fine-step backoff explores the gap toward baseline.
 2. **Fine search** -- from the last passing coarse value, step by `fine_step`
    (default -1) toward the failure point to narrow the exact limit.
 3. **Confirmation** -- a longer test (`confirm_duration`, default 300s) validates the
@@ -90,7 +91,7 @@ The Auto-Tuner automates the entire PBO Curve Optimizer search via runtime SMU w
    - **Stage 4 -- rapid transitions** (`validate_transitions`): fast load/idle cycling
      across all cores -- catches idle-to-boost instability.
    - **Stage 5 -- per-core spectrum** (`validate_spectrum`): bursts, load transitions
-     and idle watch per core with all offsets live.
+     and idle watch per core with all offsets live, independently of stage 4.
    - **Stage 6 -- all-core memory load** (`validate_memory`): one memory stressor
      (stressapptest) per core at once, all offsets live -- catches CO marginality
      that only appears under memory-controller load. Skipped with a log if no memory
@@ -110,6 +111,18 @@ The Auto-Tuner automates the entire PBO Curve Optimizer search via runtime SMU w
 5. **Result** -- each core gets a confirmed, cross-validated best offset. Export it as
    JSON or load it into the Curve Optimizer tab.
 
+A confirmed offset has passed the configured workloads and durations, not every
+possible workload indefinitely. The search targets the most aggressive passing
+candidate within its bounds; intermittent failures limit how precisely that
+boundary can be established. With `endurance=true`, validation continues in
+progressively longer rounds rather than declaring a final result.
+
+The active-clock warning compares APERF/MPERF against nominal frequency. It does
+not prove clock stretching or CO instability and never changes a stress verdict.
+The saved `stretch_threshold_pct` field controls this warning for existing sessions.
+A contradictory-failure circuit breaker pauses with the new failure bound intact;
+an earlier passing run does not make a later failure invalid.
+
 ### CO isolation
 
 During per-core search the **only** non-baseline offset on the CPU is the core under
@@ -120,9 +133,10 @@ failure or a partial SMU write, all cores revert to baseline before pausing.
 
 ### Crash safety
 
-Hard crashes are expected during CO tuning -- that is how each core's limit is found. No
-sequence of crashes, reboots, SMU faults, or resumes can leave the tuner re-applying a
-configuration that crashes the machine. Three mechanisms enforce this:
+Hard crashes can occur during CO tuning. Recovery backs off attributable failures,
+hunts ambiguous failures in isolation, and stops when evidence or hardware control
+is unavailable. It cannot guarantee a reboot-free machine. Three mechanisms bound
+recovery:
 
 1. **CO write-ahead journal** -- every CO value is recorded in SQLite *before* it is
    written to the SMU, and marked "survived" only after a test completes with it
@@ -130,10 +144,9 @@ configuration that crashes the machine. Three mechanisms enforce this:
    (whether or not a test was running, and including a crash during idle, baseline
    restore, post-test revert, or multi-core validation). Every un-survived offset is
    treated as a hard crash: a fail bound is set there and the core backs off past it.
-2. **CO=0 is the only safe floor** -- the one state guaranteed stable is CO=0 (stock
-   voltage). Crash backoff never settles past it, and if a core's *baseline* is what
-   crashed, the baseline is descended toward 0 rather than re-applied -- so an unstable
-   inherited baseline is escapable, not an infinite loop.
+2. **CO=0 is the recovery floor** -- crash backoff never goes past stock. If an
+   inherited baseline crashes, it moves toward 0 rather than being reapplied
+   unchanged. Stock is not proof of stability: hardware errors at stock pause.
 3. **Resume-crash circuit breaker** -- consecutive crash-resumes without a passing
    non-hunt test are counted. Hunt passes, thermal stops, apparatus faults, and plain
    app restarts do not clear the counter. Finding and backing off a hunt culprit does.
@@ -141,10 +154,10 @@ configuration that crashes the machine. Three mechanisms enforce this:
    to CO=0 and marks the session `quarantined`, never resumed automatically.
    Reopening requires an explicit decision and retains only previously survived values.
 
-An interrupted session is detected on next launch and offered for resume; resume
-re-applies only journaled-safe baselines and re-engages one core at a time. A crash or
-pause during validation is recoverable: on resume the tuner restores the persisted
-validation cursor and continues at the exact stage and position it left off.
+An interrupted session is detected on next launch and offered for resume. Resume
+rebuilds journal evidence from that session only and verifies baseline restoration
+through the SMU; it does not assume a reboot left stock values resident. A crash or
+pause during validation retains the persisted cursor and pending validation work.
 
 Reboot detection compares the session's persisted Linux boot ID with the current
 boot, not configuration-save times or wall-clock changes. Older histories gain

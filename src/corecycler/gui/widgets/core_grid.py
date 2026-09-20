@@ -136,7 +136,7 @@ class CoreCell(QWidget):
             if freq_mhz > 0:
                 parts.append(f"{freq_mhz:.0f}MHz")
             if stretch_pct is not None:
-                parts.append(f"S:{stretch_pct:.1f}%")
+                parts.append(f"N:{stretch_pct:.1f}%")
             if temp_c > 0:
                 parts.append(f"{temp_c:.0f}C")
             if vcore_v is not None:

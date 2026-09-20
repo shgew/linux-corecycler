@@ -28,7 +28,7 @@ ADVANCE_RELATION: dict[tuple[TunerPhase, bool], set[TunerPhase]] = {
     (P.NOT_STARTED, True): {P.COARSE_SEARCH},
     (P.NOT_STARTED, False): {P.COARSE_SEARCH},  # entry step ignores the verdict
     (P.COARSE_SEARCH, True): {P.COARSE_SEARCH, P.SETTLED},
-    (P.COARSE_SEARCH, False): {P.FINE_SEARCH, P.SETTLED},
+    (P.COARSE_SEARCH, False): {P.FINE_SEARCH, P.SETTLED, P.BACKOFF_PRECONFIRM},
     (P.FINE_SEARCH, True): {P.FINE_SEARCH, P.SETTLED},
     (P.FINE_SEARCH, False): {P.SETTLED},
     (P.SETTLED, True): {P.CONFIRMING},

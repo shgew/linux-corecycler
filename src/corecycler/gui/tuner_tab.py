@@ -295,9 +295,9 @@ class TunerTab(QWidget):
         self._stretch_threshold_spin.setValue(3.0)
         self._stretch_threshold_spin.setSuffix("%")
         self._stretch_threshold_spin.setToolTip(
-            "Clock stretch threshold - if APERF/MPERF stretch exceeds this %\n"
-            "during a test, mark it as FAIL even if stress test passed.\n"
-            "0 = disabled. 3% = recommended. Needs MSR access (CAP_SYS_RAWIO)."
+            "Warn when the active-clock frequency falls this far below nominal.\n"
+            "APERF/MPERF alone cannot prove clock stretching or instability.\n"
+            "0 = disabled. Requires MSR access. Does not change test verdicts."
         )
 
         # Check MSR availability and warn if unavailable
@@ -313,13 +313,13 @@ class TunerTab(QWidget):
         if not msr_available:
             self._stretch_threshold_spin.setEnabled(False)
             self._stretch_threshold_spin.setToolTip(
-                "MSR access unavailable - clock stretch detection disabled.\n"
+                "MSR access unavailable - active-clock warnings disabled.\n"
                 "Needs the msr kernel module and CAP_SYS_RAWIO: launch through the\n"
                 "setcap launcher (services.corecycler.msrAccess on NixOS) or run as root."
             )
             self._stretch_threshold_spin.setStyleSheet(f"color: {theme.COLOR_MUTED};")
 
-        search_layout.addRow("Stretch threshold:", self._stretch_threshold_spin)
+        search_layout.addRow("Below-nominal warning:", self._stretch_threshold_spin)
 
         self._order_combo = QComboBox()
         self._order_combo.addItems(["sequential", "round_robin", "weakest_first", "ccd_alternating", "ccd_round_robin"])
@@ -1182,7 +1182,5 @@ class TunerTab(QWidget):
     @property
     def is_running(self) -> bool:
         return self._engine is not None and (
-            self._engine.status in ACTIVE_STATUSES
-            or self._engine.status == "paused"
-            or self._engine.test_in_flight
+            self._engine.status in ACTIVE_STATUSES or self._engine.status == "paused" or self._engine.test_in_flight
         )

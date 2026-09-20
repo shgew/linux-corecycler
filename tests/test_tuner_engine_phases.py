@@ -650,12 +650,20 @@ class TestVerdictRouter:
         assert engine.status == "idle"
         assert engine._abort_requested
 
-    def test_a_pass_with_excess_clock_stretch_is_recorded_as_a_failure(self, engine, monkeypatch):
+    def test_frequency_deficit_does_not_invent_an_instability_failure(self, engine):
         engine._config.stretch_threshold_pct = 3.0
-        advanced = []
-        monkeypatch.setattr(engine, "_advance_core", lambda cid, ok: advanced.append(ok))
         engine._on_test_finished(0, True, "", "", 1.0, 9.5)
-        assert advanced == [False]
+        row = tp.get_test_log(engine._db, engine.session_id)[-1]
+        assert row["passed"]
+        assert row["error_type"] is None
+
+    def test_rejected_quarantine_restore_stays_quarantined(self, engine):
+        engine._smu.set_co_offset.return_value = False
+        engine._co_applied[0] = -20
+        engine._quarantine_session(3)
+        assert tp.get_session(engine._db, engine.session_id).status == "quarantined"
+        assert engine._co_applied[0] is None
+        assert not any(cs.in_test for cs in engine.core_states.values())
 
     def test_a_passing_hunt_slot_routes_to_the_hunt_flow(self, engine, monkeypatch):
         engine._hunting = True

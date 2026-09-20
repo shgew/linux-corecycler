@@ -83,6 +83,56 @@ class TestStateMachineTransitions:
         assert cs.phase == TunerPhase.COARSE_SEARCH
         assert cs.current_offset == -5  # 0 + (-1)*5
 
+    def test_failed_midpoint_preserves_actual_failure_bound(self, engine):
+        cs = CoreState(
+            core_id=0,
+            phase=TunerPhase.BACKOFF_PRECONFIRM,
+            current_offset=-20,
+            best_offset=-10,
+            backoff_pass_bound=-10,
+            backoff_fail_bound=-30,
+            consecutive_backoff_fails=2,
+        )
+        engine._core_states = {0: cs}
+        engine._advance_core(0, False)
+        assert cs.backoff_fail_bound == -20
+        assert cs.best_offset == -10
+        assert -20 < cs.current_offset < -10
+
+    def test_first_coarse_failure_still_finds_fine_boundary(self, engine):
+        engine._config.hardening_tiers = []
+        cs = CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-5)
+        engine._core_states = {0: cs}
+        for _ in range(30):
+            if cs.phase == TunerPhase.CONFIRMED:
+                break
+            engine._advance_core(0, cs.current_offset >= -4)
+        assert cs.phase == TunerPhase.CONFIRMED
+        assert cs.best_offset == -4
+
+    def test_failed_confirmation_backs_off_before_next_launch(self, engine):
+        engine._session_id = tp.create_session(engine._db, engine._config, "", "")
+        cs = CoreState(core_id=0, phase=TunerPhase.FAILED_CONFIRM, current_offset=-20, best_offset=-20)
+        engine._core_states = {0: cs}
+        with patch.object(engine, "_start_worker") as launch:
+            engine._run_next()
+        assert launch.call_count == 1
+        assert cs.current_offset == -19
+        assert cs.phase == TunerPhase.BACKOFF_PRECONFIRM
+
+    def test_spectrum_runs_when_transitions_disabled(self, engine):
+        engine._config.validate_transitions = False
+        engine._config.validate_spectrum = True
+        engine._validation_stage = 4
+        engine._validation_core_order = [0, 1]
+        engine._validation_core_index = 2
+        engine._core_states = {c: CoreState(core_id=c, best_offset=-10) for c in (0, 1)}
+        with patch("corecycler.tuner.engine.QTimer.singleShot"), patch.object(engine, "_start_worker") as launch:
+            engine._run_validation_next()
+            engine._run_validation_next()
+        assert launch.call_args.args[0] == 0
+        assert launch.call_args.kwargs["spectrum"] is True
+
     def test_coarse_pass_goes_more_aggressive(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
         cs = CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-5)
@@ -107,13 +157,6 @@ class TestStateMachineTransitions:
         assert cs.phase == TunerPhase.FINE_SEARCH
         assert cs.coarse_fail_offset == -10
         assert cs.current_offset == -6  # best(-5) + direction(-1)*fine(1) = -6
-
-    def test_coarse_fail_no_best_settles(self, db, simple_topology, mock_smu, mock_backend):
-        eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
-        cs = CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-5, best_offset=None)
-        eng._core_states = {0: cs}
-        eng._advance_core(0, passed=False)
-        assert cs.phase == TunerPhase.SETTLED
 
     def test_fine_pass_continues(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
@@ -2697,8 +2740,7 @@ class TestSearchBoundsAndBackoffFloor:
         eng._advance_core(0, passed=False)
         assert cs.current_offset == -20
         eng._advance_core(0, passed=True)
-        assert cs.phase == TunerPhase.BACKOFF_CONFIRMING
-        eng._advance_core(0, passed=True)
+
         assert cs.phase == TunerPhase.HARDENING_T1
         assert cs.best_offset == -20
 

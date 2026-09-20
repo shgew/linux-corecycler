@@ -324,7 +324,7 @@ class TestSupervisorInternalsEdges:
         supervisor = _idle_supervisor(backend=FakeBackend(poll_error="fake error: SUMOUT"))
         run = _LaneRun(lane=Lane(core_id=0, cpus=(0,), work_dir=tmp_path))
         run.proc = SimpleNamespace(returncode=0)
-        supervisor._we_killed = True
+
         verdict = supervisor._final_verdict(run, elapsed=5.0, interrupted=False)
         assert verdict is not None and "SUMOUT" in verdict.error_message
 
@@ -340,6 +340,35 @@ class TestSchedulerHookGlue:
         ScriptedSupervisor.script = []
         ScriptedSupervisor.created = []
         return make_scheduler(tmp_path, **config), ScriptedSupervisor
+
+    @pytest.mark.parametrize("phase", ["variable", "idle"])
+    def test_stopping_optional_validation_leaves_no_pass(self, tmp_path, monkeypatch, phase):
+        from test_scheduler import step_pass
+
+        sched, scripted = self._scheduler(
+            tmp_path,
+            monkeypatch,
+            cores_to_test=[0],
+            variable_load=phase == "variable",
+            idle_stability_test=1.0 if phase == "idle" else 0.0,
+        )
+
+        def stop_segment(sup, lanes, config_for, duration):
+            sup.kwargs["stop_event"].set()
+            return {0: None}
+
+        if phase == "variable":
+            scripted.script = [step_pass, stop_segment]
+        else:
+            scripted.script = [step_pass]
+
+            def stop_idle(*args, **kwargs):
+                sched._stop_event.set()
+                return None
+
+            monkeypatch.setattr(sched, "_idle_phase", stop_idle)
+        assert sched.run()[0] == []
+        assert sched.core_status[0].state == "pending"
 
     def test_engine_hooks_reach_the_scheduler_callbacks(self, tmp_path, monkeypatch):
         sched, scripted = self._scheduler(tmp_path, monkeypatch, cores_to_test=[0])

@@ -14,8 +14,10 @@ def _json_value_ok(default: object, value: object) -> bool:
     if isinstance(default, int):
         return isinstance(value, int) and not isinstance(value, bool)
     if isinstance(default, float):
-        return isinstance(value, (int, float)) and not isinstance(value, bool) and (
-            not isinstance(value, float) or math.isfinite(value)
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and (not isinstance(value, float) or math.isfinite(value))
         )
     if isinstance(default, str):
         return isinstance(value, str)
@@ -69,8 +71,7 @@ class TunerConfig:
     stress_mode: str = "SSE"
     fft_preset: str = "SMALL"
 
-    # Clock stretch detection
-    stretch_threshold_pct: float = 3.0  # treat as failure if stretch > this % during test
+    stretch_threshold_pct: float = 3.0
 
     # Backoff algorithm
     midpoint_jump_threshold: int = 3  # after this many consecutive backoff fails, jump to midpoint
@@ -78,9 +79,7 @@ class TunerConfig:
     # Safety
     abort_on_consecutive_failures: int = 0  # 0 = disabled
 
-    # Apparatus circuit breaker: this many consecutive FAILs on one core (each
-    # backoff step ADDS voltage, so a healthy apparatus cannot do this) rolls
-    # the core back to its most aggressive proven pass and pauses. 0 disables.
+    # Contradictory failures pause without discarding the new fail bound. Zero disables.
     apparatus_failure_streak: int = 12
 
     # Resume-crash circuit breaker. After this many consecutive crash-resumes with

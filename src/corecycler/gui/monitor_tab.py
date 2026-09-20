@@ -171,7 +171,7 @@ class CoreFreqBar(QWidget):
 
         # Stretch — fixed slot, blank when idle (keeps alignment stable)
         if self._stretch_pct is not None and self._usage_pct > 5:
-            stretch_str = f"S:{self._stretch_pct:4.1f}%"
+            stretch_str = f"N:{self._stretch_pct:4.1f}%"
             if self._stretch_pct > 3.0:
                 stretch_color = QColor(theme.CHART_TEMP)
             elif self._stretch_pct > 1.0:

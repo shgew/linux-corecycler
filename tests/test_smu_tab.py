@@ -60,6 +60,40 @@ class TestProfileLoad:
 
 
 class TestTunerLock:
+    def test_backup_cannot_unlock_restore_during_tuning(self):
+        tab = _tab()
+        tab._smu = MagicMock()
+        tab._smu.is_available.return_value = True
+        tab._smu.has_backup.return_value = True
+        tab._smu.backup_co_offsets.return_value = {0: -10}
+        tab.set_tuner_running(True)
+        with (
+            patch("corecycler.gui.smu_tab.QMessageBox.information"),
+            patch("corecycler.gui.smu_tab.QMessageBox.warning"),
+        ):
+            tab._backup_co()
+            assert not tab._restore_btn.isEnabled()
+            with patch.object(tab, "_confirm_co_write", return_value=True):
+                tab._restore_co()
+        tab._smu.restore_co_offsets.assert_not_called()
+
+    def test_ownership_is_rechecked_after_restore_confirmation(self):
+        tab = _tab()
+        tab._smu = MagicMock()
+        tab._smu.is_available.return_value = True
+        tab._smu.has_backup.return_value = True
+
+        def confirm(detail):
+            tab.set_tuner_running(True)
+            return True
+
+        with (
+            patch.object(tab, "_confirm_co_write", side_effect=confirm),
+            patch("corecycler.gui.smu_tab.QMessageBox.information"),
+        ):
+            tab._restore_co()
+        tab._smu.restore_co_offsets.assert_not_called()
+
     def test_tuner_running_disables_writes(self):
         tab = _tab()
         tab._smu = MagicMock()

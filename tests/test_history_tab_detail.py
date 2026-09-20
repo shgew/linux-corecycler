@@ -532,8 +532,7 @@ class TestRunDetail:
         assert "[info] note" in text
         assert "Total samples: 6" in text
         assert "Boost ceiling: 5000 MHz" in text
-        assert "Clock stretch: 40.0%" in text
-        assert "Clock stretch: none" in text
+
         assert "Temp: 70.0-72.0 C" in text
         assert "Vcore: 1.1000-1.1200V" in text
         assert "Settings Snapshot" in text

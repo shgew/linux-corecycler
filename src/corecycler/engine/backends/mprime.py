@@ -103,10 +103,6 @@ FATAL_PATTERNS: list[str] = [
 class MprimeBackend(StressBackend):
     name = "mprime"
 
-    def __init__(self) -> None:
-        super().__init__()
-        self._last_work_dir: Path | None = None
-
     def get_command(self, config: StressConfig, work_dir: Path) -> list[str]:
         return [self.require_binary(), "-t", "-W" + str(work_dir)]
 
@@ -118,7 +114,6 @@ class MprimeBackend(StressBackend):
 
     def prepare(self, work_dir: Path, config: StressConfig) -> None:
         work_dir.mkdir(parents=True, exist_ok=True)
-        self._last_work_dir = work_dir
 
         # A stale results.txt from an earlier run (abort, hard crash, or a
         # preserved failure that was never renamed) would be re-read by
@@ -211,18 +206,6 @@ class MprimeBackend(StressBackend):
     def parse_output(self, stdout: str, stderr: str, returncode: int) -> tuple[bool, str | None]:
         combined = stdout + "\n" + stderr
 
-        # also check results.txt if available (mprime writes errors there)
-        if self._last_work_dir:
-            results_file = self._last_work_dir / "results.txt"
-            if results_file.exists():
-                try:
-                    combined += "\n" + results_file.read_text()
-                except OSError as e:
-                    # Fail closed: without results.txt a real error could pass
-                    # unseen. This is an apparatus fault, not a verdict — the
-                    # engine pauses on it instead of advancing the search.
-                    return False, f"Failed to read results.txt ({e}) — verdict unavailable"
-
         for pattern in FATAL_PATTERNS:
             match = re.search(pattern, combined, re.IGNORECASE)
             if match:
@@ -265,8 +248,8 @@ class MprimeBackend(StressBackend):
             return None
         try:
             content = results_file.read_text()
-        except OSError:
-            return None
+        except OSError as exc:
+            return f"Failed to read results.txt ({exc}) - verdict unavailable"
         for pattern in FATAL_PATTERNS:
             match = re.search(pattern, content, re.IGNORECASE)
             if match:

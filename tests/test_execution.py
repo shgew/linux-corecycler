@@ -154,6 +154,146 @@ def run_one(supervisor: Supervisor, one: Lane, duration: float):
     return supervisor.run([one], lambda _lane: StressConfig(), duration)[one.core_id]
 
 
+class TestVerdictProvenance:
+    def test_stdout_error_survives_deadline_cleanup(self, tmp_path):
+        backend = FakeBackend(_child("import time; print('FATAL ERROR', flush=True); time.sleep(60)"))
+        backend.parse_output = lambda out, err, rc: (
+            "FATAL ERROR" not in out,
+            "FATAL ERROR" if "FATAL ERROR" in out else None,
+        )
+        supervisor, _, _ = make_supervisor(backend)
+        verdict = run_one(supervisor, lane(tmp_path), 0.3)
+        assert verdict is not None and not verdict.passed
+        assert verdict.error_type == "computation"
+
+    def test_late_child_error_overrides_leader_success(self, tmp_path, monkeypatch):
+        from io import StringIO
+        from types import SimpleNamespace
+
+        backend = FakeBackend()
+        backend.parse_output = lambda out, err, rc: (not err, err or None)
+        supervisor, _, _ = make_supervisor(backend)
+        run = execution._LaneRun(lane=lane(tmp_path))
+        run.proc = SimpleNamespace(returncode=0, poll=lambda: 0)
+        run.stderr_file = StringIO()
+        start = time.monotonic() - 10
+        supervisor._poll_exits_stalls_watchdog([run], start)
+        assert run.verdict.passed
+        monkeypatch.setattr(execution, "kill_process_group", lambda proc: run.stderr_file.write("FATAL ERROR"))
+        monkeypatch.setattr(execution, "reap_zombies", lambda: None)
+        supervisor._finish([run], start, 10)
+        assert not run.verdict.passed
+        assert run.verdict.error_type == "computation"
+
+    @pytest.mark.parametrize("when", ["exit", "cleanup", "failed_cleanup"])
+    def test_unreadable_capture_never_creates_a_pass(self, tmp_path, monkeypatch, when):
+        from io import StringIO
+        from types import SimpleNamespace
+
+        class Capture(StringIO):
+            broken = False
+
+            def read(self):
+                if self.broken:
+                    raise OSError("capture read failed")
+                return super().read()
+
+        backend = FakeBackend()
+        backend.parse_output = lambda out, err, rc: (not err, err or None)
+        supervisor, _, _ = make_supervisor(backend)
+        run = execution._LaneRun(lane=lane(tmp_path), started_at=time.monotonic() - 10)
+        run.proc = SimpleNamespace(returncode=0, poll=lambda: 0)
+        run.stderr_file = Capture("FATAL ERROR" if when == "failed_cleanup" else "")
+        run.stderr_file.broken = when == "exit"
+        supervisor._poll_exits_stalls_watchdog([run], run.started_at)
+        run.stderr_file.broken = True
+        monkeypatch.setattr(execution, "kill_process_group", lambda proc: None)
+        monkeypatch.setattr(execution, "reap_zombies", lambda: None)
+        supervisor._finish([run], run.started_at, 10)
+        assert not run.verdict.passed
+        assert run.verdict.error_type == ("computation" if when == "failed_cleanup" else "startup")
+
+    def test_external_kill_is_not_hidden_by_sibling_cleanup(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        supervisor, _, _ = make_supervisor(FakeBackend())
+        dead = execution._LaneRun(lane=lane(tmp_path, core_id=0))
+        live = execution._LaneRun(lane=lane(tmp_path, core_id=1))
+        dead.proc = SimpleNamespace(returncode=-9, poll=lambda: -9)
+        live.proc = SimpleNamespace(returncode=None)
+        live.proc.poll = lambda: live.proc.returncode
+        monkeypatch.setattr(supervisor, "_drain", lambda run: None)
+        monkeypatch.setattr(
+            execution,
+            "kill_process_group",
+            lambda proc: setattr(proc, "returncode", -15) if proc.returncode is None else None,
+        )
+        monkeypatch.setattr(execution, "reap_zombies", lambda: None)
+        supervisor._finish([dead, live], time.monotonic() - 10, 10)
+        assert dead.verdict is not None and dead.verdict.error_type == "killed"
+        assert live.verdict is not None and live.verdict.passed
+
+    def test_cleanup_time_does_not_complete_an_interrupted_test(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+
+        supervisor, stop, _ = make_supervisor(FakeBackend())
+        stopped = execution._LaneRun(lane=lane(tmp_path))
+        stopped.proc = SimpleNamespace(returncode=None)
+        stopped.proc.poll = lambda: stopped.proc.returncode
+        clock = [9.0]
+        monkeypatch.setattr(execution.time, "monotonic", lambda: clock[0])
+        monkeypatch.setattr(supervisor, "_drain", lambda run: None)
+
+        def finish(proc):
+            proc.returncode = -15
+            clock[0] = 11.0
+
+        monkeypatch.setattr(execution, "kill_process_group", finish)
+        monkeypatch.setattr(execution, "reap_zombies", lambda: None)
+        stop.set()
+        supervisor._finish([stopped], 0.0, 10.0)
+        assert stopped.verdict is None
+
+    @pytest.mark.parametrize("fault", ["permission", "unowned", "surviving"])
+    def test_cleanup_fault_cannot_be_a_pass(self, tmp_path, monkeypatch, fault):
+        from types import SimpleNamespace
+
+        supervisor, _, _ = make_supervisor(FakeBackend())
+        run = execution._LaneRun(lane=lane(tmp_path))
+        run.proc = SimpleNamespace(pid=4321, returncode=None, poll=lambda: None, stdout=None, stderr=None)
+        monkeypatch.setattr(execution, "reap_zombies", lambda: None)
+        monkeypatch.setattr(execution.os, "getpgid", lambda pid: pid + (fault == "unowned"))
+
+        def denied(*args):
+            raise PermissionError("not permitted")
+
+        monkeypatch.setattr(execution.os, "killpg", denied)
+        if fault == "surviving":
+            monkeypatch.setattr(execution, "kill_process_group", lambda proc: None)
+        supervisor._finish([run], time.monotonic() - 10, 10)
+        assert not run.verdict.passed
+        assert run.verdict.error_type == "startup"
+
+    def test_file_error_is_attributed_to_its_own_lane(self, tmp_path, monkeypatch):
+        from types import SimpleNamespace
+        from corecycler.engine.backends.mprime import MprimeBackend
+
+        backend = MprimeBackend()
+        lanes = [lane(tmp_path, core_id=i) for i in range(2)]
+        for item in lanes:
+            backend.prepare(item.work_dir, StressConfig())
+        (lanes[1].work_dir / "results.txt").write_text("FATAL ERROR: Rounding was 0.5")
+        runs = [execution._LaneRun(lane=item, started_at=0) for item in lanes]
+        for run in runs:
+            run.proc = SimpleNamespace(returncode=0, poll=lambda: 0)
+        supervisor, _, _ = make_supervisor(backend)
+        supervisor.stop_on_first_failure = False
+        supervisor._poll_exits_stalls_watchdog(runs, time.monotonic() - 10)
+        assert runs[0].verdict.passed
+        assert not runs[1].verdict.passed
+        assert runs[1].verdict.error_type == "computation"
+
+
 class TestLaunchRefusals:
     def test_prepare_failure_is_a_startup_fault(self, tmp_path):
         backend = FakeBackend(prepare_exc=OSError("read-only work dir"))
@@ -162,6 +302,17 @@ class TestLaunchRefusals:
         assert verdict is not None and not verdict.passed
         assert verdict.error_type == "startup"
         assert "read-only work dir" in verdict.error_message
+
+    def test_unavailable_output_capture_is_a_startup_fault(self, tmp_path, monkeypatch):
+        supervisor, _, _ = make_supervisor(FakeBackend())
+
+        def refuse(**kwargs):
+            raise OSError("no space for captured output")
+
+        monkeypatch.setattr(execution.tempfile, "TemporaryFile", refuse)
+        verdict = run_one(supervisor, lane(tmp_path), 1.0)
+        assert not verdict.passed
+        assert verdict.error_type == "startup"
 
     def test_unreadable_config_refuses_the_launch(self, tmp_path):
         backend = FakeBackend(assert_exc=OSError("local.txt is missing"))
@@ -649,19 +800,6 @@ class TestHelpers:
         assert signal.SIGTERM in sent and signal.SIGKILL in sent
         stdout.close.assert_called_once()
         stderr.close.assert_called_once()
-
-    def test_kill_process_group_handles_a_vanished_group(self, monkeypatch):
-        from types import SimpleNamespace
-        from unittest.mock import MagicMock
-
-        wait = MagicMock(return_value=None)
-        proc = SimpleNamespace(pid=4321, stdout=None, stderr=None, poll=lambda: None, wait=wait)
-        monkeypatch.setattr(execution.os, "getpgid", MagicMock(side_effect=ProcessLookupError))
-        killpg = MagicMock()
-        monkeypatch.setattr(execution.os, "killpg", killpg)
-        kill_process_group(proc)
-        killpg.assert_not_called()
-        wait.assert_called_once_with(timeout=1)
 
     def test_reap_zombies_never_raises(self):
         execution.reap_zombies()

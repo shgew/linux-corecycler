@@ -178,36 +178,10 @@ class TestSchedulerProcessSafety:
         assert signal.SIGKILL in signals_sent
         assert signals_sent.index(signal.SIGTERM) < signals_sent.index(signal.SIGKILL)
 
-    def test_kill_handles_vanished_process(self):
-        """Must handle ProcessLookupError (process already gone)."""
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        mock_proc.pid = 99999
-
-        with (
-            patch("os.killpg", side_effect=ProcessLookupError),
-            patch("os.getpgid", return_value=99999),
-        ):
-            execution.kill_process_group(mock_proc)
-
-    def test_kill_handles_os_error(self):
-        """Must handle OSError gracefully."""
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        mock_proc.pid = 99999
-
-        with (
-            patch("os.killpg", side_effect=OSError("Operation not permitted")),
-            patch("os.getpgid", return_value=99999),
-        ):
-            execution.kill_process_group(mock_proc)
-
 
 # ===========================================================================
 # Error detector safety — missing sysfs / dmesg
 # ===========================================================================
-
-
 
 
 # ===========================================================================

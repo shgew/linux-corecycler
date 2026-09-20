@@ -838,13 +838,12 @@ class TestFailClosedResultsRead:
         import os
 
         backend = MprimeBackend()
-        backend._last_work_dir = tmp_path
+
         results = tmp_path / "results.txt"
         results.write_text("FATAL ERROR: Rounding was 0.5, expected less than 0.4")
         os.chmod(results, 0o000)
         try:
-            passed, msg = backend.parse_output("", "", -15)
-            assert passed is False
+            msg = backend.poll_errors(tmp_path)
             assert "verdict unavailable" in msg
         finally:
             os.chmod(results, 0o644)  # let tmp_path cleanup succeed

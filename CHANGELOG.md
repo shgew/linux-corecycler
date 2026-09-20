@@ -9,6 +9,22 @@ following [Keep a Changelog](https://keepachangelog.com/) and
 Current version: 0.0.1. A per-core CPU stability tester and AMD PBO Curve
 Optimizer tuner for Linux, packaged as a NixOS module with an overlay.
 
+### Fixed (2026-09-20 autonomous search audit)
+
+- Preserve real failure bounds during midpoint backoff, search the first failed
+  coarse probe's gap toward baseline, and back off before retrying failed confirmation.
+- Run spectrum validation independently of rapid-transition validation. Interrupted
+  optional phases do not earn passing verdicts.
+- Isolate mprime result files per lane, retain subprocess output through cleanup,
+  and refuse false passes from external kills or failed process termination.
+- Rebuild resume evidence from the selected session only, verify restored values
+  instead of assuming rebooted hardware is at stock, and keep failed stock
+  restoration quarantined. Configuration preflight failures do not replace saved settings.
+- Preserve failure evidence when the contradictory-failure breaker pauses.
+- Prevent backup/restore and confirmation-dialog races from bypassing tuner SMU ownership.
+  Rejected explicit tool paths never fall back to another executable.
+- Report APERF/MPERF nominal-frequency deficits as warnings, not instability verdicts.
+
 ### Fixed (2026-09-20 reboot recovery)
 
 - Detect session reboots by persisted boot identity, with a timestamp fallback for

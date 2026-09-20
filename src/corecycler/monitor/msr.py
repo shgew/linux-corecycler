@@ -24,12 +24,12 @@ MSR_PKG_ENERGY = 0xC001029B  # Package cumulative energy counter
 
 @dataclass(slots=True)
 class ClockStretchReading:
-    """Result of APERF/MPERF sampling for one logical CPU."""
+    """Active-clock frequency ratio to nominal, not a stability measurement."""
 
     cpu_id: int
     effective_mhz: float  # actual clock from APERF/MPERF ratio * base_clock
-    ratio: float  # APERF_delta / MPERF_delta — 1.0 = no stretch, <0.97 = stretching
-    stretch_pct: float  # (1 - ratio) * 100 — 0% = perfect, >3% = suspicious
+    ratio: float
+    stretch_pct: float  # Percentage below nominal; retained for stored telemetry compatibility.
 
 
 @dataclass(slots=True)
@@ -89,10 +89,10 @@ class MSRReader:
         return self._available
 
     def read_clock_stretch(self, cpu_ids: list[int]) -> dict[int, ClockStretchReading]:
-        """Read APERF/MPERF for given logical CPUs, return stretch ratios.
+        """Read the active-clock ratio and percentage below nominal.
 
-        First call per CPU establishes baseline and returns empty.
-        Subsequent calls return the ratio over the interval since last read.
+        These counters do not measure the requested clock, so they cannot
+        establish clock stretching. The first sample only sets a baseline.
         """
         if not self.is_available():
             return {}
@@ -129,8 +129,6 @@ class MSRReader:
             ratio = da / dm
             stretch_pct = max(0.0, (1.0 - ratio) * 100.0)
 
-            # Estimate effective MHz: ratio * nominal max boost
-            # (ratio > 1.0 is possible with turbo — clamp stretch to 0%)
             results[cpu_id] = ClockStretchReading(
                 cpu_id=cpu_id,
                 effective_mhz=0,  # caller fills from sysfs freq if needed

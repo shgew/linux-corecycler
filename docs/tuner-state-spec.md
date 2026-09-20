@@ -13,7 +13,7 @@ this chart covers what happens to a core once it has a verdict.
 | Phase | PASS -> | FAIL -> |
 |---|---|---|
 | NOT_STARTED | COARSE_SEARCH (entry step, verdict ignored) | COARSE_SEARCH |
-| COARSE_SEARCH | COARSE_SEARCH, SETTLED (hit max) | FINE_SEARCH, SETTLED |
+| COARSE_SEARCH | COARSE_SEARCH, SETTLED (hit max) | FINE_SEARCH, SETTLED, BACKOFF_PRECONFIRM (no passing coarse candidate) |
 | FINE_SEARCH | FINE_SEARCH, SETTLED | SETTLED |
 | SETTLED | CONFIRMING (baseline if no passing candidate) | same |
 | CONFIRMING | CONFIRMED (HARDENING_T1 with tiers) | CONFIRMING (retry), FAILED_CONFIRM |
@@ -52,6 +52,8 @@ penalty never overshoots past stock (CO=0).
   not confirm or harden it. Baseline failures pause instead of certifying it.
 - **Time limit is not proof**: process the completed test's verdict first, then
   pause an unfinished search when its per-core time budget is exceeded.
+- Midpoint acceleration preserves the actual failed probe as the fail bound.
+  A first coarse failure still searches the gap toward baseline in fine steps.
 
 ## Invariants (asserted after every transition in the sweep)
 
@@ -66,8 +68,9 @@ penalty never overshoots past stock (CO=0).
   Independently observed MCEs still penalize the named cores, including the loaded core.
 - `startup` — environment fault: revert the offset, persist `in_test=0`,
   pause. Never logged as a verdict, never marks the journal survived.
-- Apparatus-breaker trips (implausible fail streaks, search flow only) —
-  roll back to the most aggressive proven pass, re-enter CONFIRMING, pause.
+- Contradictory-failure breaker trips pause after recording the new failure bound.
+  Earlier passes never erase newer failures. Workload identity includes backend,
+  instruction set, FFT preset, thread count and load profile.
 
 ## Crash attribution on resume (`_attribute_crash_after_reboot`)
 

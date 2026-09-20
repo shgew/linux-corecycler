@@ -224,10 +224,14 @@ class TestCheckMCE:
         with pytest.raises(RuntimeError, match="baseline"):
             ErrorDetector().check_mce()
 
-    @pytest.mark.parametrize("failure", [
-        MagicMock(returncode=1, stdout="", stderr="Permission denied"),
-        subprocess.TimeoutExpired("dmesg", 5), FileNotFoundError("dmesg"),
-    ])
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            MagicMock(returncode=1, stdout="", stderr="Permission denied"),
+            subprocess.TimeoutExpired("dmesg", 5),
+            FileNotFoundError("dmesg"),
+        ],
+    )
     def test_unreadable_monitor_is_not_a_clean_poll(self, failure):
         det = _fresh_detector(baseline=100.0)
         kwargs = {"side_effect": failure} if isinstance(failure, Exception) else {"return_value": failure}
@@ -236,9 +240,13 @@ class TestCheckMCE:
 
     def test_final_poll_observes_errors_inside_the_rate_limit(self):
         det = _fresh_detector(baseline=100.0)
-        with patch("subprocess.run", side_effect=[
-            _dmesg_result(""), _dmesg_result(f"100.11 {ZEN_BLOCK_STATUS}\n"),
-        ]):
+        with patch(
+            "subprocess.run",
+            side_effect=[
+                _dmesg_result(""),
+                _dmesg_result(f"100.11 {ZEN_BLOCK_STATUS}\n"),
+            ],
+        ):
             assert det.check_mce() == []
             events = det.check_mce(force=True)
         assert [(event.cpu, event.corrected) for event in events] == [(9, True)]
@@ -424,13 +432,17 @@ class TestLastBootEndedCleanly:
             }
         )
 
-    def test_exact_boot_system_journal_shutdown_detected(self):
-        with patch("subprocess.run", return_value=_dmesg_result(self._shutdown_record())) as mock_run:
-            assert last_boot_ended_cleanly(boot_id=BOOT_ID) is True
-        args = mock_run.call_args[0][0]
-        assert args[args.index("--boot") + 1] == BOOT_ID
-        assert f"MESSAGE_ID={JOURNAL_STOPPED_MESSAGE_ID}" in args
-        assert "_RUNTIME_SCOPE=system" in args
+    def test_only_the_terminal_boot_record_can_prove_clean_shutdown(self):
+        ordinary = json.dumps({"_BOOT_ID": BOOT_ID, "_RUNTIME_SCOPE": "system", "MESSAGE": "work continued"})
+
+        def query(args, **kwargs):
+            filtered_stop = any(arg.startswith("MESSAGE_ID=") for arg in args)
+            return _dmesg_result(self._shutdown_record() if filtered_stop else ordinary)
+
+        with patch("subprocess.run", side_effect=query):
+            assert not last_boot_ended_cleanly(boot_id=BOOT_ID)
+        with patch("subprocess.run", return_value=_dmesg_result(self._shutdown_record())):
+            assert last_boot_ended_cleanly(boot_id=BOOT_ID)
 
     def test_initrd_journal_stop_is_not_clean_shutdown_evidence(self):
         output = self._shutdown_record(runtime_scope="initrd")

@@ -796,16 +796,10 @@ class HistoryTab(QWidget):
                 if eff_maxes:
                     eff_max = max(eff_maxes)
                     parts.append(f"    Boost ceiling: {eff_max:.0f} MHz")
-                    # clock stretch: worst deficit between actual and max
                     if freqs:
                         min_freq = min(freqs)
-                        stretch_pct = (1.0 - min_freq / eff_max) * 100.0
-                        if stretch_pct > 5.0:
-                            parts.append(
-                                f"    Clock stretch: {stretch_pct:.1f}% (min {min_freq:.0f} vs max {eff_max:.0f})"
-                            )
-                        else:
-                            parts.append(f"    Clock stretch: none ({stretch_pct:.1f}%)")
+                        deficit_pct = max(0.0, (1.0 - min_freq / eff_max) * 100.0)
+                        parts.append(f"    Below boost ceiling: {deficit_pct:.1f}% (not an instability verdict)")
                 if temps:
                     parts.append(f"    Temp: {min(temps):.1f}-{max(temps):.1f} C")
                 if vcores:

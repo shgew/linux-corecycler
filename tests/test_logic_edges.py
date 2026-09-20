@@ -25,12 +25,6 @@ class TestClassifyExitCode:
         assert StressBackend.classify_exit_code(0) is None
 
 
-class TestMprimePollErrorsUnreadable:
-    def test_unreadable_results_returns_none(self, tmp_path):
-        (tmp_path / "results.txt").mkdir()  # exists() True, read_text() raises OSError
-        assert MprimeBackend().poll_errors(tmp_path) is None
-
-
 class TestStressapptestPrepareCleanup:
     def test_prepare_creates_work_dir(self, tmp_path):
         work = tmp_path / "sat"

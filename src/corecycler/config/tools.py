@@ -283,6 +283,8 @@ def command_name(key: str) -> str:
     fault, never as core instability.
     """
     resolution = resolve(key)
+    if resolution.path is None and resolution.origin in (ORIGIN_ENV, ORIGIN_CONFIG):
+        raise FileNotFoundError(f"{key}: {resolution.problem}")
     return str(resolution.path) if resolution.path else key
 
 
