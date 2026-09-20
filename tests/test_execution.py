@@ -276,6 +276,7 @@ class TestVerdictProvenance:
 
     def test_file_error_is_attributed_to_its_own_lane(self, tmp_path, monkeypatch):
         from types import SimpleNamespace
+
         from corecycler.engine.backends.mprime import MprimeBackend
 
         backend = MprimeBackend()
