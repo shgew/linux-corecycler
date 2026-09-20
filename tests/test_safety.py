@@ -27,7 +27,6 @@ from corecycler.engine.backends.base import StressConfig
 from corecycler.engine.backends.mprime import MprimeBackend
 from corecycler.engine.backends.stress_ng import StressNgBackend
 from corecycler.engine.backends.ycruncher import YCruncherBackend
-from corecycler.engine.detector import ErrorDetector
 from corecycler.engine.scheduler import CoreScheduler, SchedulerConfig, TestState
 from corecycler.engine.topology import CPUTopology, PhysicalCore
 from corecycler.smu.commands import CPUGeneration, encode_co_arg, get_commands
