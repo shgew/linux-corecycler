@@ -21,7 +21,6 @@ from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine
 from corecycler.tuner.state import CoreState
-
 from tests.silicon import FakeSilicon, Outcome
 
 
