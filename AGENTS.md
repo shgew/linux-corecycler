@@ -56,16 +56,17 @@ Supervisor polling checks, per tick: thermal state, dmesg MCEs, backend live err
 | `src/corecycler/gui/` | One module per tab plus `style.py`, `widgets/` |
 | `tests/` | 94 `test_*.py` modules, one `conftest.py` |
 | `nix/` | NixOS module and out-of-tree kernel module derivations |
-| `overlays/` | Temporary hand-authored nixpkgs fixes, one per file |
-| `scripts/` | Updater, overlay healing, live scenarios, mutation testing |
+| `scripts/` | Live scenarios and mutation testing |
 
 ## Development Commands
 
 ```bash
-nix develop                                     # the package's Python env + ruff, nixfmt, pre-commit
-ruff check src                                  # lint (no formatter gate)
+nix develop                                     # the package's Python env + ruff and nixfmt
+ruff check src                                  # lint
+ruff format --check src                        # formatting check
+nix fmt -- flake.nix nix/*.nix                  # Nix formatting
 python -m pytest -m 'not slow'                  # the suite, inside nix develop
-nix flake check                                 # build + every check (what CI runs)
+nix flake check                                 # build + every repository check
 corecycler doctor                               # tool resolution preflight
 ```
 
@@ -84,11 +85,11 @@ corecycler resume [SESSION_ID]   # resume; omitted picks an eligible active sess
 
 There is no `src/corecycler/__main__.py`; `python -m corecycler` is not an entrypoint. `python src/corecycler/main.py` works via the `sys.path` bootstrap in `main.py`.
 
-Flake checks beyond the package build: `full-eval` (eval-gates the unfree `full` variant without realizing mprime), `python-site-packages` (flat `cli.py` collision invariant), `module-eval-nixos` (every `mkIf` path in `nix/module.nix`), `kernel-modules` (builds `ryzen-smu`, `zenpower`, `it87` against both `linuxPackages.kernel` and `linuxPackages_latest.kernel`).
+Flake checks include `default`, `coverage`, `ruff`, `ruff-format`, `nixfmt`, `full-eval`, `python-site-packages`, `module-eval-nixos`, `user-containment`, and `kernel-modules`.
 
 ## Code Conventions & Common Patterns
 
-- Python 3.12+, Ruff lint only (`E,F,W,I,UP,B,SIM,TCH,TID251`), 120 columns. No `ruff format` gate in CI, though the generated git hook runs it.
+- Python 3.12+, Ruff lint and formatting (`E,F,W,I,UP,B,SIM,TCH,TID251`), 120 columns.
 - `from __future__ import annotations` everywhere; built-in generics, `X | None`, `match`, `TYPE_CHECKING` imports to break cycles.
 - Type hints on every function signature. State records are `@dataclass(slots=True)`; value objects and topology/backend metadata are `@dataclass(frozen=True, slots=True)`.
 - `StrEnum` for domain states so DB and JSON values need no adapters (`TunerPhase`, `StressMode`).
@@ -103,6 +104,8 @@ Flake checks beyond the package build: `full-eval` (eval-gates the unfree `full`
 - Adding a backend: new module in `engine/backends/`, subclass `StressBackend` with `get_command`/`parse_output`/`get_supported_modes`, decorate `@register_backend`, add it to `load_all` in `backends/__init__.py`, and add a matching `ExternalTool` to `config/tools.py`. GUI combos derive from the registry, so no GUI edits are needed.
 - Commits are Conventional with a scope: `feat(hwmon):`, `fix(smu):`, `test(tuner):`, `docs:`. Scopes in use: `tuner`, `smu`, `gui`, `engine`, `backends`, `history`, `topology`, `tests`, `ci`, `nix`.
 - Nix: `nixfmt`, `lib.mkOption` rather than `with lib;`.
+- Aim for 100% line coverage. Use `# pragma: no cover  # reason: <why>` only for code that cannot meaningfully be exercised; a reason is required and must not hide testable behavior.
+- Temporary overlays must export `meta.reason`, `meta.added` (`YYYY-MM-DD`), `overlay`, and exactly one of `dropWhen`/`dropWhenBuilds` testing the real condition.
 
 ## Important Files
 
@@ -112,16 +115,8 @@ Flake checks beyond the package build: `full-eval` (eval-gates the unfree `full`
 - `docs/tuner-state-spec.md` - **normative** per-core transition table and crash-attribution priority. `tests/test_state_transition_spec.py` executes it.
 - `docs/test-order-spec.md` - **normative** scheduler selection contract for all five orders. `tests/test_test_order_spec.py` executes it.
 - `docs/architecture.md` - layer map and containment contract.
-- `CONTRIBUTING.md` - the authoritative style and PR checklist; this file summarizes it.
 - `pyproject.toml` - Ruff rules, the `TID251` path bans, pytest markers, coverage config.
-- `flake.nix` - package variants (`default` FOSS, `full` unfree with mprime/y-cruncher), the pytest gate, all repo checks, generated git hooks.
-- `.github/workflows/` - `ci.yml`, `distro-matrix.yml`, `maintenance.yml`, `update.yml`.
-
-**Do not hand-edit:**
-
-- `README.md` `options` block between `<!-- BEGIN generated:options -->` / `<!-- END generated:options -->`: rewritten by `scripts/update-readme-options.sh`. The other `generated:*` markers (`badges`, `upstream`, `installation`, `footer`) must exist for the `check-readme-sections` hook; nothing in this repo regenerates their content.
-- `.pre-commit-config.yaml` (0 bytes, gitignored, generated by git-hooks.nix through `flake.nix`).
-- `scripts/update.sh`, `scripts/heal-overlays.sh`, `scripts/classify-build-failure.sh`, `.github/workflows/{ci,maintenance,update}.yml`, `.envrc`, `.editorconfig` are canonical copies from `nix-packaging-standard`; the `std-conformance` flake check fails on any byte of drift or a missing file. `update.yml` is a deliberate daily no-op here (`upstream.type: none` is the standard's first-party archetype).
+- `flake.nix` - package variants (`default` FOSS, `full` unfree with mprime/y-cruncher), the pytest gate, standalone coverage and repository checks.
 
 ## Runtime/Tooling Preferences
 
@@ -132,7 +127,6 @@ Flake checks beyond the package build: `full-eval` (eval-gates the unfree `full`
 - State locations: settings `~/.config/corecycler/settings.json`, tool paths `~/.config/corecycler/tool-paths.json`, history `~/.local/share/corecycler/history/history.db`, logs `~/.local/share/corecycler/logs/`, lock `~/.local/share/corecycler/corecycler.lock`, work dir `$XDG_RUNTIME_DIR/corecycler/work` when owned by the invoking UID, else `~/.cache/corecycler/work`.
 - CO tuning additionally needs a loaded `ryzen_smu`, a writable `/sys/kernel/ryzen_smu_drv/smu_args`, a supported generation, and an unambiguous core map. `MSRReader` needs `/dev/cpu/N/msr` and is read-only; it never writes MSRs.
 - Do not remove the mprime prepare/cleanup path. Without `local.txt`/`prime.txt` mprime self-pins its workers, and a stale `results.txt` silently fails the next run.
-- `overlays/*.nix` are temporary. Each must export `meta.reason`, `meta.added` (`YYYY-MM-DD`), `overlay`, and exactly one of `dropWhen`/`dropWhenBuilds` testing the real condition, not a version-string proxy. `scripts/heal-overlays.sh` `git rm`s them once the probe passes.
 
 ## Testing & QA
 
@@ -150,7 +144,7 @@ python3 scripts/mutate.py --src src/corecycler/smu/commands.py \
   --tests tests/test_smu_commands.py --max 60                               # mutation
 ```
 
-**Coverage floor is 100% line coverage** for the non-slow suite, enforced by the Nix package build (`--cov-fail-under=100`, `branch = false`, `*/main.py` omitted). New code without tests fails the build.
+**Coverage floor is 100% line coverage** for the non-slow suite, enforced by `checks.coverage` (`--cov-fail-under=100`, `branch = false`, `*/main.py` omitted). New code should have tests. When coverage is not meaningful, use `# pragma: no cover  # reason: <why>` and explain the unreachable or unobservable path. The guard test rejects bare exemptions.
 
 Three rings:
 

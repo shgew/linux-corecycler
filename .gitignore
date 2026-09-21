@@ -1,51 +1,31 @@
+# Python caches and environments
 __pycache__/
 *.py[cod]
-*$py.class
 *.egg-info/
-dist/
-build/
 .eggs/
+.venv/
+venv/
+
+# Build outputs
+build/
+dist/
+target/
+node_modules/
 *.egg
-.ruff_cache/
-.pytest_cache/
 result
 result-*
+
+# Nix and development caches
 .direnv/
 .devshell/
-.pre-commit-config.yaml
-
+.ruff_cache/
+.pytest_cache/
 .hypothesis/
+.mypy_cache/
 
-# local brainstorm — never tracked
-/ideas/
-tests/.e2e-bin-*/
+# Test and coverage output
 .coverage
 .coverage.*
 htmlcov/
 coverage/
-target/
-node_modules/
-.venv/
-venv/
-.rumdl_cache/
-.mypy_cache/
-/htmlcov/
-/coverage/
-/build/
-/dist/
-/target/
-
-# Local agent state
-CLAUDE.md
-GEMINI.md
-AGENTS.md
-AI-progress.json
-AI-tasks.json
-.session-handoff*.md
-.claude/
-.gemini/
-.codex/
-.cursor/
-.superpowers/
-.ai-context/
-.planning/
+tests/.e2e-bin-*/

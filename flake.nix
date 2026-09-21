@@ -4,15 +4,6 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-parts.url = "github:hercules-ci/flake-parts";
-    git-hooks = {
-      url = "github:cachix/git-hooks.nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
-    std = {
-      url = "github:Daaboulex/nix-packaging-standard?ref=v2.38.1";
-      inputs.nixpkgs.follows = "nixpkgs";
-      inputs.git-hooks.follows = "git-hooks";
-    };
   };
 
   outputs =
@@ -104,15 +95,9 @@
                 '';
                 disabledTestMarks = [ "slow" ];
 
-                # Coverage ratchet: line coverage may never fall below this floor.
-                # Raise the floor to the percentage this check prints whenever a
-                # batch lands. It is measured WITHOUT the slow tests, so it
-                # trails the out-of-sandbox number.
-                pytestFlags = [
-                  "--cov=corecycler"
-                  "--cov-report=term-missing"
-                  "--cov-fail-under=100"
-                ];
+                # The package build runs the non-slow tests without coverage.
+                # The standalone coverage check below enforces the 100% floor.
+                pytestFlags = [ ];
 
                 # Qt6 runtime needs
                 nativeBuildInputs = [ pkgs.qt6.wrapQtAppsHook ];
@@ -183,14 +168,7 @@
           linux-corecycler = (buildWith final).default;
           linux-corecycler-full = (buildWith final).full;
         };
-        fixOverlays =
-          let
-            dir = ./overlays;
-            names = if builtins.pathExists dir then builtins.attrNames (builtins.readDir dir) else [ ];
-          in
-          map (n: (import (dir + "/${n}")).overlay) (
-            builtins.filter (inputs.nixpkgs.lib.hasSuffix ".nix") names
-          );
+        fixOverlays = [ ];
 
         buildFor =
           system:
@@ -209,8 +187,6 @@
       in
       {
         inherit systems;
-
-        imports = [ inputs.std.flakeModules.base ];
 
         flake = {
           # NixOS module - kernel modules, device access, udev rules, package
@@ -236,37 +212,57 @@
         };
 
         perSystem =
-          { system, config, ... }:
+          { system, pkgs, ... }:
           let
             b = buildFor system;
+            checksLib = import ./nix/checks.nix;
           in
           {
-            # The FOSS default builds on CI (stress-ng/stressapptest are cached).
+            # The FOSS default uses stress-ng and stressapptest.
             packages.default = b.default;
 
             # The package's own build environment (interpreter, PySide6, pytest,
-            # hypothesis, pytest-cov) plus the standard's hook tools, so
-            # `python -m pytest` runs straight from `nix develop`.
-            devShells.default = inputs.nixpkgs.lib.mkForce (
-              inputs.std.lib.mkDevShell {
-                inherit config;
-                inherit (b) pkgs;
-              } { inputsFrom = [ b.default ]; }
-            );
+            # hypothesis and pytest-cov, so `python -m pytest` runs straight from
+            # `nix develop`.
+            formatter = pkgs.nixfmt;
 
-            # Python lint gate — same config as pyproject [tool.ruff].
-            pre-commit.settings.hooks.ruff.enable = true;
-            pre-commit.settings.hooks.taplo.excludes = [ "^pyproject\\.toml$" ];
-
-            # A unified diff's blank context lines are a single space; trimming
-            # them makes the patch stop applying.
-            pre-commit.settings.hooks.trim-trailing-whitespace.excludes = [ "\\.patch$" ];
+            devShells.default = pkgs.mkShell {
+              inputsFrom = [ b.default ];
+              packages = [
+                pkgs.nixfmt
+                pkgs.ruff
+              ];
+            };
 
             checks = {
+              default = b.default;
+              ruff = pkgs.runCommand "corecycler-ruff" { nativeBuildInputs = [ pkgs.ruff ]; } ''
+                export RUFF_CACHE_DIR=$TMPDIR/ruff-cache
+                ruff check ${inputs.self}/src
+                touch "$out"
+              '';
+              ruff-format = pkgs.runCommand "corecycler-ruff-format" { nativeBuildInputs = [ pkgs.ruff ]; } ''
+                export RUFF_CACHE_DIR=$TMPDIR/ruff-cache
+                ruff format --check ${inputs.self}/src
+                touch "$out"
+              '';
+              nixfmt = pkgs.runCommand "corecycler-nixfmt" { nativeBuildInputs = [ pkgs.nixfmt ]; } ''
+                nixfmt --check ${inputs.self}/flake.nix ${inputs.self}/nix/*.nix
+                touch "$out"
+              '';
+              coverage = b.default.overrideAttrs (old: {
+                pname = "corecycler-coverage";
+                pytestFlags = [
+                  "--cov=corecycler"
+                  "--cov-report=term-missing"
+                  "--cov-fail-under=100"
+                ];
+              });
+
               # Eval-only gate for the off-CI `full`: force its full build graph to
               # EVALUATE (catching dep/version/unfree breakage) without realizing the
               # uncached, unfree mprime closure. The real build happens off-CI.
-              full-eval = inputs.std.lib.drvEvalCheck {
+              full-eval = checksLib.drvEvalCheck {
                 pkgs = inputs.nixpkgs.legacyPackages.${system};
                 name = "corecycler-full-eval";
                 drv = b.full;
@@ -276,7 +272,7 @@
               # package -- a flat module (cli.py) collides with any other app in a
               # merged site-packages. tests/test_packaging.py is the fast pytest
               # mirror of the same invariant.
-              python-site-packages = inputs.std.lib.pythonSitePackagesCheck {
+              python-site-packages = checksLib.pythonSitePackagesCheck {
                 inherit (b) pkgs;
                 drv = b.default;
                 package = "corecycler";
@@ -284,7 +280,7 @@
 
               # Force full evaluation of the NixOS module (options + assertions +
               # every mkIf path) without building the closure.
-              module-eval-nixos = inputs.std.lib.nixosModuleCheck {
+              module-eval-nixos = checksLib.nixosModuleCheck {
                 inherit (inputs) nixpkgs;
                 inherit system;
                 module = import ./nix/module.nix { inherit (inputs) self; };
