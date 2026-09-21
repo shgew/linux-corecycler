@@ -228,6 +228,7 @@ class TestStatus:
         assert f"#{sid}" in out
         assert "config unreadable" in out
 
+
 class TestReport:
     def test_empty_db(self, db, capsys):
         assert cli.cmd_report(db=db) == cli.EXIT_COMPLETED
@@ -240,6 +241,7 @@ class TestReport:
     def test_bad_argument_shape_is_refused(self, capsys):
         assert cli._dispatch_report(["1", "2"]) == cli.EXIT_REFUSED
         assert "expected [SESSION_ID] [--json]" in capsys.readouterr().err
+
     def test_non_integer_session_id_is_refused_by_the_cli(self, capsys):
         assert cli.cli_main(["report", "latest"]) == cli.EXIT_REFUSED
         captured = capsys.readouterr()

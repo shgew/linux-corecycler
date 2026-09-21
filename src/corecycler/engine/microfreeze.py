@@ -109,11 +109,7 @@ class MicroFreezeMonitor:
         with self._lock:
             context = self._context
             worst_ms = max((hitch.latency_ms for hitch in self._hitches), default=0.0)
-        content = (
-            f"timestamp={datetime.now(UTC).isoformat()}\n"
-            f"context={context}\n"
-            f"worst_latency_ms={worst_ms:.3f}\n"
-        )
+        content = f"timestamp={datetime.now(UTC).isoformat()}\ncontext={context}\nworst_latency_ms={worst_ms:.3f}\n"
         try:
             atomic_write(self.breadcrumb_path, content)
         except OSError as exc:

@@ -43,7 +43,6 @@ def tuning(db, topo_single_ccd, mock_backend, monkeypatch):
     return eng
 
 
-
 @pytest.mark.parametrize("action", ["start", "resume", "validate_profile"])
 def test_dry_run_never_starts_a_tuning_session(tuning, action):
     tuning._smu.dry_run = True
@@ -71,7 +70,6 @@ def test_failure_at_time_limit_is_not_confirmation(tuning):
     assert tuning.status == "paused"
     assert cs.phase == TunerPhase.FAILED_CONFIRM
     assert tp.get_test_log(tuning._db, tuning.session_id, core_id=0)[-1]["passed"] == 0
-
 
 
 def test_crash_invalidates_a_contradicted_pass_bound(tuning):
@@ -212,6 +210,7 @@ def test_only_live_mask_phases_count_as_stability_evidence():
     search_phases = {"coarse", "fine", "confirm", "backoff_preconfirm", "backoff_confirm"}
     assert search_phases <= tp.LIVE_EVIDENCE_PHASES
     assert "hunt" not in tp.LIVE_EVIDENCE_PHASES
+
 
 @pytest.mark.parametrize("missing", ["unknown", "uninstalled"])
 def test_resume_refuses_unavailable_saved_backend(tuning, monkeypatch, missing):

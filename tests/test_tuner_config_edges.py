@@ -45,9 +45,7 @@ class TestTunerConfigValidation:
 
     def test_battery_unknown_profile(self):
         entry = {**TunerConfig().battery[0], "profile": "unknown"}
-        assert _errors(battery=[entry]) == [
-            "battery[0].profile must be one of ['spectrum', 'sustained', 'transient']"
-        ]
+        assert _errors(battery=[entry]) == ["battery[0].profile must be one of ['spectrum', 'sustained', 'transient']"]
 
     def test_ycruncher_unknown_test_tag(self):
         entry = {**TunerConfig().battery[1], "tests": ["NOPE"]}

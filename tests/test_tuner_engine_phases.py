@@ -209,7 +209,6 @@ class TestValidationOffsetWrites:
         assert engine.status == "paused"
 
 
-
 class TestParallelRowLogging:
     def _rows(self, engine, core_id):
         return tp.get_test_log(engine._db, engine._session_id, core_id=core_id)
@@ -402,6 +401,7 @@ class TestHuntSlots:
         assert engine._hunt.stage is bisect.Stage.PROBE
         persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
         assert persisted == engine._hunt
+
 
 class TestApparatusFault:
     def test_a_fault_retries_the_same_step(self, engine, monkeypatch):
@@ -1284,6 +1284,8 @@ class TestSearchArithmetic:
         assert cs.phase is TunerPhase.BACKOFF_PRECONFIRM
         assert cs.best_offset == 0
         assert cs.current_offset == 0
+
+
 class TestHuntDecisions:
     def _probe(self, engine):
         candidates = sorted(engine._core_states)
@@ -1413,9 +1415,7 @@ class TestHuntDecisions:
             (3, (13.0, 6.0), 0),
         ],
     )
-    def test_statistical_verdict_requires_failures_and_separation(
-        self, engine, failures, scores, expected
-    ):
+    def test_statistical_verdict_requires_failures_and_separation(self, engine, failures, scores, expected):
         for cs in engine._core_states.values():
             cs.suspicion = 0.0
         engine._core_states[0].suspicion, engine._core_states[1].suspicion = scores
@@ -1432,9 +1432,7 @@ class TestHuntDecisions:
             cs = _confirm(engine, core_id, -20)
             cs.suspicion = 10.0 if core_id == 0 else 6.0 if core_id == 1 else 0.0
             tp.save_core_state(engine._db, engine._session_id, cs)
-        tp.set_unattributed_crashes(
-            engine._db, engine._session_id, engine._config.suspicion_min_failures
-        )
+        tp.set_unattributed_crashes(engine._db, engine._session_id, engine._config.suspicion_min_failures)
         engine._co_applied = dict.fromkeys(engine._core_states, -20)
         engine._last_tested_core = 0
         engine._hunt = bisect.HuntState(stage=bisect.Stage.EXHAUSTED, loaded=[0])
@@ -1453,9 +1451,7 @@ class TestHuntDecisions:
             cs = _confirm(engine, core_id, -20)
             cs.suspicion = 30.0 if core_id == 0 else 1.0
             tp.save_core_state(engine._db, engine._session_id, cs)
-        tp.set_unattributed_crashes(
-            engine._db, engine._session_id, engine._config.suspicion_min_failures
-        )
+        tp.set_unattributed_crashes(engine._db, engine._session_id, engine._config.suspicion_min_failures)
         engine._db.bank_regime_time("ctx", 0, "boost", -20, 600.0)
         engine.context_hash = lambda: "ctx"
         engine._co_applied = dict.fromkeys(engine._core_states, -20)
@@ -1527,6 +1523,8 @@ class TestHuntDecisions:
         assert engine.status == "quarantined"
         assert engine._co_applied == dict.fromkeys(engine._core_states, 0)
         assert all(not cs.in_test for cs in restored.values())
+
+
 class TestResumeAttributionLadder:
     def test_baseline_confirmations_need_no_logged_proof(self, engine):
         cs = _confirm(engine, 0, 0)
@@ -1586,6 +1584,8 @@ class TestResumeAttributionLadder:
             assert session.validation_stage == 4
             assert session.validation_index == 2
             assert session.validation_half == 1
+
+
 class TestRemainingHuntCoverage:
     def test_completed_probe_state_resolves_to_a_persisted_culprit_verdict(self, engine):
         for core_id in engine._core_states:

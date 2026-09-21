@@ -59,6 +59,7 @@ BESTS = (None, -18, -4)
 FAIL_BOUNDS = (None, -22)
 PASS_BOUNDS = (None, -4)
 
+
 def make_engine(db: HistoryDB, **config_overrides) -> TunerEngine:
     from corecycler.engine.topology import CPUTopology, PhysicalCore
 
@@ -95,6 +96,7 @@ def advance_scenarios():
         (0, 3),
     )
 
+
 def check_invariants(eng: TunerEngine, cs: CoreState, label: str) -> None:
     assert not eng._exceeds_max(cs.current_offset), f"{label}: current beyond max"
     if cs.best_offset is not None:
@@ -122,9 +124,7 @@ def test_every_verdict_transition_is_declared():
     db = HistoryDB(":memory:")
     try:
         eng = make_engine(db)
-        observed: dict[tuple[TunerPhase, bool], set[TunerPhase]] = {
-            key: set() for key in ADVANCE_RELATION
-        }
+        observed: dict[tuple[TunerPhase, bool], set[TunerPhase]] = {key: set() for key in ADVANCE_RELATION}
         for (
             phase,
             passed,
@@ -325,9 +325,7 @@ def test_every_crash_penalty_transition_is_declared():
 
             eng._apply_crash_penalty(cs)
 
-            assert cs.phase is CRASH_RELATION[phase], (
-                f"UNDECLARED CRASH TRANSITION {label}: {phase} -> {cs.phase}"
-            )
+            assert cs.phase is CRASH_RELATION[phase], f"UNDECLARED CRASH TRANSITION {label}: {phase} -> {cs.phase}"
             assert cs.best_offset is not None, f"{label}: best is None after crash"
             assert cs.crash_count >= 1 and cs.crash_cooldown >= 1, label
             assert cs.backoff_fail_bound is not None, label

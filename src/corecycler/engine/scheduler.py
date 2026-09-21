@@ -259,12 +259,7 @@ class CoreScheduler:
             if self.config.stop_on_error:
                 self._stop_event.set()
 
-        if (
-            passed
-            and self.config.variable_load
-            and self.config.duty_cycle is None
-            and not self._stop_event.is_set()
-        ):
+        if passed and self.config.variable_load and self.config.duty_cycle is None and not self._stop_event.is_set():
             var_passed, var_error = self._run_variable_load(lane, self.config.seconds_per_core / 3.0)
             if not var_passed:
                 passed = False

@@ -1216,9 +1216,7 @@ class TunerEngine(QObject):
             raw = self._breadcrumb_path().read_text()
         except OSError:
             return ""
-        fields = dict(
-            line.split("=", 1) for line in raw.splitlines() if "=" in line
-        )
+        fields = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
         context = fields.get("context", "").strip()
         worst = fields.get("worst_latency_ms", "").strip()
         if not context:
@@ -1274,8 +1272,7 @@ class TunerEngine(QObject):
         cs.current_offset = cs.best_offset + self._config.direction
         cs.battery_index = 0
         self.log_message.emit(
-            f"Core {core_id}: {best[0]:.1f}h banked in every regime at {cs.best_offset} "
-            f"- probing {cs.current_offset}"
+            f"Core {core_id}: {best[0]:.1f}h banked in every regime at {cs.best_offset} - probing {cs.current_offset}"
         )
         return core_id
 
@@ -2238,9 +2235,7 @@ class TunerEngine(QObject):
         it is not a suspect and does not cost a probe.
         """
         return sorted(
-            cid
-            for cid, cs in self._core_states.items()
-            if self._mask_offset(cs, Mask.LIVE) != cs.baseline_offset
+            cid for cid, cs in self._core_states.items() if self._mask_offset(cs, Mask.LIVE) != cs.baseline_offset
         )
 
     def _save_hunt(self) -> None:
@@ -2609,9 +2604,7 @@ class TunerEngine(QObject):
 
     def _check_time_budget(self, cs: CoreState) -> bool:
         """Pause an inconclusive search instead of manufacturing confirmation."""
-        if cs.cumulative_test_time <= self._config.max_core_time_seconds or cs.phase in (
-            TunerPhase.CONFIRMED,
-        ):
+        if cs.cumulative_test_time <= self._config.max_core_time_seconds or cs.phase in (TunerPhase.CONFIRMED,):
             return False
         self.log_message.emit(f"Core {cs.core_id}: time budget exceeded without confirmation; pausing for review")
         self.pause()
@@ -2847,8 +2840,7 @@ class TunerEngine(QObject):
         while core_id is None:
             # Distinguish "all done" from "all active cores in cooldown"
             in_cooldown = any(
-                cs.crash_cooldown > 0 and cs.phase not in (TunerPhase.CONFIRMED,)
-                for cs in self._core_states.values()
+                cs.crash_cooldown > 0 and cs.phase not in (TunerPhase.CONFIRMED,) for cs in self._core_states.values()
             )
             if not in_cooldown:
                 self._complete_session()

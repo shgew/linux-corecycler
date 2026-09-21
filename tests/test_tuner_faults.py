@@ -641,9 +641,7 @@ class TestUnstableBaselineEscapes:
 
 
 class TestResumeCrashCircuitBreaker:
-    def test_threshold_starts_stock_control_hunt_instead_of_dead_ending(
-        self, db, topo, smu, mock_backend
-    ):
+    def test_threshold_starts_stock_control_hunt_instead_of_dead_ending(self, db, topo, smu, mock_backend):
         cfg = TunerConfig(
             cores_to_test=[0],
             resume_crash_quarantine_threshold=1,
@@ -689,8 +687,7 @@ class TestResumeCrashCircuitBreaker:
         eng = make_engine(db, topo, smu, mock_backend, cores_to_test=[0, 1])
         eng._session_id = sid
         eng._core_states = {
-            core: CoreState(core_id=core, current_offset=-10, baseline_offset=0, in_test=True)
-            for core in (0, 1)
+            core: CoreState(core_id=core, current_offset=-10, baseline_offset=0, in_test=True) for core in (0, 1)
         }
         for cs in eng._core_states.values():
             tp.save_core_state(db, sid, cs)
@@ -1983,7 +1980,6 @@ class TestApparatusBreaker:
         assert eng._status != "paused"  # streak is 1: the fail at -20 alone
 
 
-
 # ---------------------------------------------------------------------------
 # SMU revert failure is a hardware-state fault -> pause, never march on
 # ---------------------------------------------------------------------------
@@ -2291,9 +2287,7 @@ class TestUnattributedIncidentOnResume:
             tp.set_unattributed_crashes(db, sid, unattributed)
         return sid
 
-    def test_dirty_reboot_mid_validation_starts_stock_control_hunt(
-        self, db, topo, smu, mock_backend, monkeypatch
-    ):
+    def test_dirty_reboot_mid_validation_starts_stock_control_hunt(self, db, topo, smu, mock_backend, monkeypatch):
         monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0, **kwargs: False)
         sid = self._seed(db, {0: -10, 1: -12})
         eng = make_engine(db, topo, smu, mock_backend, cores_to_test=[0, 1])
@@ -2358,5 +2352,3 @@ class TestInTestMarkDurability:
         eng._mark_cores_under_stress([0])
         assert flushed
         assert db.get_tuner_core_states(sid)[0].in_test
-
-

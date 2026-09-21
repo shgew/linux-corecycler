@@ -622,6 +622,7 @@ class TestLogTable:
         tab._update_core_row(0)
 
         assert tab._core_table.item(0, 10).text() == "-"
+
     def test_an_entry_without_a_session_is_dropped(self, tab):
         tab._add_log_entry(0, -30, True)
         assert tab._log_table.rowCount() == 0

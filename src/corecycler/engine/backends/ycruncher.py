@@ -16,9 +16,7 @@ _HEADLESS_FLAGS = ("skip-warnings", "pause:-2", "status:none")
 _DEFAULT_MEMORY_MIB = 1024
 _PER_TEST_SECONDS = 30
 
-VALID_COMPONENT_TESTS: frozenset[str] = frozenset(
-    {"BKT", "BBP", "SFTv4", "SNT", "SVT", "FFTv4", "N63", "VT3"}
-)
+VALID_COMPONENT_TESTS: frozenset[str] = frozenset({"BKT", "BBP", "SFTv4", "SNT", "SVT", "FFTv4", "N63", "VT3"})
 
 MODE_TO_ALGORITHMS: dict[StressMode, tuple[str, ...]] = {
     StressMode.SSE: ("BKT",),

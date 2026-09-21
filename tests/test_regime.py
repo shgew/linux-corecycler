@@ -88,15 +88,9 @@ def test_workload_errors_explain_malformed_entries_exactly():
     assert workload_errors("battery", 2, _entry(profile="bursty")) == [
         "battery[2].profile must be one of ['spectrum', 'sustained', 'transient']"
     ]
-    assert workload_errors("battery", 2, _entry(threads=0)) == [
-        "battery[2].threads must be a positive integer"
-    ]
-    assert workload_errors("battery", 2, _entry(threads=True)) == [
-        "battery[2].threads must be a positive integer"
-    ]
-    assert workload_errors("battery", 2, _entry(tests="BKT")) == [
-        "battery[2].tests must be a list of strings"
-    ]
+    assert workload_errors("battery", 2, _entry(threads=0)) == ["battery[2].threads must be a positive integer"]
+    assert workload_errors("battery", 2, _entry(threads=True)) == ["battery[2].threads must be a positive integer"]
+    assert workload_errors("battery", 2, _entry(tests="BKT")) == ["battery[2].tests must be a list of strings"]
     assert workload_errors("battery", 2, _entry(tests=["ZZZ", "AAA"])) == [
         "battery[2].tests has unknown tags: AAA, ZZZ"
     ]
@@ -112,7 +106,4 @@ def test_config_rejects_blank_fields_in_search_and_endurance_batteries():
     errors = config.validate()
 
     assert "battery[0] requires non-blank string backend, stress_mode, fft_preset" in errors
-    assert (
-        "endurance_workloads[0] requires non-blank string backend, stress_mode, fft_preset"
-        in errors
-    )
+    assert "endurance_workloads[0] requires non-blank string backend, stress_mode, fft_preset" in errors

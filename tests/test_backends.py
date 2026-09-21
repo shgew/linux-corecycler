@@ -676,9 +676,7 @@ class TestYCruncherBackend:
         assert str(exc_info.value) == "Unknown y-cruncher component test(s): BAD, UNKNOWN"
 
     @pytest.mark.parametrize(("test_seconds", "duration_arg"), [(45, "-D:45"), (0, "-D:1")])
-    def test_get_command_uses_clamped_test_duration(
-        self, tmp_path: Path, test_seconds: int, duration_arg: str
-    ) -> None:
+    def test_get_command_uses_clamped_test_duration(self, tmp_path: Path, test_seconds: int, duration_arg: str) -> None:
         backend = YCruncherBackend()
         backend._binary = "/bin/y-cruncher"
         cmd = backend.get_command(StressConfig(test_seconds=test_seconds), tmp_path)

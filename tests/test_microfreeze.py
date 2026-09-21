@@ -58,9 +58,7 @@ def test_only_hitches_over_threshold_are_recorded(monkeypatch: pytest.MonkeyPatc
     assert monitor.worst_ms() == 20.0
 
 
-def test_hitch_window_drops_entries_older_than_sixty_seconds(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-) -> None:
+def test_hitch_window_drops_entries_older_than_sixty_seconds(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monitor = MicroFreezeMonitor(tmp_path / "breadcrumb")
     monitor._hitches.extend((Hitch(1.0, 20.0), Hitch(2.0, 30.0)))
     monkeypatch.setattr(microfreeze.time, "monotonic", lambda: 61.5)

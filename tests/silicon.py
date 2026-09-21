@@ -95,7 +95,11 @@ class FakeSilicon:
         loaded = frozenset(loaded)
         for core_id in sorted(loaded):
             si = self.cores.get(core_id)
-            if si is not None and applied.get(core_id, 0) < si.load_limit and self._bites(core_id, applied[core_id], "load"):
+            if (
+                si is not None
+                and applied.get(core_id, 0) < si.load_limit
+                and self._bites(core_id, applied[core_id], "load")
+            ):
                 self.history.append((loaded, dict(applied), Outcome.SOFT_FAIL, core_id))
                 return Outcome.SOFT_FAIL, core_id
         for core_id in sorted(self.cores):

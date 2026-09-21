@@ -695,9 +695,7 @@ class TestSeededStart:
         ]
         assert 7 not in eng._core_states
 
-    def test_the_seeded_state_is_persisted_before_the_first_slot(
-        self, db, simple_topology, mock_smu, mock_backend
-    ):
+    def test_the_seeded_state_is_persisted_before_the_first_slot(self, db, simple_topology, mock_smu, mock_backend):
         """A crash during the first seeded slot must resume at the seed, not
         at stock, so the seeded vector has to reach the database first."""
         eng = self._engine(db, simple_topology, mock_smu, mock_backend)
@@ -1612,8 +1610,6 @@ class TestDeathSpiralPrevention:
 
         assert cs.cumulative_test_time == 400.0
 
-    
-
     def test_accumulate_counts_all_search_phases(self, db, simple_topology, mock_smu, mock_backend):
         """All active search phases accumulate time."""
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
@@ -1746,8 +1742,6 @@ class TestCrashAwareScheduling:
         cs = CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-20, best_offset=-20)
         assert eng._is_core_available(cs) is False
 
-    
-
     def test_is_core_available_cooldown_returns_false(self, db, simple_topology, mock_smu, mock_backend):
         """Cores with crash_cooldown > 0 are not available."""
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
@@ -1774,9 +1768,7 @@ class TestRegimeBatteryAndAnnealing:
             config=cfg,
         )
 
-    def test_offset_advances_only_after_every_regime_passes(
-        self, db, simple_topology, mock_smu, mock_backend
-    ):
+    def test_offset_advances_only_after_every_regime_passes(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
         eng._session_id = tp.create_session(db, eng._config, "", "")
         cs = CoreState(
@@ -1791,8 +1783,9 @@ class TestRegimeBatteryAndAnnealing:
         regime_count = len(eng._slot_regimes(cs))
         assert regime_count == 4
 
-        with patch.object(eng, "_revert_core_to_baseline", return_value=True), patch(
-            "corecycler.tuner.engine.QTimer.singleShot"
+        with (
+            patch.object(eng, "_revert_core_to_baseline", return_value=True),
+            patch("corecycler.tuner.engine.QTimer.singleShot"),
         ):
             for expected_index in range(1, regime_count):
                 eng._on_test_finished(0, True, "", "", 1.0, 0.0)
@@ -1825,8 +1818,9 @@ class TestRegimeBatteryAndAnnealing:
         eng._core_states = {0: cs}
         tp.save_core_state(db, eng._session_id, cs)
 
-        with patch.object(eng, "_revert_core_to_baseline", return_value=True), patch(
-            "corecycler.tuner.engine.QTimer.singleShot"
+        with (
+            patch.object(eng, "_revert_core_to_baseline", return_value=True),
+            patch("corecycler.tuner.engine.QTimer.singleShot"),
         ):
             eng._on_test_finished(0, False, "unstable", "stress", 1.0, 0.0)
 
@@ -1849,15 +1843,18 @@ class TestRegimeBatteryAndAnnealing:
             regime_floor_pct=20.0,
         )
         cs = CoreState(core_id=0, phase=TunerPhase.FINE_SEARCH, current_offset=-6, best_offset=-5)
-        with patch.object(eng, "context_hash", return_value="ctx"), patch.object(
-            db,
-            "regime_yield",
-            return_value={
-                "boost": (10, 3600.0),
-                "current": (0, 3600.0),
-                "transient": (0, 3600.0),
-                "coupled": (0, 3600.0),
-            },
+        with (
+            patch.object(eng, "context_hash", return_value="ctx"),
+            patch.object(
+                db,
+                "regime_yield",
+                return_value={
+                    "boost": (10, 3600.0),
+                    "current": (0, 3600.0),
+                    "transient": (0, 3600.0),
+                    "coupled": (0, 3600.0),
+                },
+            ),
         ):
             regimes = eng._slot_regimes(cs)
             assert regimes[0] == "boost"
@@ -1902,9 +1899,7 @@ class TestRegimeBatteryAndAnnealing:
         assert persisted.anneal_bar_hours == 6.0
         assert lines == ["Core 0: annealed deeper to -11"]
 
-    def test_annealing_failure_restores_best_and_doubles_bar(
-        self, db, simple_topology, mock_smu, mock_backend
-    ):
+    def test_annealing_failure_restores_best_and_doubles_bar(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
         eng._session_id = tp.create_session(db, eng._config, "", "")
         cs = CoreState(
@@ -1931,9 +1926,7 @@ class TestRegimeBatteryAndAnnealing:
         assert persisted.best_offset == -10
         assert persisted.anneal_strikes == 2
         assert persisted.anneal_bar_hours == 24.0
-        assert lines == [
-            "Core 0: anneal probe failed - back to -10, next probe needs 24h clean (strike 2/3)"
-        ]
+        assert lines == ["Core 0: anneal probe failed - back to -10, next probe needs 24h clean (strike 2/3)"]
 
     def test_zero_bank_hours_disables_annealing(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, anneal_bank_hours=0.0)
@@ -1974,9 +1967,7 @@ class TestRegimeBatteryAndAnnealing:
         assert cs.current_offset == -10
 
     def test_confirmed_cores_complete_the_session(self, db, simple_topology, mock_smu, mock_backend):
-        eng = self._make_engine(
-            db, simple_topology, mock_smu, mock_backend, cores_to_test=[0, 1], auto_validate=False
-        )
+        eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, cores_to_test=[0, 1], auto_validate=False)
         eng._set_status("running")
         eng._core_states = {
             0: CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-8, best_offset=-8),
@@ -2000,9 +1991,7 @@ class TestMicroFreezeLifecycle:
             config=TunerConfig(cores_to_test=[0]),
         )
 
-    def test_monitor_preserves_context_until_stopped(
-        self, db, simple_topology, mock_smu, mock_backend, tmp_path
-    ):
+    def test_monitor_preserves_context_until_stopped(self, db, simple_topology, mock_smu, mock_backend, tmp_path):
         eng = self._engine(db, simple_topology, mock_smu, mock_backend)
         breadcrumb = tmp_path / "breadcrumbs" / "microfreeze.txt"
         with patch.object(eng, "_breadcrumb_path", return_value=breadcrumb):
@@ -2011,8 +2000,7 @@ class TestMicroFreezeLifecycle:
             eng._start_freeze_monitor()
             eng._freeze._write_breadcrumb()
             assert eng._read_breadcrumb() == (
-                "core 0 transient at -12 "
-                "(worst scheduling hitch 0.000ms in the minute before the freeze)"
+                "core 0 transient at -12 (worst scheduling hitch 0.000ms in the minute before the freeze)"
             )
             eng._stop_freeze_monitor()
 
@@ -2023,16 +2011,15 @@ class TestMicroFreezeLifecycle:
     ):
         eng = self._engine(db, simple_topology, mock_smu, mock_backend)
         breadcrumb = tmp_path / "read-only" / "microfreeze.txt"
-        with patch.object(eng, "_breadcrumb_path", return_value=breadcrumb), patch(
-            "pathlib.Path.mkdir", side_effect=OSError("read-only filesystem")
+        with (
+            patch.object(eng, "_breadcrumb_path", return_value=breadcrumb),
+            patch("pathlib.Path.mkdir", side_effect=OSError("read-only filesystem")),
         ):
             eng._start_freeze_monitor()
 
         assert eng._freeze is None
 
-    def test_unreadable_breadcrumb_has_no_crash_context(
-        self, db, simple_topology, mock_smu, mock_backend, tmp_path
-    ):
+    def test_unreadable_breadcrumb_has_no_crash_context(self, db, simple_topology, mock_smu, mock_backend, tmp_path):
         eng = self._engine(db, simple_topology, mock_smu, mock_backend)
         with patch.object(eng, "_breadcrumb_path", return_value=tmp_path / "missing.txt"):
             assert eng._read_breadcrumb() == ""
@@ -2095,8 +2082,7 @@ class TestMaskApplicationFailures:
         assert eng.status == "paused"
         assert eng._co_applied == {0: 0, 1: 0}
         assert lines[0] == (
-            "CO mask failed: core 1 write to -6 did not read back. "
-            "Stopping (SMU issue, not a core stability failure)."
+            "CO mask failed: core 1 write to -6 did not read back. Stopping (SMU issue, not a core stability failure)."
         )
 
 
@@ -2261,9 +2247,6 @@ class TestValidationS4:
         assert engine._validation_dirty is True
 
 
-
-
-
 class TestCooldownDrainLoop:
     """Tests that cooldown drain uses a loop (not recursion)."""
 
@@ -2316,9 +2299,6 @@ class TestStateMachineGaps:
         )
         eng._session_id = tp.create_session(db, cfg, "", "")
         return eng
-
-
-    
 
     # Gap 3: Resume with in_test=True during CONFIRMING phase
     def test_resume_crash_during_confirming(self, db, simple_topology, mock_smu, mock_backend):
@@ -2391,9 +2371,6 @@ class TestStateMachineGaps:
         assert cs.phase == TunerPhase.CONFIRMED
 
     # Gap 7: Hardening fail all the way to baseline
-    
-
-
 
     # Gap 9: Crash during backoff tightens the fail bound toward the pass region
     def test_crash_during_backoff_with_existing_fail_bound(self, db, simple_topology, mock_smu, mock_backend):

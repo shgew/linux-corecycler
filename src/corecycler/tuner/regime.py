@@ -142,10 +142,7 @@ def workload_errors(name: str, index: int, item: object) -> list[str]:
         Regime(item.get("regime"))
     except ValueError:
         return [f"{name}[{index}].regime must be one of {sorted(r.value for r in Regime)}"]
-    if not all(
-        isinstance(item.get(k), str) and item[k].strip()
-        for k in ("backend", "stress_mode", "fft_preset")
-    ):
+    if not all(isinstance(item.get(k), str) and item[k].strip() for k in ("backend", "stress_mode", "fft_preset")):
         return [f"{name}[{index}] requires non-blank string backend, stress_mode, fft_preset"]
     try:
         Profile(item.get("profile", "sustained"))

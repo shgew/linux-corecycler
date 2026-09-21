@@ -68,9 +68,7 @@ def cli_main(argv: list[str]) -> int:
         print(f"corecycler {__version__}")
         return EXIT_COMPLETED
     if argv in (["--help"], ["-h"]) or (
-        len(argv) == 2
-        and argv[0] in ("doctor", "status", "report", "tune", "resume")
-        and argv[1] in ("--help", "-h")
+        len(argv) == 2 and argv[0] in ("doctor", "status", "report", "tune", "resume") and argv[1] in ("--help", "-h")
     ):
         print(USAGE)
         return EXIT_COMPLETED

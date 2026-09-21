@@ -164,9 +164,7 @@ def test_clock_nanosleep_uses_an_absolute_monotonic_deadline(monkeypatch: pytest
     assert calls == [(time.CLOCK_MONOTONIC, 1, 7.5)]
 
 
-def test_resume_os_error_is_telemetry_only(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
+def test_resume_os_error_is_telemetry_only(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
     def fail_resume(_pgid: int, _sig: signal.Signals) -> None:
         raise PermissionError("resume denied")
 

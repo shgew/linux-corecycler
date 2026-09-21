@@ -118,14 +118,10 @@ class TunerConfig:
 
     # The workload battery. Every slot runs the regimes this list covers, so
     # an offset is never called good on the strength of one instruction mix.
-    battery: list[dict] = dataclasses.field(
-        default_factory=lambda: [w.to_dict() for w in regime.DEFAULT_BATTERY]
-    )
+    battery: list[dict] = dataclasses.field(default_factory=lambda: [w.to_dict() for w in regime.DEFAULT_BATTERY])
     # Coarse search runs only the fastest-failing regimes; the full battery
     # starts at fine search, where a wrong answer actually costs something.
-    coarse_regimes: list[str] = dataclasses.field(
-        default_factory=lambda: [str(r) for r in regime.COARSE_REGIMES]
-    )
+    coarse_regimes: list[str] = dataclasses.field(default_factory=lambda: [str(r) for r in regime.COARSE_REGIMES])
 
     # No regime may be starved below this share of slot time, however poorly
     # it has performed: absence of failures in a regime is the thing being

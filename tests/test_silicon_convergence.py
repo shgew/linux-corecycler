@@ -154,9 +154,7 @@ class TestConvergenceProperty:
         idle=st.lists(st.integers(min_value=-45, max_value=-20), min_size=4, max_size=4),
     )
     def test_converges_from_any_silicon(self, db, mock_backend, load, idle):
-        silicon = FakeSilicon(
-            cores={i: CoreSilicon(load_limit=load[i], idle_limit=idle[i]) for i in range(4)}
-        )
+        silicon = FakeSilicon(cores={i: CoreSilicon(load_limit=load[i], idle_limit=idle[i]) for i in range(4)})
         run = drive(db, _topo(4), mock_backend, silicon)
         ok, problems = converged(silicon, run.final)
         assert not run.stalled, f"engine handed back control: {run.status}"
@@ -166,9 +164,7 @@ class TestConvergenceProperty:
 @pytest.mark.parametrize("n_cores", [2, 8])
 def test_scales_with_core_count(db, mock_backend, n_cores):
     silicon = FakeSilicon(
-        cores={
-            i: CoreSilicon(load_limit=-38, idle_limit=-27 if i == n_cores - 1 else -60) for i in range(n_cores)
-        }
+        cores={i: CoreSilicon(load_limit=-38, idle_limit=-27 if i == n_cores - 1 else -60) for i in range(n_cores)}
     )
     run = drive(db, _topo(n_cores), mock_backend, silicon)
     ok, problems = converged(silicon, run.final)

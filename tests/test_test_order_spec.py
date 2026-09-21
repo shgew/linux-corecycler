@@ -276,6 +276,7 @@ class TestAnnealingFallThrough:
         monkeypatch.setattr(eng, "_banked_hours", lambda _cs: 100.0)
 
         assert eng._pick_next_core() is None
+
     @pytest.mark.parametrize(
         ("best_offset", "banked_hours"),
         [(-10, 0.5), (-50, 100.0)],
@@ -294,6 +295,8 @@ class TestAnnealingFallThrough:
         monkeypatch.setattr(eng, "_banked_hours", lambda _cs: banked_hours)
 
         assert eng._pick_next_core() is None
+
+
 class TestInterruptionContract:
     @staticmethod
     def _log_real_test(db, session_id, core, offset=-10):

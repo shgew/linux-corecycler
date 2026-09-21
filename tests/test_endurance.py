@@ -213,10 +213,7 @@ class TestWorkloadSelection:
         assert eng._threads_for(0, 8) == width
         assert eng._threads_for(999, 4) == 1  # unknown core never asks for SMT it has not got
 
-
-    def test_hunt_probe_selects_its_recorded_workload(
-        self, db, topo_dual_ccd_x3d, mock_backend
-    ):
+    def test_hunt_probe_selects_its_recorded_workload(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _at(_seed(db, topo_dual_ccd_x3d, mock_backend))
         eng._hunting = True
         eng._hunt_workload = {
@@ -262,7 +259,6 @@ class TestWorkloadSelection:
         assert worker.scheduler.stress_config.fft_preset is FFTPreset[workload["fft_preset"]]
         assert worker.scheduler.stress_config.duty_cycle == duty_cycle
         assert worker.scheduler.config.duty_cycle == duty_cycle
-
 
     def test_unknown_persisted_workload_values_fall_back_to_safe_stress_defaults(
         self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch, tmp_path
@@ -364,9 +360,7 @@ class TestRounds:
         session = tp.get_session(db, eng._session_id)
         assert (session.endurance_round, session.endurance_workload) == (1, 0)
 
-    def test_a_round_boundary_hands_a_fully_banked_core_to_annealing(
-        self, db, topo_dual_ccd_x3d, mock_backend
-    ):
+    def test_a_round_boundary_hands_a_fully_banked_core_to_annealing(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _seed(db, topo_dual_ccd_x3d, mock_backend)
         _at(eng, workload=len(eng._config.endurance_workloads))
         eng.context_hash = lambda: "ctx"

@@ -158,6 +158,7 @@ class TestNewConfigOptions:
         errors = cfg.validate()
         assert any("max_apparatus_retries" in e.lower() for e in errors)
 
+
 class TestEnduranceConfig:
     """The endurance workload matrix: thread counts, knob ranges, round-trip."""
 
@@ -218,6 +219,7 @@ class TestConfigValidationFailsClosed:
     def test_zero_fine_step_rejected(self):
         errors = self._cfg(fine_step=0).validate()
         assert any("fine_step" in e for e in errors)
+
     @pytest.mark.parametrize(
         ("settings", "message"),
         [
@@ -252,9 +254,7 @@ class TestConfigValidationFailsClosed:
         ]
 
     def test_coarse_regimes_must_be_present_in_the_battery(self):
-        assert self._cfg(coarse_regimes=["unknown"]).validate() == [
-            "coarse_regimes not present in battery: unknown"
-        ]
+        assert self._cfg(coarse_regimes=["unknown"]).validate() == ["coarse_regimes not present in battery: unknown"]
 
     def test_at_least_one_coarse_regime_is_required(self):
         assert self._cfg(coarse_regimes=[]).validate() == ["coarse_regimes must name at least one regime"]

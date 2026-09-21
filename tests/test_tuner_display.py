@@ -24,5 +24,3 @@ class TestPerCoreFreqText:
 
     def test_live_core_without_known_ceiling_has_unit(self):
         assert CoreFreqBar._freq_text(4321.0, 0.0) == "4321MHz"
-
-

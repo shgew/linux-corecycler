@@ -328,6 +328,7 @@ class TestTunerSessionMethods:
         assert len(runs) == 0
         assert db.get_tuner_session(sid) is None
         assert db.get_context(ctx_id) is None
+
     def test_regime_bank_summary_returns_persisted_evidence(self, db):
         db.bank_regime_time("ctx", 3, "boost", -25, 1800.0)
         db.bank_regime_time("ctx", 3, "boost", -25, 900.0)

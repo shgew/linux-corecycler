@@ -237,9 +237,7 @@ class TestForensicAttribution:
         assert after == {0: (BEST[0], BEST[0], 0), 1: (BEST[1], BEST[1], 0)}
         assert eng._smu.written == {}
 
-    def test_loaded_core_is_not_blamed_when_other_live_offsets_were_resident(
-        self, db, topo_dual_ccd_x3d, mock_backend
-    ):
+    def test_loaded_core_is_not_blamed_when_other_live_offsets_were_resident(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[2, 3])
         eng._core_states = {
             2: CoreState(core_id=2, phase=TunerPhase.COARSE_SEARCH, current_offset=-20, in_test=True),
@@ -263,9 +261,7 @@ class TestForensicAttribution:
         assert eng._pending_hunt_loaded == [2]
         assert all(cs.crash_count == 0 for cs in eng._core_states.values())
 
-    def test_only_non_stock_resident_can_be_blamed_without_a_hunt(
-        self, db, topo_dual_ccd_x3d, mock_backend
-    ):
+    def test_only_non_stock_resident_can_be_blamed_without_a_hunt(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[2, 3])
         tested = CoreState(core_id=2, phase=TunerPhase.COARSE_SEARCH, current_offset=-20, in_test=True)
         stock = CoreState(core_id=3, phase=TunerPhase.COARSE_SEARCH, current_offset=0)
@@ -560,10 +556,10 @@ class TestUnattributedMcePayload:
     ):
         calls = self._mark_survived_calls(db, topo_single_ccd, mock_backend, _mce_payload(-1), monkeypatch)
         assert calls == []
+
+
 class TestResumeHuntAttribution:
-    def test_an_in_flight_isolated_slot_penalizes_its_proven_culprit(
-        self, db, topo_dual_ccd_x3d, mock_backend
-    ):
+    def test_an_in_flight_isolated_slot_penalizes_its_proven_culprit(self, db, topo_dual_ccd_x3d, mock_backend):
         engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         _seed_confirmed_validating(engine, db, BEST, BASELINES)
         for cs in engine._core_states.values():
@@ -578,15 +574,12 @@ class TestResumeHuntAttribution:
         restored = tp.load_core_states(db, engine._session_id)
         assert crashed == [5]
         assert pending_hunt is False
-        assert restored[5].current_offset == BEST[5] + (
-            engine._config.crash_penalty_steps * engine._config.fine_step
-        )
+        assert restored[5].current_offset == BEST[5] + (engine._config.crash_penalty_steps * engine._config.fine_step)
         assert restored[5].crash_count == 1
         assert all(restored[cid].crash_count == 0 for cid in restored if cid != 5)
         assert tp.get_session(db, engine._session_id).hunting_core is None
-    def test_unattributed_hunt_preserves_the_last_workload_breadcrumb(
-        self, db, topo_dual_ccd_x3d, mock_backend
-    ):
+
+    def test_unattributed_hunt_preserves_the_last_workload_breadcrumb(self, db, topo_dual_ccd_x3d, mock_backend):
         engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         session = _seed_confirmed_validating(engine, db, BEST, BASELINES)
         engine._forensics = lambda *_a, **_kw: ([], True)
@@ -600,9 +593,7 @@ class TestResumeHuntAttribution:
         assert pending_hunt is True
         assert any("mprime AVX2 large" in message for message in messages)
 
-    def test_a_journal_suspect_already_attributed_is_not_penalized_twice(
-        self, db, topo_single_ccd, mock_backend
-    ):
+    def test_a_journal_suspect_already_attributed_is_not_penalized_twice(self, db, topo_single_ccd, mock_backend):
         engine = _make_engine(db, topo_single_ccd, mock_backend)
         cs = CoreState(
             core_id=0,

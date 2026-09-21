@@ -1686,9 +1686,7 @@ COMMIT;
     # Per-regime confidence banks
     # ------------------------------------------------------------------
 
-    def bank_regime_time(
-        self, context_hash: str, core_id: int, regime: str, offset_value: int, seconds: float
-    ) -> None:
+    def bank_regime_time(self, context_hash: str, core_id: int, regime: str, offset_value: int, seconds: float) -> None:
         """Credit clean time to one (context, core, regime, offset) bucket.
 
         Keyed on the context hash rather than the session so confidence
