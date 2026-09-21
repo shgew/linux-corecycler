@@ -10,7 +10,7 @@
 
 Per-core CPU stability testing and AMD PBO Curve Optimizer tuning for Linux -- a graphical tool that stress-tests one core at a time at full single-threaded boost, optionally reads and writes per-core Curve Optimizer offsets via the AMD SMU, and includes an **automatic crash-safe tuner** that searches each core's most aggressive stable undervolt for you. A Linux counterpart to [CoreCycler](https://github.com/sp00n/corecycler) (Windows).
 
-> **Status:** actively developed and tested on an **AMD Ryzen 9 9950X3D** (Zen 5, dual-CCD X3D, AM5). Other AMD Ryzen processors (Zen 2-5) should work but are less thoroughly tested; Intel CPUs are supported for stress testing only (no Curve Optimizer). Found a problem on other hardware? [Open an issue](https://github.com/shgew/linux-corecycler/issues) with your CPU model.
+> **Status:** actively developed and tested on an **AMD Ryzen 7 7800X3D** (Zen 4, single-CCD X3D, AM5). Other AMD Ryzen processors (Zen 2-5) should work but are less thoroughly tested; Intel CPUs are supported for stress testing only (no Curve Optimizer). Found a problem on other hardware? [Open an issue](https://github.com/shgew/linux-corecycler/issues) with your CPU model.
 
 <!-- BEGIN generated:upstream -->
 ## Project

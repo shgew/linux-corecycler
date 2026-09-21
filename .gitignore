@@ -34,3 +34,18 @@ venv/
 /build/
 /dist/
 /target/
+
+# Local agent state
+CLAUDE.md
+GEMINI.md
+AGENTS.md
+AI-progress.json
+AI-tasks.json
+.session-handoff*.md
+.claude/
+.gemini/
+.codex/
+.cursor/
+.superpowers/
+.ai-context/
+.planning/
