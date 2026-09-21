@@ -55,6 +55,7 @@ class TestConfigJsonFailsClosed:
             max_offset=max_off,
             inherit_current=inherit,
             auto_validate=auto_validate,
+            endurance=False,
             test_order=order,
             stretch_threshold_pct=stretch,
             cores_to_test=[0, 1, 2],
@@ -81,7 +82,10 @@ def _core_state(data) -> CoreState:
         crash_cooldown=data.draw(st.integers(0, 5)),
         thermal_aborts=data.draw(st.integers(0, 5)),
         cumulative_test_time=data.draw(st.floats(0.0, 1e6, allow_nan=False, allow_infinity=False)),
-        hardening_tier_index=data.draw(st.integers(0, 4)),
+        battery_index=data.draw(st.integers(0, 8)),
+        anneal_strikes=data.draw(st.integers(0, 10)),
+        anneal_bar_hours=data.draw(st.floats(0.0, 1e4, allow_nan=False, allow_infinity=False)),
+        suspicion=data.draw(st.floats(0.0, 1e4, allow_nan=False, allow_infinity=False)),
     )
 
 

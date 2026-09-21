@@ -221,7 +221,7 @@ class TestTunerSessionDetail:
             tp.save_core_state(
                 db,
                 sid,
-                CoreState(core_id=c, phase=TunerPhase.HARDENED, current_offset=-30, best_offset=-30),
+                CoreState(core_id=c, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30),
             )
         tab = _tab(db)
         tab._view_mode = tab.VIEW_TUNER

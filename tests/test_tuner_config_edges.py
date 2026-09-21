@@ -34,8 +34,32 @@ class TestTunerConfigValidation:
         errs = _errors(apparatus_failure_streak=2, max_confirm_retries=2)
         assert any("must exceed max_confirm_retries" in e for e in errs)
 
-    def test_hardening_tier_not_a_dict(self):
-        assert any("must be a dict" in e for e in _errors(hardening_tiers=["nope"]))
+    def test_battery_entry_not_a_dict(self):
+        assert _errors(battery=["nope"]) == ["battery[0] must be a dict"]
+
+    def test_battery_unknown_regime(self):
+        entry = {**TunerConfig().battery[0], "regime": "unknown"}
+        assert _errors(battery=[entry]) == [
+            "battery[0].regime must be one of ['boost', 'coupled', 'current', 'transient']"
+        ]
+
+    def test_battery_unknown_profile(self):
+        entry = {**TunerConfig().battery[0], "profile": "unknown"}
+        assert _errors(battery=[entry]) == ["battery[0].profile must be one of ['spectrum', 'sustained', 'transient']"]
+
+    def test_ycruncher_unknown_test_tag(self):
+        entry = {**TunerConfig().battery[1], "tests": ["NOPE"]}
+        assert _errors(battery=[entry]) == ["battery[0].tests has unknown tags: NOPE"]
+
+    @staticmethod
+    def test_anneal_max_strikes_range():
+        for value in (0, 11):
+            assert _errors(anneal_max_strikes=value) == ["anneal_max_strikes must be 1-10"]
+
+    @staticmethod
+    def test_regime_floor_pct_range():
+        for value in (0, 101):
+            assert _errors(regime_floor_pct=value) == ["regime_floor_pct must be 0-25"]
 
     def test_over_temp_grace_negative(self):
         assert any("over_temp_grace_seconds" in e for e in _errors(over_temp_grace_seconds=-1.0))

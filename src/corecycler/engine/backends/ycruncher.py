@@ -16,11 +16,13 @@ _HEADLESS_FLAGS = ("skip-warnings", "pause:-2", "status:none")
 _DEFAULT_MEMORY_MIB = 1024
 _PER_TEST_SECONDS = 30
 
+VALID_COMPONENT_TESTS: frozenset[str] = frozenset({"BKT", "BBP", "SFTv4", "SNT", "SVT", "FFTv4", "N63", "VT3"})
+
 MODE_TO_ALGORITHMS: dict[StressMode, tuple[str, ...]] = {
     StressMode.SSE: ("BKT",),
     StressMode.AVX: ("BKT", "BBP", "SFTv4", "SNT", "SVT"),
-    StressMode.AVX2: (),
-    StressMode.AVX512: (),
+    StressMode.AVX2: ("BKT", "FFTv4", "N63", "VT3"),
+    StressMode.AVX512: ("BKT", "FFTv4", "N63", "VT3"),
     StressMode.CUSTOM: (),
 }
 
@@ -42,14 +44,19 @@ class YCruncherBackend(StressBackend):
     def get_command(self, config: StressConfig, work_dir: Path) -> list[str]:
         binary = self.require_binary()
         memory_mib = config.memory_mb if config.memory_mb and config.memory_mb > 0 else _DEFAULT_MEMORY_MIB
+        algorithms = config.tests if config.tests is not None else MODE_TO_ALGORITHMS.get(config.mode, ())
+        unknown_tests = sorted(set(algorithms) - VALID_COMPONENT_TESTS)
+        if unknown_tests:
+            raise ValueError(f"Unknown y-cruncher component test(s): {', '.join(unknown_tests)}")
+        test_seconds = max(config.test_seconds if config.test_seconds is not None else _PER_TEST_SECONDS, 1)
         cmd = [
             binary,
             *_HEADLESS_FLAGS,
             "stress",
             f"-M:{memory_mib}M",
-            f"-D:{_PER_TEST_SECONDS}",
+            f"-D:{test_seconds}",
         ]
-        cmd.extend(MODE_TO_ALGORITHMS.get(config.mode, ()))
+        cmd.extend(algorithms)
         return cmd
 
     def get_supported_modes(self) -> list[StressMode]:

@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 from corecycler.config.paths import resolve_work_dir
 from corecycler.engine import execution
-from corecycler.engine.backends.base import StressConfig, StressResult
+from corecycler.engine.backends.base import DutyCycle, StressConfig, StressResult
 from corecycler.engine.detector import ErrorDetector, MCEEvent
 from corecycler.engine.execution import Lane, SuperviseHooks, Supervisor, ThermalWatch
 from corecycler.inhibit import SleepInhibitor
@@ -64,6 +64,7 @@ class SchedulerConfig:
     variable_load_interval: float = 15.0
     idle_between_cores: float = 0.0
     idle_stability_test: float = 0.0
+    duty_cycle: DutyCycle | None = None
 
 
 class CoreScheduler:
@@ -237,6 +238,7 @@ class CoreScheduler:
             return
 
         self.stress_config.threads = len(lane.cpus)
+        self.stress_config.duty_cycle = self.config.duty_cycle
         start_time = time.monotonic()
         self._set_phase(core_id, "stress")
         supervisor = self._supervisor(f"stress (CPU {lane.cpu_list})")
@@ -257,7 +259,7 @@ class CoreScheduler:
             if self.config.stop_on_error:
                 self._stop_event.set()
 
-        if passed and self.config.variable_load and not self._stop_event.is_set():
+        if passed and self.config.variable_load and self.config.duty_cycle is None and not self._stop_event.is_set():
             var_passed, var_error = self._run_variable_load(lane, self.config.seconds_per_core / 3.0)
             if not var_passed:
                 passed = False

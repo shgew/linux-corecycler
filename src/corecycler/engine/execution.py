@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 from corecycler.engine import containment
 from corecycler.engine.backends.base import KILLED_BY_US_CODES, StressResult
+from corecycler.engine.duty import DutyCycleDriver
 
 if TYPE_CHECKING:
     import threading
@@ -62,6 +63,7 @@ class _LaneRun:
     we_killed: bool = False
     stdout_file: TextIO | None = None
     stderr_file: TextIO | None = None
+    duty_driver: DutyCycleDriver | None = None
 
     @property
     def running(self) -> bool:
@@ -300,6 +302,9 @@ class Supervisor:
                 cwd=str(lane.work_dir),
                 preexec_fn=make_preexec(),
             )
+            if cfg.duty_cycle is not None:
+                run.duty_driver = DutyCycleDriver(cfg.duty_cycle, run.proc.pid)
+                run.duty_driver.start()
         except (OSError, RuntimeError, TypeError) as exc:
             log.error("core %d: stress process failed to start: %s", lane.core_id, exc)
             self._fail(run, f"Failed to start stress test: {exc}", batch_start, error_type="startup")
@@ -533,6 +538,8 @@ class Supervisor:
         elapsed = time.monotonic() - start
         interrupted = self.stop_event.is_set() and elapsed < duration
         for run in runs:
+            if run.duty_driver is not None:
+                run.duty_driver.stop()
             if run.proc is None:
                 continue
             run.we_killed = run.proc.poll() is None

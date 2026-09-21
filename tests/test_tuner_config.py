@@ -12,41 +12,35 @@ from corecycler.tuner.config import TunerConfig
 class TestTunerConfigDefaults:
     def test_json_roundtrip(self):
         cfg = TunerConfig(coarse_step=10, max_offset=-40, cores_to_test=[0, 1, 2])
-        json_str = cfg.to_json()
-        restored = TunerConfig.from_json(json_str)
-        assert restored.coarse_step == 10
-        assert restored.max_offset == -40
-        assert restored.cores_to_test == [0, 1, 2]
-        assert restored.start_offset == cfg.start_offset
+        assert TunerConfig.from_json(cfg.to_json()) == cfg
 
     def test_json_roundtrip_defaults(self):
         cfg = TunerConfig()
-        restored = TunerConfig.from_json(cfg.to_json())
-        assert restored.coarse_step == cfg.coarse_step
-        assert restored.direction == cfg.direction
-        assert restored.cores_to_test == cfg.cores_to_test
+        assert TunerConfig.from_json(cfg.to_json()) == cfg
 
     @pytest.mark.parametrize(
         "payload",
         [
             "{broken",
             "[]",
-            '{"max_temperatur_c": 80}',
             '{"max_temperature_c": "80"}',
-            '{"hardening_tiers": null}',
+            '{"battery": null}',
+            '{"coarse_regimes": null}',
             '{"auto_validate": 1}',
             '{"start_offset": -10.5}',
             '{"search_duration_seconds": NaN}',
-            '{"over_temp_grace_seconds": Infinity}',
             '{"cores_to_test": [0, "1"]}',
             '{"cores_to_test": [0, 0]}',
-            '{"hardening_tiers": [7]}',
-            '{"hardening_tiers": [{"backend": [], "stress_mode": "SSE", "fft_preset": "SMALL"}]}',
+            '{"battery": [7]}',
         ],
     )
     def test_invalid_json_is_rejected_instead_of_using_defaults(self, payload):
         with pytest.raises(ValueError):
             TunerConfig.from_json(payload)
+
+    def test_unknown_field_is_rejected(self):
+        with pytest.raises(ValueError, match="^unknown tuner config fields: hardening_tiers$"):
+            TunerConfig.from_json('{"hardening_tiers": []}')
 
     def test_direct_config_rejects_wrong_types_before_comparisons(self):
         cfg = TunerConfig(coarse_step="five", search_duration_seconds=float("nan"))
@@ -56,26 +50,28 @@ class TestTunerConfigDefaults:
 
     def test_from_json_keeps_valid_typed_fields(self):
         """The type guard must not reject legitimate values."""
-        cfg = TunerConfig.from_json(
-            json.dumps(
-                {
-                    "coarse_step": 7,
-                    "cores_to_test": [0, 2],
-                    "auto_validate": False,
-                    "max_temperature_c": 90.0,
-                    "hardening_tiers": [],
-                }
-            )
+        expected = TunerConfig(
+            coarse_step=7,
+            cores_to_test=[0, 2],
+            validate_memory=False,
+            max_temperature_c=90.0,
+            battery=TunerConfig().battery,
+            coarse_regimes=["current"],
+            regime_floor_pct=10.0,
+            control_run_confirmations=3,
+            probe_base_seconds=900,
+            probe_mttf_multiplier=3.0,
+            probe_level_multiplier=2.0,
+            probe_final_multiplier=5.0,
+            suspicion_separation=3.0,
+            suspicion_min_failures=4,
+            anneal_bank_hours=8.0,
+            anneal_max_strikes=4,
         )
-        assert cfg.coarse_step == 7
-        assert cfg.cores_to_test == [0, 2]
-        assert cfg.auto_validate is False
-        assert cfg.max_temperature_c == 90.0
-        assert cfg.hardening_tiers == []
+        assert TunerConfig.from_json(expected.to_json()) == expected
 
     def test_from_json_accepts_json_int_for_float_field(self):
-        """JSON has no float/int distinction — a bare int for a float field is
-        valid (60 for max_temperature_c), not a type error."""
+        """JSON has no float/int distinction — a bare int for a float field is valid."""
         cfg = TunerConfig.from_json(json.dumps({"max_temperature_c": 90}))
         assert cfg.max_temperature_c == 90
 
@@ -101,49 +97,56 @@ class TestTunerConfigDefaults:
 
 
 class TestNewConfigOptions:
-    def test_hardening_tiers_default(self):
+    def test_defaults(self):
         cfg = TunerConfig()
-        assert cfg.hardening_tiers == [
-            {"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL"},
-            {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "LARGE"},
-            {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "SMALL", "profile": "spectrum"},
-        ]
-
-    def test_max_core_time_default(self):
-        cfg = TunerConfig()
+        assert len(cfg.battery) == 7
+        assert {entry["regime"] for entry in cfg.battery} == {
+            "boost",
+            "current",
+            "transient",
+            "coupled",
+        }
+        assert cfg.coarse_regimes == ["current", "transient"]
+        assert cfg.regime_floor_pct == 15.0
+        assert cfg.control_run_confirmations == 2
+        assert cfg.probe_base_seconds == 1800
+        assert cfg.probe_mttf_multiplier == 4.0
+        assert cfg.probe_level_multiplier == 1.5
+        assert cfg.probe_final_multiplier == 4.0
+        assert cfg.suspicion_separation == 2.0
+        assert cfg.suspicion_min_failures == 3
+        assert cfg.anneal_bank_hours == 6.0
+        assert cfg.anneal_max_strikes == 3
         assert cfg.max_core_time_seconds == 7200
-
-    def test_crash_penalty_steps_default(self):
-        cfg = TunerConfig()
         assert cfg.crash_penalty_steps == 3
-
-    def test_validate_transitions_default(self):
-        cfg = TunerConfig()
         assert cfg.validate_transitions is True
-
-    def test_validate_memory_default_and_roundtrips(self):
-        cfg = TunerConfig()
         assert cfg.validate_memory is True
-        restored = TunerConfig.from_json(TunerConfig(validate_memory=False).to_json())
-        assert restored.validate_memory is False
 
-    def test_hardening_tiers_json_roundtrip(self):
-        cfg = TunerConfig()
-        restored = TunerConfig.from_json(cfg.to_json())
-        assert restored.hardening_tiers == cfg.hardening_tiers
-        assert restored.max_core_time_seconds == cfg.max_core_time_seconds
-        assert restored.crash_penalty_steps == cfg.crash_penalty_steps
-        assert restored.validate_transitions == cfg.validate_transitions
+    def test_new_fields_json_roundtrip(self):
+        defaults = TunerConfig()
+        cfg = TunerConfig(
+            battery=list(reversed(defaults.battery)),
+            coarse_regimes=["boost"],
+            regime_floor_pct=10.0,
+            control_run_confirmations=3,
+            probe_base_seconds=900,
+            probe_mttf_multiplier=3.0,
+            probe_level_multiplier=2.0,
+            probe_final_multiplier=5.0,
+            suspicion_separation=3.0,
+            suspicion_min_failures=4,
+            anneal_bank_hours=8.0,
+            anneal_max_strikes=4,
+        )
+        assert TunerConfig.from_json(cfg.to_json()) == cfg
 
-    def test_empty_hardening_tiers_valid(self):
-        cfg = TunerConfig(hardening_tiers=[])
-        errors = cfg.validate()
-        assert not any("hardening" in e.lower() for e in errors)
+    def test_validate_memory_roundtrips(self):
+        cfg = TunerConfig(validate_memory=False)
+        assert TunerConfig.from_json(cfg.to_json()) == cfg
 
     def test_validate_crash_penalty_range(self):
-        cfg = TunerConfig(crash_penalty_steps=0)
-        errors = cfg.validate()
-        assert any("crash_penalty" in e.lower() for e in errors)
+        errors = TunerConfig(crash_penalty_steps=0).validate()
+        assert any("crash_penalty" in error for error in errors)
 
     def test_validate_max_core_time_range(self):
         cfg = TunerConfig(max_core_time_seconds=100)
@@ -155,39 +158,30 @@ class TestNewConfigOptions:
         errors = cfg.validate()
         assert any("max_apparatus_retries" in e.lower() for e in errors)
 
-    def test_spectrum_tier_profile_validated(self):
-        good = TunerConfig(
-            hardening_tiers=[
-                {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "SMALL", "profile": "spectrum"},
-            ]
-        )
-        assert not any("profile" in e for e in good.validate())
-        bad = TunerConfig(
-            hardening_tiers=[
-                {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "SMALL", "profile": "bogus"},
-            ]
-        )
-        assert any("profile" in e for e in bad.validate())
-
-    def test_default_tiers_include_spectrum(self):
-        assert TunerConfig().hardening_tiers[-1]["profile"] == "spectrum"
-
 
 class TestEnduranceConfig:
     """The endurance workload matrix: thread counts, knob ranges, round-trip."""
 
     def _workload(self, **kw):
-        return {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "SMALL", **kw}
+        return {
+            "regime": "current",
+            "backend": "mprime",
+            "stress_mode": "SSE",
+            "fft_preset": "SMALL",
+            **kw,
+        }
 
-    @pytest.mark.parametrize("field", ["hardening_tiers", "endurance_workloads"])
+    @pytest.mark.parametrize("field", ["battery", "endurance_workloads"])
     @pytest.mark.parametrize("threads", [True, 0, -1, "2", 1.0])
     def test_non_positive_int_threads_rejected(self, field, threads):
         errors = TunerConfig(**{field: [self._workload(threads=threads)]}).validate()
         assert any(f"{field}[0].threads must be a positive integer" == e for e in errors)
 
-    @pytest.mark.parametrize("field", ["hardening_tiers", "endurance_workloads"])
-    def test_positive_int_threads_accepted(self, field):
-        assert TunerConfig(**{field: [self._workload(threads=2)]}).validate() == []
+    def test_positive_int_threads_accepted(self):
+        workloads = [dict(entry) for entry in TunerConfig().battery]
+        workloads[0]["threads"] = 2
+        assert TunerConfig(battery=workloads).validate() == []
+        assert TunerConfig(endurance_workloads=[self._workload(threads=2)]).validate() == []
 
     def test_endurance_requires_auto_validate(self):
         errors = TunerConfig(endurance=True, auto_validate=False).validate()
@@ -205,12 +199,7 @@ class TestEnduranceConfig:
 
     def test_endurance_json_roundtrip(self):
         cfg = TunerConfig(endurance=True)
-        restored = TunerConfig.from_json(cfg.to_json())
-        assert restored.endurance is True
-        assert restored.endurance_workloads == cfg.endurance_workloads
-        assert restored.endurance_workloads[0]["threads"] == 2
-        assert restored.endurance_slot_seconds == 600
-        assert restored.endurance_slot_max_seconds == 3600
+        assert TunerConfig.from_json(cfg.to_json()) == cfg
 
 
 class TestConfigValidationFailsClosed:
@@ -230,6 +219,45 @@ class TestConfigValidationFailsClosed:
     def test_zero_fine_step_rejected(self):
         errors = self._cfg(fine_step=0).validate()
         assert any("fine_step" in e for e in errors)
+
+    @pytest.mark.parametrize(
+        ("settings", "message"),
+        [
+            ({"apparatus_failure_streak": -1}, "apparatus_failure_streak must be 0-100 (0 disables)"),
+            (
+                {"apparatus_failure_streak": 2},
+                "apparatus_failure_streak must exceed max_confirm_retries (legitimate confirm retries would trip it)",
+            ),
+            ({"max_core_time_seconds": 1799}, "max_core_time_seconds must be 1800-14400"),
+            ({"regime_floor_pct": 0}, "regime_floor_pct must be 0-25"),
+            ({"control_run_confirmations": 0}, "control_run_confirmations must be 1-10"),
+            ({"probe_base_seconds": 59}, "probe_base_seconds must be 60-86400"),
+            ({"probe_mttf_multiplier": 0}, "probe_mttf_multiplier must be > 0"),
+            ({"probe_level_multiplier": 0.5}, "probe_level_multiplier must be >= 1"),
+            ({"probe_final_multiplier": 0.5}, "probe_final_multiplier must be >= 1"),
+            ({"suspicion_separation": 0.5}, "suspicion_separation must be >= 1"),
+            ({"suspicion_min_failures": 0}, "suspicion_min_failures must be >= 1"),
+            ({"anneal_bank_hours": 0}, "anneal_bank_hours must be > 0"),
+            ({"anneal_max_strikes": 0}, "anneal_max_strikes must be 1-10"),
+        ],
+    )
+    def test_battery_and_hunt_knob_ranges_are_rejected(self, settings, message):
+        assert self._cfg(**settings).validate() == [message]
+
+    def test_battery_must_not_be_empty(self):
+        assert self._cfg(battery=[]).validate() == ["battery must have at least one workload"]
+
+    def test_battery_must_cover_every_regime(self):
+        current = [entry for entry in TunerConfig().battery if entry["regime"] == "current"]
+        assert self._cfg(battery=current, coarse_regimes=["current"]).validate() == [
+            "battery does not cover regimes: boost, coupled, transient"
+        ]
+
+    def test_coarse_regimes_must_be_present_in_the_battery(self):
+        assert self._cfg(coarse_regimes=["unknown"]).validate() == ["coarse_regimes not present in battery: unknown"]
+
+    def test_at_least_one_coarse_regime_is_required(self):
+        assert self._cfg(coarse_regimes=[]).validate() == ["coarse_regimes must name at least one regime"]
 
     def test_each_invalid_numeric_field_is_rejected(self):
         cases = {

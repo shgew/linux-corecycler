@@ -116,6 +116,11 @@ def set_unattributed_crashes(db: HistoryDB, session_id: int, value: int) -> None
     db.set_unattributed_crashes(session_id, value)
 
 
+def set_hunt_state(db: HistoryDB, session_id: int, blob: str) -> None:
+    """Durably record bisection progress before the probe that may reboot us."""
+    db.set_hunt_state(session_id, blob)
+
+
 def set_hunting_core(db: HistoryDB, session_id: int, core_id: int | None) -> None:
     """Durably record which core an isolated hunt slot stresses, before it runs."""
     db.set_hunting_core(session_id, core_id)
@@ -187,6 +192,7 @@ def log_test_result(
     peak_stretch_pct: float | None = None,
     threads: int | None = None,
     profile: str | None = None,
+    regime: str | None = None,
 ) -> int:
     return db.insert_tuner_test_log(
         session_id,
@@ -204,6 +210,7 @@ def log_test_result(
         peak_stretch_pct=peak_stretch_pct,
         threads=threads,
         profile=profile,
+        regime=regime,
     )
 
 
@@ -225,11 +232,24 @@ def get_session_offsets(db: HistoryDB, session_id: int) -> dict[int, int]:
 # Live-evidence ledger
 # ---------------------------------------------------------------------------
 
-# Only all-offsets-live phases count as evidence. Isolation-mode search,
-# hardening and hunt slots run with every other core at stock, which holds the
-# shared VDDCR rail high and overstates what the profile survives in use.
+# Only all-offsets-live phases count as evidence. A hunt probe deliberately
+# parks cores at stock, which holds the shared VDDCR rail high and overstates
+# what the profile survives in use, so hunt slots never bank as evidence.
+# Ordinary search does run the live mask and does count.
 LIVE_EVIDENCE_PHASES = frozenset(
-    {"validate_s1", "validate_s2", "validate_s3", "validate_s5", "validate_s6", "endurance"}
+    {
+        "coarse",
+        "fine",
+        "confirm",
+        "backoff_preconfirm",
+        "backoff_confirm",
+        "validate_s1",
+        "validate_s2",
+        "validate_s3",
+        "validate_s5",
+        "validate_s6",
+        "endurance",
+    }
 )
 
 

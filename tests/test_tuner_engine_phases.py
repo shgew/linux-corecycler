@@ -15,6 +15,7 @@ import pytest
 from corecycler.engine.topology import CPUTopology, PhysicalCore
 from corecycler.history.db import HistoryDB
 from corecycler.tuner import engine as eng
+from corecycler.tuner import bisect
 from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine
@@ -208,36 +209,6 @@ class TestValidationOffsetWrites:
         assert engine.status == "paused"
 
 
-class TestIsolationWrites:
-    def test_other_cores_go_to_baseline(self, engine):
-        _confirm(engine, 1, -20)
-        assert engine._apply_co_isolation(0, -12) is True
-        assert engine._co_applied[1] == engine._core_states[1].baseline_offset
-        assert engine._co_applied[0] == -12
-
-    def test_a_rejected_baseline_revert_pauses(self, engine):
-        engine._co_applied[1] = -20
-        engine._smu.set_co_offset.return_value = False
-        assert engine._apply_co_isolation(0, -12) is False
-        assert engine.status == "paused"
-
-    def test_a_raising_baseline_revert_pauses(self, engine):
-        engine._co_applied[1] = -20
-        engine._smu.set_co_offset.side_effect = OSError("smu busy")
-        assert engine._apply_co_isolation(0, -12) is False
-        assert engine.status == "paused"
-
-    def test_a_raising_test_write_pauses(self, engine):
-        def _write(core, _value):
-            if core == 0:
-                raise OSError("smu busy")
-            return True
-
-        engine._smu.set_co_offset.side_effect = _write
-        assert engine._apply_co_isolation(0, -12) is False
-        assert engine.status == "paused"
-
-
 class TestParallelRowLogging:
     def _rows(self, engine, core_id):
         return tp.get_test_log(engine._db, engine._session_id, core_id=core_id)
@@ -356,99 +327,80 @@ class TestValidationSoak:
 
 
 class TestHuntSlots:
-    def _hunting(self, engine, queue):
-        engine._hunting = True
-        engine._hunt_queue = list(queue)
-        for cid in queue:
+    def _hunting(self, engine):
+        candidates = sorted(engine._core_states)
+        for cid in candidates:
             _confirm(engine, cid, -20)
-        for cid in engine._core_states:
-            if cid not in queue:
-                engine._co_applied[cid] = -15
+        engine._hunt = bisect.begin(candidates, loaded=[0])
+        engine._hunting = True
+        engine._set_status("hunting")
+        engine._save_hunt()
         return engine
 
-    def test_an_aborted_engine_runs_no_slot(self, engine):
-        self._hunting(engine, [0])
+    def _probing(self, engine):
+        self._hunting(engine)
+        assert bisect.next_live_set(engine._hunt) == []
+        bisect.record(
+            engine._hunt,
+            reproduced=False,
+            control_confirmations=engine._config.control_run_confirmations,
+            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
+        )
+        live, _ = bisect.split(sorted(engine._core_states))
+        engine._save_hunt()
+        return live
+
+    def test_an_aborted_engine_runs_no_probe(self, engine):
+        self._hunting(engine)
+        before = engine._hunt.to_json()
         engine._abort_requested = True
         engine._run_next_hunt_slot()
-        assert engine._hunt_queue == [0]
+        assert engine._hunt.to_json() == before
+        engine._start_worker.assert_not_called()
 
-    def test_a_paused_engine_runs_no_slot(self, engine):
-        self._hunting(engine, [0])
+    def test_a_paused_engine_runs_no_probe(self, engine):
+        self._hunting(engine)
+        before = engine._hunt.to_json()
         engine._paused = True
         engine._run_next_hunt_slot()
-        assert engine._hunt_queue == [0]
+        assert engine._hunt.to_json() == before
+        engine._start_worker.assert_not_called()
 
-    def test_a_slot_isolates_one_core_at_its_offset(self, engine):
-        self._hunting(engine, [0])
+    def test_a_probe_applies_the_live_offset_mask(self, engine):
+        live = self._probing(engine)
         engine._run_next_hunt_slot()
-        assert engine._co_applied[0] == -20
-        assert all(engine._co_applied[c] == 0 for c in (1, 2, 3))
+        assert live == [0, 1]
+        assert all(engine._co_applied[c] == -20 for c in live)
+        assert all(engine._co_applied[c] == 0 for c in (2, 3))
         assert engine._core_states[0].in_test is True
         assert engine._last_tested_core == 0
         engine._start_worker.assert_called_once()
 
-    def test_a_rejected_stock_write_pauses_the_hunt(self, engine):
-        self._hunting(engine, [0])
+    def test_a_rejected_mask_write_pauses_the_hunt(self, engine):
+        self._probing(engine)
         engine._smu.set_co_offset.return_value = False
         engine._run_next_hunt_slot()
         assert engine.status == "paused"
-        assert not engine._start_worker.called
+        engine._start_worker.assert_not_called()
 
-    def test_a_raising_stock_write_pauses_the_hunt(self, engine):
-        self._hunting(engine, [0])
+    def test_a_raising_mask_write_pauses_the_hunt(self, engine):
+        self._probing(engine)
         engine._smu.set_co_offset.side_effect = OSError("smu busy")
         engine._run_next_hunt_slot()
         assert engine.status == "paused"
+        engine._start_worker.assert_not_called()
 
-    def test_a_rejected_slot_write_pauses_the_hunt(self, engine):
-        self._hunting(engine, [0])
-        engine._smu.set_co_offset.side_effect = lambda core, _value: core != 0
+    def test_a_passing_control_probe_starts_bisection(self, engine, monkeypatch):
+        self._hunting(engine)
         engine._run_next_hunt_slot()
-        assert engine.status == "paused"
-        assert not engine._start_worker.called
-
-    def test_a_raising_slot_write_pauses_the_hunt(self, engine):
-        self._hunting(engine, [0])
-
-        def _write(core, _value):
-            if core == 0:
-                raise OSError("smu busy")
-            return True
-
-        engine._smu.set_co_offset.side_effect = _write
-        engine._run_next_hunt_slot()
-        assert engine.status == "paused"
-
-    def test_a_passing_slot_moves_to_the_next(self, engine, monkeypatch):
-        self._hunting(engine, [0, 1])
         queued = []
         monkeypatch.setattr(eng.QTimer, "singleShot", lambda _ms, fn: queued.append(fn))
         engine._on_hunt_slot_finished(0, True, "", {})
         assert queued
         assert engine._hunting is True
-
-    def test_an_unknown_core_is_skipped(self, engine, monkeypatch):
-        self._hunting(engine, [0])
-        queued = []
-        monkeypatch.setattr(eng.QTimer, "singleShot", lambda _ms, fn: queued.append(fn))
-        engine._on_hunt_slot_finished(99, False, "crash", {})
-        assert queued
-        assert engine._hunting is True
-
-    def test_a_failing_slot_names_the_culprit(self, engine):
-        self._hunting(engine, [0])
-        engine._co_applied[0] = -20
-        engine._on_hunt_slot_finished(0, False, "crash", {})
-        assert engine._hunting is False
-        assert engine.status == "running"
-        assert engine._core_states[0].crash_count == 1
-
-    def test_a_non_crash_failure_costs_one_step(self, engine):
-        self._hunting(engine, [0])
-        engine._co_applied[0] = -20
-        engine._on_hunt_slot_finished(0, False, "computation", {})
-        assert engine._core_states[0].crash_count == 0
-        assert engine._hunting is False
+        assert engine._hunt.stage is bisect.Stage.PROBE
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+        assert persisted == engine._hunt
 
 
 class TestApparatusFault:
@@ -464,12 +416,27 @@ class TestApparatusFault:
         engine._handle_apparatus_fault(0, "backend missing", "startup", {})
         assert engine.status in ("idle", "aborted")
 
-    def test_a_fault_during_a_hunt_requeues_the_slot(self, engine, monkeypatch):
+    def test_a_fault_during_a_hunt_requeues_the_probe(self, engine, monkeypatch):
+        for cid in engine._core_states:
+            _confirm(engine, cid, -20)
+        state = bisect.begin(sorted(engine._core_states), loaded=[0])
+        assert bisect.next_live_set(state) == []
+        bisect.record(
+            state,
+            reproduced=False,
+            control_confirmations=engine._config.control_run_confirmations,
+            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
+        )
+        in_flight = bisect.next_live_set(state)
+        engine._hunt = state
         engine._hunting = True
-        engine._hunt_queue = []
+        engine._save_hunt()
         monkeypatch.setattr(eng.QTimer, "singleShot", lambda _ms, _fn: None)
         engine._handle_apparatus_fault(0, "backend missing", "startup", {})
-        assert engine._hunt_queue == [0]
+        assert state.in_flight == []
+        assert state.queue[0] == in_flight
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+        assert persisted == state
 
     def test_a_fault_during_validation_reruns_the_stage(self, engine, monkeypatch):
         engine._validation_stage = 1
@@ -635,13 +602,24 @@ class TestVerdictRouter:
         assert worker.deleteLater.called
         assert engine._worker is None
 
-    def test_a_thermal_stop_during_a_hunt_retries_the_same_slot(self, engine):
+    def test_a_thermal_stop_during_a_hunt_retries_the_same_probe(self, engine):
+        state = bisect.HuntState(
+            stage=bisect.Stage.PROBE,
+            pending=[[0, 1, 2, 3]],
+            queue=[[2, 3]],
+            in_flight=[0, 1],
+            loaded=[0],
+        )
+        engine._hunt = state
         engine._hunting = True
-        engine._hunt_queue = []
+        engine._save_hunt()
         engine._on_test_finished(0, False, "too hot", "thermal", 1.0, 0.0)
-        assert engine._hunt_queue == [0]
+        assert state.in_flight == []
+        assert state.queue == [[0, 1], [2, 3]]
         assert engine._validation_thermal_aborts == 1
         assert engine._hunting is True
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+        assert persisted == state
 
     def test_repeated_thermal_stops_end_the_hunt_honestly(self, engine):
         engine._hunting = True
@@ -756,12 +734,34 @@ class TestAbortTeardown:
         assert engine._worker is None
         assert engine.status == "idle"
 
-    def test_aborting_a_hunt_clears_the_queue(self, engine):
+    def test_aborting_a_hunt_requeues_the_in_flight_probe(self, engine):
+        state = bisect.HuntState(
+            stage=bisect.Stage.PROBE,
+            pending=[[0, 1, 2, 3]],
+            queue=[[2, 3]],
+            in_flight=[0, 1],
+            parent=[0, 1, 2, 3],
+            found=[3],
+            exonerated=[2],
+            level=2,
+            loaded=[0],
+        )
+        engine._hunt = state
         engine._hunting = True
-        engine._hunt_queue = [1, 2]
+        engine._save_hunt()
+        worker = MagicMock()
+        worker.isRunning.return_value = True
+        worker.wait.return_value = True
+        engine._worker = worker
+        unchanged = (state.pending, state.found, state.exonerated, state.level)
         engine.abort()
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+        assert persisted.in_flight == []
+        assert persisted.queue == [[0, 1], [2, 3]]
+        assert (persisted.pending, persisted.found, persisted.exonerated, persisted.level) == unchanged
         assert engine._hunting is False
-        assert engine._hunt_queue == []
+        assert engine._worker is None
+        assert worker.scheduler.force_stop.called
 
 
 class TestWorkerLaunch:
@@ -772,7 +772,7 @@ class TestWorkerLaunch:
         monkeypatch.setattr(eng, "_TunerWorker", factory)
         return worker, factory
 
-    def test_an_unreadable_mode_or_preset_falls_back_to_a_safe_default(self, engine, monkeypatch):
+    def test_the_active_battery_workload_outranks_primary_defaults(self, engine, monkeypatch):
         from corecycler.engine.backends.base import FFTPreset, StressMode
 
         worker, factory = self._real_launch(engine, monkeypatch)
@@ -781,7 +781,7 @@ class TestWorkerLaunch:
         engine._start_worker(0, 1)
         assert worker.start.called
         scheduler = factory.call_args.args[2]
-        assert scheduler.stress_config.mode is StressMode.SSE
+        assert scheduler.stress_config.mode is StressMode.AVX2
         assert scheduler.stress_config.fft_preset is FFTPreset.SMALL
 
     def test_an_unbuildable_scheduler_is_an_apparatus_fault(self, engine, monkeypatch):
@@ -1012,20 +1012,6 @@ class TestLifecycleGuards:
         engine.pause()
         assert engine.status != "paused"
 
-    def test_an_empty_hunt_queue_ends_the_hunt(self, engine, monkeypatch):
-        engine._hunting = True
-        engine._hunt_queue = []
-        ended = []
-        monkeypatch.setattr(engine, "_end_hunt_fruitless", lambda: ended.append(True))
-        engine._run_next_hunt_slot()
-        assert ended == [True]
-
-    def test_ending_a_hunt_without_a_session_is_safe(self, engine):
-        engine._hunting = True
-        engine._session_id = None
-        engine._end_hunt_fruitless()
-        assert engine._hunting is False
-
     def test_a_quarantine_survives_a_failing_smu(self, engine, caplog):
         _confirm(engine, 0, -20)
         engine._smu.set_co_offset.side_effect = OSError("smu gone")
@@ -1204,11 +1190,11 @@ class TestResumeGuards:
         tp.journal_mark_survived(engine._db, sid)
         monkeypatch.setattr(eng, "_rebooted_since", lambda *_a, **_kw: True)
         monkeypatch.setattr(engine, "_forensics", lambda *_a, **_kw: ([], True))
-        hunts = []
-        monkeypatch.setattr(engine, "_start_hunt", lambda: hunts.append(True))
+        start_hunt = MagicMock()
+        monkeypatch.setattr(engine, "_start_hunt", start_hunt)
         engine._worker = None
         engine.resume(sid)
-        assert hunts == [True]
+        start_hunt.assert_called_once()
 
 
 class TestValidationStageWriteFailures:
@@ -1298,3 +1284,373 @@ class TestSearchArithmetic:
         assert cs.phase is TunerPhase.BACKOFF_PRECONFIRM
         assert cs.best_offset == 0
         assert cs.current_offset == 0
+
+
+class TestHuntDecisions:
+    def _probe(self, engine):
+        candidates = sorted(engine._core_states)
+        for core_id in candidates:
+            _confirm(engine, core_id, -20)
+        state = bisect.begin(candidates, loaded=[0])
+        assert bisect.next_live_set(state) == []
+        bisect.record(
+            state,
+            reproduced=False,
+            control_confirmations=engine._config.control_run_confirmations,
+            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
+        )
+        first = bisect.next_live_set(state)
+        engine._hunt = state
+        engine._hunting = True
+        engine._save_hunt()
+        return state, first
+
+    def test_two_stock_crashes_are_a_persisted_platform_fault(self, engine):
+        for core_id in engine._core_states:
+            _confirm(engine, core_id, -20)
+        engine._co_applied = dict.fromkeys(engine._core_states, -20)
+        engine._hunt = bisect.begin(sorted(engine._core_states), loaded=[0])
+        engine._hunting = True
+        engine._save_hunt()
+
+        assert bisect.next_live_set(engine._hunt) == []
+        engine._record_hunt_probe(reproduced=True)
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+        assert persisted.stage is bisect.Stage.CONTROL
+        assert persisted.control_fails == 1
+
+        assert bisect.next_live_set(engine._hunt) == []
+        engine._record_hunt_probe(reproduced=True)
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+        assert persisted.stage is bisect.Stage.PLATFORM
+
+        faults = []
+        engine.platform_fault.connect(faults.append)
+        engine._resolve_hunt()
+
+        session = tp.get_session(engine._db, engine._session_id)
+        assert engine.status == "quarantined"
+        assert session.status == "quarantined"
+        assert session.hunt_state == ""
+        assert faults == ["the machine failed with every core at stock"]
+        assert engine._co_applied == dict.fromkeys(engine._core_states, 0)
+        assert all(cs.crash_count == 0 for cs in engine._core_states.values())
+
+    def test_a_reproducing_half_is_recursed_into(self, engine):
+        state, guilty_half = self._probe(engine)
+        engine._record_hunt_probe(reproduced=True)
+        innocent_half = bisect.next_live_set(state)
+        assert set(guilty_half).isdisjoint(innocent_half)
+        engine._record_hunt_probe(reproduced=False)
+
+        assert state.pending == [guilty_half]
+        assert bisect.next_live_set(state) == guilty_half[:1]
+        engine._save_hunt()
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+        assert persisted.parent == guilty_half
+        assert persisted.in_flight == guilty_half[:1]
+
+    def test_two_reproducing_halves_become_independent_subproblems(self, engine):
+        state, first_half = self._probe(engine)
+        engine._record_hunt_probe(reproduced=True)
+        second_half = bisect.next_live_set(state)
+        engine._record_hunt_probe(reproduced=True)
+
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+        assert persisted.stage is bisect.Stage.PROBE
+        assert persisted.pending == [first_half, second_half]
+        assert bisect.next_live_set(state) == first_half[:1]
+
+    def test_non_reproduction_escalates_before_exhausting(self, engine):
+        state, _ = self._probe(engine)
+        while state.stage is bisect.Stage.PROBE:
+            engine._record_hunt_probe(reproduced=False)
+            if state.stage is bisect.Stage.PROBE:
+                assert bisect.next_live_set(state) is not None
+
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+        assert persisted.stage is bisect.Stage.EXHAUSTED
+        assert persisted.no_reproduce == engine._config.max_unattributed_crash_hunts
+        assert persisted.level > 1
+
+    def test_a_consumed_probe_state_becomes_an_exhausted_verdict(self, engine):
+        state = bisect.begin([0, 1], loaded=[0])
+        assert bisect.next_live_set(state) == []
+        bisect.record(
+            state,
+            reproduced=False,
+            control_confirmations=engine._config.control_run_confirmations,
+            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
+        )
+        state.pending.clear()
+
+        assert bisect.next_live_set(state) is None
+        assert state.stage is bisect.Stage.EXHAUSTED
+
+    def test_a_reproducing_probe_halves_exculpated_suspicion(self, engine):
+        state, live = self._probe(engine)
+        cleared = sorted(set(state.parent) - set(live))
+        accused_first = cleared[0]
+        still_live = live[0]
+        engine._core_states[accused_first].suspicion = 16.0
+        engine._core_states[still_live].suspicion = 10.0
+        for cs in engine._core_states.values():
+            tp.save_core_state(engine._db, engine._session_id, cs)
+
+        engine._record_hunt_probe(reproduced=True)
+
+        restored = tp.load_core_states(engine._db, engine._session_id)
+        assert restored[accused_first].suspicion == 8.0
+        assert restored[still_live].suspicion == 10.0
+        assert restored[still_live].suspicion > restored[accused_first].suspicion
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+        assert persisted.guilty_halves == [live]
+
+    @pytest.mark.parametrize(
+        ("failures", "scores", "expected"),
+        [
+            (2, (20.0, 1.0), None),
+            (3, (0.0, 0.0), None),
+            (3, (10.0, 6.0), None),
+            (3, (13.0, 6.0), 0),
+        ],
+    )
+    def test_statistical_verdict_requires_failures_and_separation(self, engine, failures, scores, expected):
+        for cs in engine._core_states.values():
+            cs.suspicion = 0.0
+        engine._core_states[0].suspicion, engine._core_states[1].suspicion = scores
+        tp.set_unattributed_crashes(engine._db, engine._session_id, failures)
+        for cs in engine._core_states.values():
+            tp.save_core_state(engine._db, engine._session_id, cs)
+
+        assert engine._suspicion_verdict() == expected
+        restored = tp.load_core_states(engine._db, engine._session_id)
+        assert (restored[0].suspicion, restored[1].suspicion) == scores
+
+    def test_exhausted_near_tie_continues_without_blame(self, engine):
+        for core_id in engine._core_states:
+            cs = _confirm(engine, core_id, -20)
+            cs.suspicion = 10.0 if core_id == 0 else 6.0 if core_id == 1 else 0.0
+            tp.save_core_state(engine._db, engine._session_id, cs)
+        tp.set_unattributed_crashes(engine._db, engine._session_id, engine._config.suspicion_min_failures)
+        engine._co_applied = dict.fromkeys(engine._core_states, -20)
+        engine._last_tested_core = 0
+        engine._hunt = bisect.HuntState(stage=bisect.Stage.EXHAUSTED, loaded=[0])
+        engine._hunting = True
+
+        engine._resolve_hunt()
+
+        restored = tp.load_core_states(engine._db, engine._session_id)
+        assert all(cs.best_offset == -20 for cs in restored.values())
+        assert all(cs.crash_count == 0 for cs in restored.values())
+        assert engine.status == "running"
+        assert tp.get_unattributed_crashes(engine._db, engine._session_id) == 0
+
+    def test_exhausted_clear_winner_is_demoted_and_loses_banked_evidence(self, engine):
+        for core_id in engine._core_states:
+            cs = _confirm(engine, core_id, -20)
+            cs.suspicion = 30.0 if core_id == 0 else 1.0
+            tp.save_core_state(engine._db, engine._session_id, cs)
+        tp.set_unattributed_crashes(engine._db, engine._session_id, engine._config.suspicion_min_failures)
+        engine._db.bank_regime_time("ctx", 0, "boost", -20, 600.0)
+        engine.context_hash = lambda: "ctx"
+        engine._co_applied = dict.fromkeys(engine._core_states, -20)
+        engine._last_tested_core = 0
+        engine._hunt = bisect.HuntState(stage=bisect.Stage.EXHAUSTED, loaded=[0])
+        engine._hunting = True
+
+        engine._resolve_hunt()
+
+        restored = tp.load_core_states(engine._db, engine._session_id)
+        assert restored[0].current_offset == -19
+        assert restored[0].suspicion == 0.0
+        assert all(restored[cid].current_offset == -20 for cid in (1, 2, 3))
+        assert engine._db.get_regime_banks("ctx", 0, -20) == {}
+
+    @pytest.mark.parametrize("failure", [False, OSError("smu gone")])
+    def test_failed_stock_restoration_stops_the_hunt(self, engine, failure):
+        _confirm(engine, 0, -20)
+        engine._co_applied[0] = -20
+        if isinstance(failure, Exception):
+            engine._smu.set_co_offset.side_effect = failure
+        else:
+            engine._smu.set_co_offset.return_value = failure
+
+        assert engine._restore_hunt_stock() is False
+        assert engine.status == "paused"
+        assert engine._co_applied[0] != 0
+
+    def test_platform_fault_with_no_live_candidates_is_final(self, engine):
+        faults = []
+        engine.platform_fault.connect(faults.append)
+        engine._start_hunt(loaded=[0])
+
+        assert engine.status == "quarantined"
+        assert faults == ["no core held a live offset at the time of the failure"]
+        assert tp.get_session(engine._db, engine._session_id).hunt_state == ""
+
+    def test_multi_core_control_probe_persists_the_replayed_load(self, engine, monkeypatch):
+        for core_id in engine._core_states:
+            _confirm(engine, core_id, -20)
+        engine._hunt = bisect.begin(sorted(engine._core_states), loaded=[0, 1])
+        engine._hunting = True
+        monkeypatch.setattr(engine, "_start_multi_core_worker", lambda *_a, **_kw: None)
+
+        engine._run_next_hunt_slot()
+
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+        assert persisted.stage is bisect.Stage.CONTROL
+        assert persisted.loaded == [0, 1]
+        assert engine._core_states[0].in_test is True
+        assert engine._core_states[1].in_test is True
+
+    def test_confirmed_time_is_not_counted_as_search_time(self, engine):
+        cs = _confirm(engine, 0, -20)
+        cs.cumulative_test_time = 120.0
+        engine._accumulate_test_time(cs, 60.0)
+        assert cs.cumulative_test_time == 120.0
+
+    def test_successful_quarantine_restores_stock_and_persists_it(self, engine):
+        for core_id in engine._core_states:
+            cs = _confirm(engine, core_id, -20)
+            cs.in_test = True
+            tp.save_core_state(engine._db, engine._session_id, cs)
+        engine._co_applied = dict.fromkeys(engine._core_states, -20)
+
+        engine._quarantine_session(3)
+
+        restored = tp.load_core_states(engine._db, engine._session_id)
+        assert engine.status == "quarantined"
+        assert engine._co_applied == dict.fromkeys(engine._core_states, 0)
+        assert all(not cs.in_test for cs in restored.values())
+
+
+class TestResumeAttributionLadder:
+    def test_baseline_confirmations_need_no_logged_proof(self, engine):
+        cs = _confirm(engine, 0, 0)
+        engine._reconcile_confirmed_evidence()
+        restored = tp.load_core_states(engine._db, engine._session_id)[0]
+        assert restored.phase is TunerPhase.CONFIRMED
+        assert restored.best_offset == cs.baseline_offset
+
+    def test_quarantined_resume_pulls_unproven_offsets_to_evidence(self, engine, monkeypatch):
+        sid = engine._session_id
+        for core_id in engine._core_states:
+            cs = _confirm(engine, core_id, -20)
+            tp.log_test_result(engine._db, sid, core_id, -10, "confirm", True, duration=60.0)
+            tp.journal_co_intent(engine._db, sid, core_id, -10, survived=True)
+            tp.save_core_state(engine._db, sid, cs)
+        tp.set_resume_crash_streak(engine._db, sid, 4)
+        tp.update_session_status(engine._db, sid, "quarantined")
+        monkeypatch.setattr(eng, "_rebooted_since", lambda *_a, **_kw: False)
+        engine._worker = None
+
+        engine.resume(sid)
+
+        restored = tp.load_core_states(engine._db, sid)
+        assert all(cs.best_offset == -10 for cs in restored.values())
+        assert all(cs.current_offset == -10 for cs in restored.values())
+        assert all(cs.crash_count == 0 for cs in restored.values())
+        assert tp.get_resume_crash_streak(engine._db, sid) == 0
+
+    @pytest.mark.parametrize(("prior", "expected_status"), [(0, "validating"), (1, "paused")])
+    def test_unattributed_validation_reboot_persists_an_owed_clean_pass(
+        self, engine, monkeypatch, prior, expected_status
+    ):
+        sid = engine._session_id
+        for core_id in engine._core_states:
+            cs = _confirm(engine, core_id, 0)
+            cs.baseline_offset = 0
+            cs.in_test = False
+            tp.save_core_state(engine._db, sid, cs)
+            tp.journal_co_intent(engine._db, sid, core_id, 0, survived=True)
+        tp.journal_mark_survived(engine._db, sid)
+        tp.set_hunting_core(engine._db, sid, None)
+        tp.update_session_status(engine._db, sid, "validating")
+        tp.set_validation_position(engine._db, sid, 4, 2, 1, False, "[]")
+        tp.set_unattributed_crashes(engine._db, sid, prior)
+        monkeypatch.setattr(eng, "_rebooted_since", lambda *_a, **_kw: True)
+        monkeypatch.setattr(eng, "last_boot_ended_cleanly", lambda **_kw: False)
+        monkeypatch.setattr(engine, "_forensics", lambda *_a, **_kw: ([], True))
+        engine._worker = None
+
+        engine.resume(sid)
+
+        session = tp.get_session(engine._db, sid)
+        assert session.status == expected_status
+        assert session.unattributed_crashes == prior + 1
+        assert session.validation_dirty == 1
+        if expected_status == "paused":
+            assert session.validation_stage == 4
+            assert session.validation_index == 2
+            assert session.validation_half == 1
+
+
+class TestRemainingHuntCoverage:
+    def test_completed_probe_state_resolves_to_a_persisted_culprit_verdict(self, engine):
+        for core_id in engine._core_states:
+            _confirm(engine, core_id, -20)
+        engine._hunt = bisect.HuntState(stage=bisect.Stage.CULPRIT, found=[0], loaded=[0])
+        engine._hunting = True
+        engine._save_hunt()
+
+        engine._run_next_hunt_slot()
+
+        restored = tp.load_core_states(engine._db, engine._session_id)
+        session = tp.get_session(engine._db, engine._session_id)
+        assert restored[0].current_offset == -19
+        assert all(restored[cid].current_offset == -20 for cid in (1, 2, 3))
+        assert session.hunt_state == ""
+        assert session.status == "running"
+
+    def test_failed_stock_restore_preserves_the_unresolved_incident(self, engine):
+        _confirm(engine, 0, -20)
+        engine._co_applied[0] = -20
+        engine._smu.set_co_offset.return_value = False
+        tp.set_unattributed_crashes(engine._db, engine._session_id, 2)
+
+        engine._after_hunt_resume()
+
+        assert engine.status == "paused"
+        assert tp.get_unattributed_crashes(engine._db, engine._session_id) == 2
+
+    def test_stock_cores_receive_no_suspicion_credit(self, engine):
+        for cs in engine._core_states.values():
+            cs.baseline_offset = 0
+            cs.current_offset = 0
+            cs.best_offset = 0
+            cs.suspicion = 0.0
+            tp.save_core_state(engine._db, engine._session_id, cs)
+
+        engine._credit_suspicion()
+
+        restored = tp.load_core_states(engine._db, engine._session_id)
+        assert all(cs.suspicion == 0.0 for cs in restored.values())
+
+    def test_resume_folds_the_reboot_into_the_persisted_probe(self, engine, monkeypatch):
+        sid = engine._session_id
+        for core_id in engine._core_states:
+            cs = _confirm(engine, core_id, -20)
+            cs.in_test = True
+            tp.save_core_state(engine._db, sid, cs)
+        state = bisect.begin(sorted(engine._core_states), loaded=[0])
+        assert bisect.next_live_set(state) == []
+        bisect.record(
+            state,
+            reproduced=False,
+            control_confirmations=engine._config.control_run_confirmations,
+            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
+        )
+        failed_live = bisect.next_live_set(state)
+        tp.set_hunt_state(engine._db, sid, state.to_json())
+        tp.update_session_status(engine._db, sid, "hunting")
+        monkeypatch.setattr(eng, "_rebooted_since", lambda *_a, **_kw: True)
+        monkeypatch.setattr(engine, "_apply_hunt_mask", lambda _live: True)
+        engine._worker = None
+
+        engine.resume(sid)
+
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, sid).hunt_state)
+        assert persisted is not None
+        assert persisted.guilty_halves == [failed_live]
+        assert set(persisted.in_flight).isdisjoint(failed_live)

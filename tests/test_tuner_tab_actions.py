@@ -370,7 +370,7 @@ class TestResumeSession:
 class TestAbort:
     def test_abort_releases_the_ui_and_repaints_every_core(self, tab):
         eng = _engine()
-        eng.core_states[1].phase = TunerPhase.HARDENED
+        eng.core_states[1].phase = TunerPhase.CONFIRMED
         tab._engine = eng
         tab._set_running_state(True)
         tab._active_test_core = 0
@@ -500,7 +500,7 @@ class TestEngineSignals:
 
     def test_a_new_worker_releases_the_previous_core(self, tab):
         tab._engine = _engine()
-        tab._engine.core_states[0].phase = TunerPhase.HARDENED
+        tab._engine.core_states[0].phase = TunerPhase.CONFIRMED
         tab._active_test_core = 0
         states = []
         tab.tuner_core_testing.connect(lambda c, s: states.append((c, s)))
@@ -616,6 +616,13 @@ class TestTicker:
 
 
 class TestLogTable:
+    def test_core_without_an_active_session_shows_no_last_result(self, tab):
+        tab._engine = _engine(session_id=None, cores=(0,))
+
+        tab._update_core_row(0)
+
+        assert tab._core_table.item(0, 10).text() == "-"
+
     def test_an_entry_without_a_session_is_dropped(self, tab):
         tab._add_log_entry(0, -30, True)
         assert tab._log_table.rowCount() == 0

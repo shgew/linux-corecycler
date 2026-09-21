@@ -7,6 +7,8 @@ import json
 import math
 from dataclasses import asdict, dataclass
 
+from corecycler.tuner import regime
+
 
 def _json_value_ok(default: object, value: object) -> bool:
     if isinstance(default, bool):
@@ -27,17 +29,8 @@ def _json_value_ok(default: object, value: object) -> bool:
 
 
 def _workload_errors(name: str, i: int, item: object) -> list[str]:
-    """Validate one workload/tier dict shared by hardening_tiers and endurance_workloads."""
-    if not isinstance(item, dict):
-        return [f"{name}[{i}] must be a dict"]
-    if not all(isinstance(item.get(k), str) for k in ("backend", "stress_mode", "fft_preset")):
-        return [f"{name}[{i}] requires string backend, stress_mode, fft_preset"]
-    if item.get("profile") not in (None, "sustained", "spectrum"):
-        return [f"{name}[{i}].profile must be sustained or spectrum"]
-    threads = item.get("threads")
-    if not (threads is None or (type(threads) is int and threads >= 1)):
-        return [f"{name}[{i}].threads must be a positive integer"]
-    return []
+    """Validate one workload entry shared by the battery and endurance lists."""
+    return regime.workload_errors(name, i, item)
 
 
 @dataclass(slots=True)
@@ -123,16 +116,38 @@ class TunerConfig:
     # Backoff tuning
     backoff_preconfirm_multiplier: float = 2.0
 
-    # Multi-mode hardening tiers (run after confirmation)
-    # profile "spectrum" runs the tier as light-load coverage (bursts,
-    # transitions, idle watch) instead of sustained stress.
-    hardening_tiers: list[dict[str, str | int]] = dataclasses.field(
-        default_factory=lambda: [
-            {"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL"},
-            {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "LARGE"},
-            {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "SMALL", "profile": "spectrum"},
-        ]
-    )
+    # The workload battery. Every slot runs the regimes this list covers, so
+    # an offset is never called good on the strength of one instruction mix.
+    battery: list[dict] = dataclasses.field(default_factory=lambda: [w.to_dict() for w in regime.DEFAULT_BATTERY])
+    # Coarse search runs only the fastest-failing regimes; the full battery
+    # starts at fine search, where a wrong answer actually costs something.
+    coarse_regimes: list[str] = dataclasses.field(default_factory=lambda: [str(r) for r in regime.COARSE_REGIMES])
+
+    # No regime may be starved below this share of slot time, however poorly
+    # it has performed: absence of failures in a regime is the thing being
+    # proven, so it can never be scheduled away entirely.
+    regime_floor_pct: float = 15.0
+
+    # Unattributed-failure pipeline. The control run tests the competing
+    # hypothesis that the platform, not the offsets, is at fault; it must
+    # reproduce this many times at stock before we call it a platform fault.
+    control_run_confirmations: int = 2
+    # Probe budget: max(base, mttf_multiplier x observed time-to-failure),
+    # grown per bisection level and again for the final single-core check,
+    # because a false clean near the leaves costs the whole answer.
+    probe_base_seconds: int = 1800
+    probe_mttf_multiplier: float = 4.0
+    probe_level_multiplier: float = 1.5
+    probe_final_multiplier: float = 4.0
+    # The statistical fallback only acts on a clear winner.
+    suspicion_separation: float = 2.0
+    suspicion_min_failures: int = 3
+
+    # Annealing: banked clean time in EVERY regime earns one probe a step
+    # deeper. A failed probe doubles the bar; this many strikes and the core
+    # stops probing that depth.
+    anneal_bank_hours: float = 6.0
+    anneal_max_strikes: int = 3
 
     # Per-core time budget for search phases (seconds)
     max_core_time_seconds: int = 7200
@@ -160,19 +175,12 @@ class TunerConfig:
     validate_soak: bool = True
     soak_duration_seconds: int = 1800
 
-    # Perpetual endurance after a clean validation pass: rounds of per-core and
-    # all-core slots over endurance_workloads, slot length doubling each round
-    # from endurance_slot_seconds up to endurance_slot_max_seconds. Never
-    # completes; a failing slot backs its core off one fine_step.
-    endurance: bool = False
-    endurance_workloads: list[dict[str, str | int]] = dataclasses.field(
-        default_factory=lambda: [
-            {"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL", "threads": 2},
-            {"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL", "threads": 1},
-            {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "SMALL", "threads": 1},
-            {"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "LARGE", "threads": 2},
-            {"backend": "mprime", "stress_mode": "SSE", "fft_preset": "SMALL", "profile": "spectrum"},
-        ]
+    # Perpetual endurance: the search never terminates, it converges and then
+    # keeps proving the vector, annealing a step deeper whenever a core has
+    # banked enough clean time in every regime. A failing slot demotes.
+    endurance: bool = True
+    endurance_workloads: list[dict] = dataclasses.field(
+        default_factory=lambda: [w.to_dict() for w in regime.DEFAULT_BATTERY]
     )
     endurance_slot_seconds: int = 600
     endurance_slot_max_seconds: int = 3600
@@ -244,8 +252,40 @@ class TunerConfig:
             )
         if not 1800 <= self.max_core_time_seconds <= 14400:
             errors.append("max_core_time_seconds must be 1800-14400")
-        for i, tier in enumerate(self.hardening_tiers):
-            errors.extend(_workload_errors("hardening_tiers", i, tier))
+        for i, entry in enumerate(self.battery):
+            errors.extend(_workload_errors("battery", i, entry))
+        if not errors and not self.battery:
+            errors.append("battery must have at least one workload")
+        if not errors:
+            covered = regime.regimes_covered(self.battery)
+            missing = sorted(str(r) for r in regime.Regime if r not in covered)
+            if missing:
+                errors.append(f"battery does not cover regimes: {', '.join(missing)}")
+            unknown_coarse = sorted(set(self.coarse_regimes) - {str(r) for r in covered})
+            if unknown_coarse:
+                errors.append(f"coarse_regimes not present in battery: {', '.join(unknown_coarse)}")
+            if not self.coarse_regimes:
+                errors.append("coarse_regimes must name at least one regime")
+        if not 0 < self.regime_floor_pct <= 100 / len(regime.Regime):
+            errors.append(f"regime_floor_pct must be 0-{100 / len(regime.Regime):.0f}")
+        if not 1 <= self.control_run_confirmations <= 10:
+            errors.append("control_run_confirmations must be 1-10")
+        if not 60 <= self.probe_base_seconds <= 86400:
+            errors.append("probe_base_seconds must be 60-86400")
+        if self.probe_mttf_multiplier <= 0:
+            errors.append("probe_mttf_multiplier must be > 0")
+        if self.probe_level_multiplier < 1:
+            errors.append("probe_level_multiplier must be >= 1")
+        if self.probe_final_multiplier < 1:
+            errors.append("probe_final_multiplier must be >= 1")
+        if self.suspicion_separation < 1:
+            errors.append("suspicion_separation must be >= 1")
+        if self.suspicion_min_failures < 1:
+            errors.append("suspicion_min_failures must be >= 1")
+        if self.anneal_bank_hours <= 0:
+            errors.append("anneal_bank_hours must be > 0")
+        if not 1 <= self.anneal_max_strikes <= 10:
+            errors.append("anneal_max_strikes must be 1-10")
         for i, workload in enumerate(self.endurance_workloads):
             errors.extend(_workload_errors("endurance_workloads", i, workload))
         if self.endurance and not self.auto_validate:

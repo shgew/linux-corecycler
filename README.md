@@ -40,7 +40,7 @@ Read this before using the Curve Optimizer features. Full scope in [SECURITY.md]
 - **Your BIOS PBO settings are never modified** -- only the runtime SMU state changes, and only when you explicitly write a value.
 - **Stress testing changes nothing** -- it only runs workloads pinned to cores; it writes no CO, voltage, or frequency.
 - **CO is written in only two places** -- the Curve Optimizer tab (per-core, each write behind a confirmation dialog, with dry-run and backup/restore) and the Auto-Tuner. They are mutually exclusive -- the tab is locked while the tuner runs.
-- **The automatic tuner is crash-safe** -- a CO write-ahead journal records every value before it is applied, CO=0 (stock) is the only floor it trusts, and a resume-crash circuit breaker forces all cores to stock and quarantines a profile that keeps crashing -- so no sequence of crashes, reboots, or resumes can loop the machine into re-crashing. See [Crash safety](docs/usage.md#crash-safety).
+- **The automatic tuner is crash-safe** -- a CO write-ahead journal records every value before it is applied, CO=0 (stock) is the only floor it trusts, and a profile that keeps crashing through resumes stops being guessed at: the attribution hunt drops every core to stock and bisects the offset mask until it names the core or proves the fault is not in the offsets -- so no sequence of crashes, reboots, or resumes can loop the machine into re-crashing. See [Crash safety](docs/usage.md#crash-safety) and [Flows](docs/usage.md#flows).
 - **Thermal protection** -- a configurable temperature limit (default 95C) pauses testing; the tuner fails closed if no temperature sensor is readable.
 
 ## Installation

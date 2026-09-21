@@ -44,11 +44,12 @@ def _tab(db):
     return TunerTab(db=db, topology=_topo(), smu=None)
 
 
-def _engine(sid, states):
+def _engine(sid, states, context_hash=""):
     eng = MagicMock()
     eng.session_id = sid
     eng.status = "validating"
     eng.core_states = states
+    eng.context_hash = lambda: context_hash
     return eng
 
 
@@ -57,17 +58,41 @@ def _sid(db):
 
 
 class TestCoreRow:
-    def test_update_core_row_creates_and_fills(self, db):
+    def test_update_core_row_shows_banked_evidence_not_just_a_phase(self, db):
+        """The row's job is to say how much the offset is worth.
+
+        The weakest regime is the headline number, so a core with hours in
+        three regimes and nothing in the fourth must still read as unproven.
+        """
         sid = _sid(db)
         tp.log_test_result(db, sid, 0, -30, "confirm", True, duration=60.0)
+        for regime in ("boost", "current", "transient"):
+            db.bank_regime_time("ctx", 0, regime, -30, 7200.0)
+        tab = _tab(db)
+        tab._engine = _engine(
+            sid,
+            {0: CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)},
+            context_hash="ctx",
+        )
+        tab._update_core_row(0)
+        assert tab._find_core_row(0) == 0
+        headers = [tab._core_table.horizontalHeaderItem(c).text() for c in range(tab._core_table.columnCount())]
+        assert tab._core_table.item(0, headers.index("Boost")).text() == "2.0h"
+        assert tab._core_table.item(0, headers.index("Coupled")).text() == "0.0h"
+        assert tab._core_table.item(0, headers.index("Proven")).text() == "0.0h"
+        assert tab._core_table.item(0, headers.index("Last Result")).text() == "PASS"
+
+    def test_core_row_reports_no_hours_without_a_context(self, db):
+        """Confidence is keyed to the operating point; with no context there
+        is nothing to key it to, and the row must not imply otherwise."""
+        sid = _sid(db)
         tab = _tab(db)
         tab._engine = _engine(
             sid, {0: CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)}
         )
         tab._update_core_row(0)
-        assert tab._find_core_row(0) == 0
-        assert tab._core_table.item(0, 5).text() == "1"
-        assert tab._core_table.item(0, 6).text() == "PASS"
+        headers = [tab._core_table.horizontalHeaderItem(c).text() for c in range(tab._core_table.columnCount())]
+        assert tab._core_table.item(0, headers.index("Proven")).text() == "0.0h"
 
     def test_update_core_row_no_engine_is_noop(self, db):
         tab = _tab(db)
@@ -80,29 +105,6 @@ class TestCoreRow:
         tab._engine = _engine(_sid(db), {})
         tab._update_core_row(9)
         assert tab._find_core_row(9) == -1
-
-
-class TestCounts:
-    def test_count_excludes_synthetic_resume_rows(self, db):
-        sid = _sid(db)
-        tp.log_test_result(db, sid, 0, -30, "confirm", True, duration=60.0)
-        tp.log_test_result(db, sid, 0, -30, "resume", False, duration=None)
-        tab = _tab(db)
-        tab._engine = _engine(sid, {})
-        assert tab._count_tests(0) == 1
-
-    def test_last_result_fail(self, db):
-        sid = _sid(db)
-        tp.log_test_result(db, sid, 0, -40, "search", False, error_msg="rounding", duration=30.0)
-        tab = _tab(db)
-        tab._engine = _engine(sid, {})
-        assert tab._last_result(0) == "FAIL"
-
-    def test_counts_zero_without_engine(self, db):
-        tab = _tab(db)
-        tab._engine = None
-        assert tab._count_tests(0) == 0
-        assert tab._last_result(0) == "-"
 
 
 class TestLogEntry:

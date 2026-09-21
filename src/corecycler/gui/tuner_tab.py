@@ -42,6 +42,7 @@ from corecycler.history.timefmt import format_local
 from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine
+from corecycler.tuner.regime import Regime
 from corecycler.tuner.state import TunerPhase
 
 if TYPE_CHECKING:
@@ -53,6 +54,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 _PHASE_TO_GRID = PHASE_TO_GRID
+_REGIMES: tuple[str, ...] = tuple(str(r) for r in Regime)
 
 ACTIVE_STATUSES = ("running", "validating", "hunting")
 
@@ -162,15 +164,19 @@ class TunerTab(QWidget):
 
         # Core status table
         self._core_table = QTableWidget()
-        self._core_table.setColumnCount(7)
+        # The phase a core is in is carried by the row colour; the columns
+        # carry the evidence, because "confirmed" without banked hours behind
+        # it is the claim this tuner exists to stop making.
+        self._core_table.setColumnCount(7 + len(_REGIMES))
         self._core_table.setHorizontalHeaderLabels(
             [
                 "Core",
                 "CCD",
-                "Phase",
                 "Current Offset",
                 "Best Offset",
-                "Tests Run",
+                "Proven",
+                *(r.capitalize() for r in _REGIMES),
+                "Suspicion",
                 "Last Result",
             ]
         )
@@ -341,8 +347,12 @@ class TunerTab(QWidget):
         stress_layout = QFormLayout(stress_group)
         stress_layout.setSpacing(6)
 
-        from corecycler.engine.backends import available_backends
+        from corecycler.engine.backends import available_backends, load_all
 
+        # Registration is an import side effect, so the registry only holds
+        # whatever happened to be imported already. Listing that is how a
+        # saved session's backend silently becomes unselectable.
+        load_all()
         self._backend_combo = QComboBox()
         self._backend_combo.addItems(available_backends())
         self._backend_combo.setToolTip(
@@ -574,7 +584,7 @@ class TunerTab(QWidget):
         for sess in sessions:
             core_states = tp.load_core_states(self._db, sess.id)
             total = len(core_states)
-            confirmed = sum(1 for cs in core_states.values() if cs.phase in (TunerPhase.CONFIRMED, TunerPhase.HARDENED))
+            confirmed = sum(1 for cs in core_states.values() if cs.phase is TunerPhase.CONFIRMED)
             started = format_local(sess.created_at) if sess.created_at else "?"
             last = format_local(sess.updated_at) if sess.updated_at else started
             label = (
@@ -943,15 +953,20 @@ class TunerTab(QWidget):
         core_info = self._topology.cores.get(core_id) if self._topology else None
         ccd = core_info.ccd if core_info else None
 
+        hours = self._regime_hours(core_id, cs.best_offset)
+        proven = min(hours.values()) if hours else 0.0
         items = [
             str(core_id),
             str(ccd) if ccd is not None else "-",
-            phase_label(cs.phase),
             str(cs.current_offset),
             str(cs.best_offset) if cs.best_offset is not None else "-",
-            str(self._count_tests(core_id)),
+            f"{proven:.1f}h",
+            *(f"{hours.get(r, 0.0):.1f}h" for r in _REGIMES),
+            f"{cs.suspicion:.1f}" if cs.suspicion else "-",
             self._last_result(core_id),
         ]
+        self._core_table.verticalHeaderItem(row)
+        self._core_table.setVerticalHeaderItem(row, QTableWidgetItem(phase_label(cs.phase)))
 
         color = QColor(theme.PHASE_COLORS[cs.phase])
         for col, text in enumerate(items):
@@ -959,27 +974,26 @@ class TunerTab(QWidget):
             item.setForeground(color)
             self._core_table.setItem(row, col, item)
 
+    def _regime_hours(self, core_id: int, offset: int | None) -> dict[str, float]:
+        """Clean hours banked per regime at the core's best offset.
+
+        No offset or no context means nothing has been banked yet, which is
+        reported as zero rather than hidden.
+        """
+        if offset is None or not self._db or not self._engine:
+            return {}
+        context = self._engine.context_hash()
+        if not context:
+            return {}
+        banks = self._db.get_regime_banks(context, core_id, offset)
+        return {r: banks.get(r, 0.0) / 3600.0 for r in _REGIMES}
+
     def _find_core_row(self, core_id: int) -> int:
         for row in range(self._core_table.rowCount()):
             item = self._core_table.item(row, 0)
             if item and item.text() == str(core_id):
                 return row
         return -1
-
-    @staticmethod
-    def _real_test_count(entries: list[dict]) -> int:
-        """Count real stress tests, excluding synthetic crash-on-resume rows.
-
-        A crash recovered on resume is logged with duration=None (it records a
-        reboot, not a stress run); counting it inflates "Tests Run".
-        """
-        return sum(1 for e in entries if e.get("duration_seconds") is not None)
-
-    def _count_tests(self, core_id: int) -> int:
-        if not self._db or not self._engine or not self._engine.session_id:
-            return 0
-        entries = tp.get_test_log(self._db, self._engine.session_id, core_id=core_id)
-        return self._real_test_count(entries)
 
     def _last_result(self, core_id: int) -> str:
         if not self._db or not self._engine or not self._engine.session_id:

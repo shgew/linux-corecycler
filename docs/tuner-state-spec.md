@@ -1,135 +1,152 @@
 # Tuner core state machine — transition specification
 
-The per-core state machine's ALLOWED transition relation, declared as data
-and exhaustively executed by `tests/test_state_transition_spec.py`: every
-(phase x outcome x offset-scenario) combination is driven through the real
-`_advance_core` / `_apply_crash_penalty`, and any transition outside this
-chart fails the suite. Safety invariants are asserted after every single
-transition. `docs/test-order-spec.md` covers which core gets tested next;
-this chart covers what happens to a core once it has a verdict.
+This document is the normative transition contract for one tuner core.
+`tests/test_state_transition_spec.py` executes the real `_advance_core`,
+`_on_test_finished`, `_apply_crash_penalty`, and annealing picker paths against
+this contract. `docs/test-order-spec.md` specifies which core is selected.
 
-## Verdict transitions (`_advance_core`)
+## Verdict transitions
+
+The destinations below are the complete phase relation after a slot has a
+verdict. A comma means the destination depends on bounds, retry counters, or
+the configured offset limit.
 
 | Phase | PASS -> | FAIL -> |
 |---|---|---|
-| NOT_STARTED | COARSE_SEARCH (entry step, verdict ignored) | COARSE_SEARCH |
-| COARSE_SEARCH | COARSE_SEARCH, SETTLED (hit max) | FINE_SEARCH, SETTLED, BACKOFF_PRECONFIRM (no passing coarse candidate) |
-| FINE_SEARCH | FINE_SEARCH, SETTLED | SETTLED |
-| SETTLED | CONFIRMING (baseline if no passing candidate) | same |
-| CONFIRMING | CONFIRMED (HARDENING_T1 with tiers) | CONFIRMING (retry), FAILED_CONFIRM |
-| FAILED_CONFIRM | BACKOFF_PRECONFIRM (baseline still needs testing) | same |
-| BACKOFF_PRECONFIRM | BACKOFF_PRECONFIRM (midpoint probe), BACKOFF_CONFIRMING | BACKOFF_PRECONFIRM, BACKOFF_CONFIRMING (retry pass bound); pause if baseline fails |
-| BACKOFF_CONFIRMING | CONFIRMED, BACKOFF_PRECONFIRM (midpoint; HARDENING_T1 with tiers) | BACKOFF_PRECONFIRM, BACKOFF_CONFIRMING; pause if baseline fails |
-| HARDENING_T1 | HARDENING_T2, HARDENED | HARDENING_T1 (back off and retest; pause if baseline fails) |
-| HARDENING_T2 | HARDENING_T1 (next tier), HARDENED | HARDENING_T2 (back off and retest; pause if baseline fails) |
-| CONFIRMED | CONFIRMED (absorbing) | CONFIRMED |
-| HARDENED | HARDENED (absorbing) | HARDENED |
+| `NOT_STARTED` | `COARSE_SEARCH` (entry step; verdict ignored) | `COARSE_SEARCH` (entry step; verdict ignored) |
+| `COARSE_SEARCH` | `COARSE_SEARCH`, `SETTLED` | `FINE_SEARCH`, `SETTLED`, `BACKOFF_PRECONFIRM` |
+| `FINE_SEARCH` | `FINE_SEARCH`, `SETTLED` | `SETTLED` |
+| `SETTLED` | `CONFIRMING` | `CONFIRMING` |
+| `CONFIRMING` | `CONFIRMED` | `CONFIRMING`, `FAILED_CONFIRM` |
+| `CONFIRMED` | `CONFIRMED` | `CONFIRMED` |
+| `FAILED_CONFIRM` | `BACKOFF_PRECONFIRM` | `BACKOFF_PRECONFIRM` |
+| `BACKOFF_PRECONFIRM` | `BACKOFF_PRECONFIRM`, `BACKOFF_CONFIRMING` | `BACKOFF_PRECONFIRM`, `BACKOFF_CONFIRMING`; pause if the baseline fails |
+| `BACKOFF_CONFIRMING` | `CONFIRMED`, `BACKOFF_PRECONFIRM` | `BACKOFF_PRECONFIRM`, `BACKOFF_CONFIRMING`; pause if the baseline fails |
+| `ANNEALING` | `CONFIRMED` and promote the probed offset | `CONFIRMED` and return to the prior best offset |
 
-## Hard-crash transitions (`_apply_crash_penalty`)
+`CONFIRMED` is the single resting phase. There are no hardening phases or
+hardening tiers.
 
-Every search/confirm/terminal phase is forced into BACKOFF_PRECONFIRM (a
-crash invalidates any confirmation); NOT_STARTED, SETTLED, FAILED_CONFIRM and
-BACKOFF_CONFIRMING keep their phase while the offsets back off. After every
-crash penalty: `best_offset` is set (never None), never more aggressive than
-the penalized current, the crashed value is a hard fail bound, and the
-penalty never overshoots past stock (CO=0).
+A core created with a seed (`tune --seed-from`) starts in `COARSE_SEARCH` at the
+seeded offset rather than in `NOT_STARTED`, so its first slot tests the seed
+instead of stepping past it, and its `baseline_offset` stays at the configured
+`start_offset`. Once running it obeys the table above unchanged.
+
+## Per-slot regime battery gate
+
+A state-machine PASS means that the current offset passed **every regime**
+required for that slot, not merely one workload:
+
+1. `_slot_regimes` uses the configured `coarse_regimes` during
+   `COARSE_SEARCH`. From `FINE_SEARCH` onward it uses every regime represented
+   in the configured battery. Regimes absent from the battery are omitted.
+2. Within that set, regimes are ordered by observed failure yield, subject to
+   the configured floor that prevents a regime with no failures from being
+   starved.
+3. `_battery_entry` selects a workload for the regime at `battery_index`.
+4. A PASS with regimes remaining increments `battery_index`, schedules the
+   next regime, and retests the **same offset in the same phase**. It does not
+   call `_advance_core`.
+5. A PASS of the final regime resets `battery_index` to zero and delivers one
+   PASS to `_advance_core`.
+6. A FAIL in any regime resets `battery_index` to zero and immediately
+   delivers one FAIL to `_advance_core`; later regimes in that slot are not
+   run.
+
+Thus a short failure is conclusive for the slot, while a short pass proves
+only one part of the battery. The battery gate also applies to `ANNEALING`.
+
+## Annealing loop
+
+Annealing lets a converged answer improve with accumulated real running time:
+
+1. Clean time is banked by `(context, core, regime, offset)`. The eligibility
+   value is the banked time in the **weakest regime**, i.e. the minimum across
+   every regime at the core's current `best_offset`.
+2. Only when no ordinary core is available may `_pick_next_core` fall through
+   to a `CONFIRMED` core whose weakest-regime bank meets its current bar. The
+   picker changes it to `ANNEALING`, sets `current_offset` one fine step deeper
+   than `best_offset`, and resets `battery_index`.
+3. The deeper offset must pass the complete regime battery. A complete PASS
+   promotes it to `best_offset`, returns to `CONFIRMED`, clears
+   `anneal_strikes`, and resets `anneal_bar_hours` to the configured
+   `anneal_bank_hours`.
+4. Any regime FAIL returns `current_offset` to the existing `best_offset`,
+   returns to `CONFIRMED`, increments `anneal_strikes`, and doubles the current
+   bar (using `anneal_bank_hours` as the initial bar).
+5. A core at the configured offset limit, or with
+   `anneal_strikes >= anneal_max_strikes`, is no longer an annealing candidate.
+
+## Hard-crash transitions
+
+`_apply_crash_penalty` records the crashed value as a hard fail bound, backs
+off without crossing stock, invalidates an overly aggressive best value, and
+applies crash cooldown bookkeeping. Its phase relation is:
+
+| Phase before crash | Phase after crash penalty |
+|---|---|
+| `COARSE_SEARCH` | `BACKOFF_PRECONFIRM` |
+| `FINE_SEARCH` | `BACKOFF_PRECONFIRM` |
+| `CONFIRMING` | `BACKOFF_PRECONFIRM` |
+| `CONFIRMED` | `BACKOFF_PRECONFIRM` |
+| `BACKOFF_PRECONFIRM` | `BACKOFF_PRECONFIRM` |
+| `NOT_STARTED` | `NOT_STARTED` |
+| `SETTLED` | `SETTLED` |
+| `FAILED_CONFIRM` | `FAILED_CONFIRM` |
+| `BACKOFF_CONFIRMING` | `BACKOFF_CONFIRMING` |
+| `ANNEALING` | `ANNEALING` |
+
+After every crash penalty, `best_offset` is set, the crashed value remains a
+fail bound, and neither `current_offset` nor `best_offset` crosses the safe
+stock floor.
 
 ## Guards that make the function total
 
-- **Contradictory evidence**: a PASS at/beyond the recorded fail bound must
-  not widen the bounds (failures outrank passes) — otherwise the backoff
-  binary search diverges toward more aggressive values. The pass is dropped
-  and the search steps back to just inside the fail bound.
-- **Normalization**: a persisted backoff-phase row with `best_offset = NULL`
-  (older versions, hand edits) is normalized to the baseline instead of
-  crashing the arithmetic.
-- **Persistence boundary**: reading or writing a core state with offsets
-  outside the sane CO range or negative counters raises — corruption is
-  rejected at the boundary, in both directions.
-- **Contradicted pass bounds**: a failure at a pass bound, or at a less aggressive
-  offset, invalidates that bound. Backoff must earn confirmation again.
-- **Baseline is not proof**: reaching stock or an inherited BIOS baseline does
-  not confirm or harden it. Baseline failures pause instead of certifying it.
-- **Time limit is not proof**: process the completed test's verdict first, then
-  pause an unfinished search when its per-core time budget is exceeded.
-- Midpoint acceleration preserves the actual failed probe as the fail bound.
-  A first coarse failure still searches the gap toward baseline in fine steps.
+- A PASS at or beyond a recorded fail bound cannot widen the bounds. Failure
+  evidence wins, and the search steps back inside the fail bound.
+- A persisted backoff state with `best_offset = NULL` is normalized to the
+  baseline before backoff arithmetic.
+- A failure at or less aggressive than a recorded pass bound invalidates that
+  pass bound.
+- Reaching stock or an inherited baseline is not proof. A baseline failure in
+  confirmation/backoff pauses rather than certifying it.
+- Offset limits are clamped, counters cannot become negative, and persistence
+  rejects corrupt states at the database boundary.
+- A completed verdict is processed before the per-core time budget can pause
+  an unfinished search.
 
-## Invariants (asserted after every transition in the sweep)
+## Verdicts that do not enter this relation
 
-1. Offsets never exceed `max_offset` in the aggressive direction.
-2. `backoff_pass_bound` is never more aggressive than `backoff_fail_bound`.
-3. Counters never go negative.
-4. Every produced state passes the persistence-boundary sanity guard.
+- `thermal`: cool down and retry the same slot; heat is not an offset verdict.
+- `startup`, `stall`, `killed`, or another apparatus fault: no stability
+  verdict is manufactured. Restore the applicable baseline and retry or pause
+  according to the instrument-failure breaker.
+- A worker result containing an unattributed machine check does not advance a
+  loaded core merely because it was loaded; it enters crash attribution.
 
-## Verdict classes that never enter this state machine
+## Crash attribution priority
 
-- `thermal` - cool down and retry without treating heat as an offset failure.
-  Independently observed MCEs still penalize the named cores, including the loaded core.
-- `startup` — environment fault: revert the offset, persist `in_test=0`,
-  pause. Never logged as a verdict, never marks the journal survived.
-- Contradictory-failure breaker trips pause after recording the new failure bound.
-  Earlier passes never erase newer failures. Workload identity includes backend,
-  instruction set, FFT preset, thread count and load profile.
+Resume binds evidence to the persisted boot and execution checkpoint before
+repairing session state. Reopening in the same boot does not apply another
+penalty. Attribution uses this strict priority:
 
-## Crash attribution on resume (`_attribute_crash_after_reboot`)
+1. **An in-flight attribution hunt owns the event.** Its persisted `hunt_state`
+   determines which mask was loaded and advances the hunt; ordinary attribution
+   must not corrupt that experiment.
+2. **Kernel MCE evidence naming a mapped, non-stock core** penalizes exactly
+   that core at its journaled resident offset. Evidence naming an unknown or
+   stock core is an instrument/evidence inconsistency, never permission to
+   blame a different core.
+3. **A persisted hunt slot** (`hunting_core`) attributes the crash to that slot.
+4. **The only core away from stock** is attributable when exactly one
+   journaled resident offset is non-zero.
+5. **Otherwise start or resume the attribution hunt.** It runs repeated stock
+   control probes with every core at CO=0, group-bisects the live-offset mask,
+   performs leave-one-out confirmation, and uses the persisted suspicion model
+   as the statistical fallback when deterministic isolation does not identify
+   one core.
 
-Reboot detection uses the persisted session boot ID before any resume-time repairs
-or narrative writes. Legacy sessions fall back to execution timestamps; metadata
-updates are not execution. Reopening within the same boot does not impose another
-crash penalty. Unavailable forensic history pauses before any CO restoration.
-
-Evidence outranks policy; a guess is never written. Priority order:
-
-1. Kernel-journal forensics from the exact persisted session boot, since the last
-   execution checkpoint: penalize exactly the cores the kernel's MCE lines name,
-   anchored at their journaled resident values. Stock or out-of-scope core evidence
-   pauses without penalizing another core. Initrd journal-stop records do not prove
-   that a boot ended cleanly.
-2. A persisted hunt slot (`tuner_sessions.hunting_core`): the box died while
-   one core was stressed alone with every other core at stock — proof by
-   isolation.
-3. A single in-test core in the SEARCH flow (isolation mode): direct blame.
-4. The CO journal's un-survived residents.
-5. Anything ambiguous (multi-core in-test set, or any crash under
-   validation, including a paused session with a persisted validation cursor):
-   penalize NOBODY; run the isolated crash hunt - per-core
-   slots at the tuned value with all other cores at stock, most suspect
-   first (prior MCE rows, crash history, deepest undervolt). A slot failure
-   convicts its core. Completed slots clear their persisted in-test markers before
-   another slot starts. A fruitless hunt restores every participating core to
-   stock without changing learned offsets; a failed restoration pauses and never
-   resumes validation. After `max_unattributed_crash_hunts` fruitless hunts in a
-   row the session pauses for the owner. Isolated passes do not prove that the
-   combined offset profile is stable.
-
-Cross-core MCE evidence during a live test uses `_apply_crash_penalty` with
-`steps=1, count_crash=False` for corrected errors (one-step backoff, re-earn
-confirmation, journal kept un-survived) and the full penalty for uncorrected
-ones - the same declared transition relation, so the chart above holds.
-
-Hardware-evidence backoff invalidates persisted clean-validation credit before
-leaving validation. Resuming preserves that debt even when loading an older
-cursor snapshot. Explicit Validate Profile first reconfirms each core and then
-runs the configured staged validation; it cannot skip stages just because the
-UI already reports validating.
-
-Endurance (`TunerConfig.endurance`) is validation stage 9: a session-level,
-perpetual confirmation loop entered instead of completion once a clean staged
-pass finishes. It changes no per-core transition - cores stay `HARDENED` and
-the chart above holds. Each round runs, per configured workload, one solo slot
-per core with every offset live followed by one all-core slot, with slot length
-doubling each round up to `endurance_slot_max_seconds`. A solo-slot failure is
-`_backoff_core` by one fine step and a retry of the same slot; an all-core-slot
-failure backs off the reported lane, re-tests it solo, then reruns the slot.
-Crash attribution treats stage 9 exactly like any other validation stage: the
-isolated hunt runs and nobody is convicted by guess. `unattributed_crashes`
-resets to 0 after every round that completed with no back-off. Endurance hunts
-replay the interrupted workload and at least its original duration in isolation.
-A sustained replay is followed on the same isolated core by a load/idle spectrum
-slot of `spectrum_slot_seconds`, using the same backend, mode, FFT preset and
-thread count. Thermal and apparatus retries remain in the interrupted sub-slot;
-only both passes advance to the next core. A workload that already uses the
-spectrum profile needs no duplicate spectrum slot.
-Hunt passes and non-verdict stops retain the resume-crash streak; a passing
-non-hunt test or a convicted hunt backoff clears it.
+A stability ambiguity never pauses the crash-attribution engine and never
+causes a guessed penalty: it becomes another hunt probe. This path pauses only
+for an instrument failure, such as unavailable boot forensics, contradictory
+stock/unknown evidence, or inability to apply or restore the requested mask.

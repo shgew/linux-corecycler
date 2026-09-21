@@ -30,7 +30,7 @@ def _single_core_topology() -> CPUTopology:
 def exec_dir():
     """A directory that can hold EXECUTABLE fixtures.
 
-    pytest's tmp_path lives under /tmp, which is mounted noexec on hardened
+    pytest's tmp_path lives under /tmp, which is mounted noexec on locked-down
     systems — the repo's own filesystem is the one place guaranteed exec.
     """
     with tempfile.TemporaryDirectory(prefix=".e2e-bin-", dir=Path(__file__).parent) as d:
