@@ -24,6 +24,25 @@
           "aarch64-linux"
         ];
 
+        # The sandbox strips .git, so setuptools-scm cannot read the tag. The
+        # version is the release line pyproject declares plus the commit the
+        # flake was evaluated from, the same shape setuptools-scm's
+        # node-and-date scheme emits. Both the store path and the wheel's
+        # METADATA carry it, so an installed build names its own commit.
+        scmVersion =
+          let
+            inherit (inputs) self;
+            base = (inputs.nixpkgs.lib.importTOML ./pyproject.toml).tool.setuptools_scm.fallback_version;
+            node =
+              if self ? shortRev then
+                "g${self.shortRev}"
+              else if self ? dirtyShortRev then
+                "g${inputs.nixpkgs.lib.removeSuffix "-dirty" self.dirtyShortRev}.dirty"
+              else
+                "d${builtins.substring 0 8 self.lastModifiedDate}";
+          in
+          "${base}+${node}";
+
         # Shared builder for a system: the FOSS `default` and the `full` (mprime,
         # unfree) variants from one mkCoreCycler. Used by both perSystem (default
         # -> a built check) and flake.packages (full -> an off-CI eval gate).
@@ -52,7 +71,7 @@
               }:
               pythonPkgs.buildPythonApplication {
                 pname = "corecycler${pnameSuffix}";
-                version = "0.0.1";
+                version = scmVersion;
                 pyproject = true;
 
                 src = ./.;
@@ -61,6 +80,8 @@
                   pythonPkgs.setuptools
                   pythonPkgs.setuptools-scm
                 ];
+
+                env.SETUPTOOLS_SCM_PRETEND_VERSION = scmVersion;
 
                 dependencies = [
                   pythonPkgs.pyside6
@@ -215,13 +236,23 @@
         };
 
         perSystem =
-          { system, ... }:
+          { system, config, ... }:
           let
             b = buildFor system;
           in
           {
             # The FOSS default builds on CI (stress-ng/stressapptest are cached).
             packages.default = b.default;
+
+            # The package's own build environment (interpreter, PySide6, pytest,
+            # hypothesis, pytest-cov) plus the standard's hook tools, so
+            # `python -m pytest` runs straight from `nix develop`.
+            devShells.default = inputs.nixpkgs.lib.mkForce (
+              inputs.std.lib.mkDevShell {
+                inherit config;
+                inherit (b) pkgs;
+              } { inputsFrom = [ b.default ]; }
+            );
 
             # Python lint gate — same config as pyproject [tool.ruff].
             pre-commit.settings.hooks.ruff.enable = true;
@@ -274,7 +305,7 @@
             }
             // inputs.nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
               user-containment = import ./nix/containment-test.nix {
-                pkgs = b.pkgs;
+                inherit (b) pkgs;
                 corecyclerModule = import ./nix/module.nix { inherit (inputs) self; };
               };
 
