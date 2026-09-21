@@ -132,6 +132,14 @@ Flake checks include `default`, `coverage`, `ruff`, `ruff-format`, `nixfmt`, `fu
 
 pytest (`pythonpath = ["src"]`, `testpaths = ["tests"]`) with Hypothesis. Markers: `slow`, `hardware`, `contract`. Register new markers in `pyproject.toml`.
 
+Test-driven development is required for every behavior change. Follow the cycle in order:
+
+1. **Red:** Before editing production code, add or change the smallest test that expresses the desired observable behavior. Run that test and confirm it fails for the expected reason; an unrelated failure or an immediately passing test does not establish the red step.
+2. **Green:** Make the smallest production change that satisfies the test, then rerun the targeted test until it passes.
+3. **Refactor:** Improve the production and test code without changing behavior, keeping the targeted test green, then run the relevant broader gate.
+
+Every bug fix starts with a regression test that reproduces the bug. Exercise hardware-dependent behavior through the existing hermetic seams; put external assumptions in the Ring A and Ring B contract tests. Documentation-only, comment-only, and formatting-only changes are exempt because they do not change behavior.
+
 ```bash
 python -m pytest -m "not slow" --cov=corecycler --cov-report=term --cov-fail-under=100
 python -m pytest -m "not slow" --cov=corecycler --cov-report=term-missing   # find gaps
