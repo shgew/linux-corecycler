@@ -832,4 +832,3 @@ class TestExternalOwnership:
         tab = _tab(db=db, topology=None, smu=_smu())
         tab._resume_session(sid)
         assert tab._engine is None
-

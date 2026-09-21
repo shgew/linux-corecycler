@@ -26,13 +26,24 @@ class TestTunerConfigDefaults:
         assert restored.direction == cfg.direction
         assert restored.cores_to_test == cfg.cores_to_test
 
-    @pytest.mark.parametrize("payload", [
-        '{broken', '[]', '{"max_temperatur_c": 80}', '{"max_temperature_c": "80"}',
-        '{"hardening_tiers": null}', '{"auto_validate": 1}', '{"start_offset": -10.5}',
-        '{"search_duration_seconds": NaN}', '{"over_temp_grace_seconds": Infinity}',
-        '{"cores_to_test": [0, "1"]}', '{"cores_to_test": [0, 0]}', '{"hardening_tiers": [7]}',
-        '{"hardening_tiers": [{"backend": [], "stress_mode": "SSE", "fft_preset": "SMALL"}]}',
-    ])
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            "{broken",
+            "[]",
+            '{"max_temperatur_c": 80}',
+            '{"max_temperature_c": "80"}',
+            '{"hardening_tiers": null}',
+            '{"auto_validate": 1}',
+            '{"start_offset": -10.5}',
+            '{"search_duration_seconds": NaN}',
+            '{"over_temp_grace_seconds": Infinity}',
+            '{"cores_to_test": [0, "1"]}',
+            '{"cores_to_test": [0, 0]}',
+            '{"hardening_tiers": [7]}',
+            '{"hardening_tiers": [{"backend": [], "stress_mode": "SSE", "fft_preset": "SMALL"}]}',
+        ],
+    )
     def test_invalid_json_is_rejected_instead_of_using_defaults(self, payload):
         with pytest.raises(ValueError):
             TunerConfig.from_json(payload)

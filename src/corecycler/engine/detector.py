@@ -78,7 +78,9 @@ def classify_mce_line(body: str) -> MCEEvent | None:
     if _is_mce_error_line(lower):
         cpu_m = _CPU_RE.search(lower)
         bank_m = _BANK_RE.search(lower)
-        corrected = bool(re.search(r"\bcorrected\b", lower)) and "uncorrect" not in lower
+        corrected = (
+            bool(re.search(r"\bcorrected\b", lower)) and "uncorrected" not in lower and "uncorrectable" not in lower
+        )
         return MCEEvent(
             timestamp=time.time(),
             cpu=int(cpu_m.group(1)) if cpu_m else -1,

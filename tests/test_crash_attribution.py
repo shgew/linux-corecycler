@@ -170,10 +170,7 @@ class TestForensicAttribution:
         """journalctl missing cannot prove an isolated core caused the reboot."""
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         session = _seed_hardened_validating(eng, db, BEST, BASELINES)
-        before = {
-            core: (cs.current_offset, cs.best_offset, cs.crash_count)
-            for core, cs in eng._core_states.items()
-        }
+        before = {core: (cs.current_offset, cs.best_offset, cs.crash_count) for core, cs in eng._core_states.items()}
         eng._forensics = lambda since, timeout=15.0, **kwargs: ([], False)
 
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
@@ -181,10 +178,7 @@ class TestForensicAttribution:
         assert crashed == []
         assert pending_hunt is False
         assert eng.status == "paused"
-        after = {
-            core: (cs.current_offset, cs.best_offset, cs.crash_count)
-            for core, cs in eng._core_states.items()
-        }
+        after = {core: (cs.current_offset, cs.best_offset, cs.crash_count) for core, cs in eng._core_states.items()}
         assert after == before
         assert eng._smu.written == {}
 
@@ -242,10 +236,7 @@ class TestForensicAttribution:
         assert crashed == []
         assert pending_hunt is False
         assert eng.status == "paused"
-        after = {
-            core: (cs.current_offset, cs.best_offset, cs.crash_count)
-            for core, cs in eng._core_states.items()
-        }
+        after = {core: (cs.current_offset, cs.best_offset, cs.crash_count) for core, cs in eng._core_states.items()}
         assert after == {0: (BEST[0], BEST[0], 0), 1: (BEST[1], BEST[1], 0)}
         assert eng._smu.written == {}
 
@@ -425,9 +416,7 @@ class TestHuntCrashBreaker:
         tp.set_resume_crash_streak(db, eng._session_id, 2)
         return eng._core_states[core_id]
 
-    def test_passing_hunt_slots_do_not_clear_the_resume_crash_streak(
-        self, db, topo_dual_ccd_x3d, mock_backend
-    ):
+    def test_passing_hunt_slots_do_not_clear_the_resume_crash_streak(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         self._active_hunt(eng, db)
 
@@ -448,9 +437,7 @@ class TestHuntCrashBreaker:
         assert tp.get_resume_crash_streak(db, eng._session_id) == 2
         assert (cs.current_offset, cs.best_offset, cs.backoff_fail_bound) == before
 
-    def test_a_hunt_failure_that_backs_off_the_core_clears_the_streak(
-        self, db, topo_dual_ccd_x3d, mock_backend
-    ):
+    def test_a_hunt_failure_that_backs_off_the_core_clears_the_streak(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         cs = self._active_hunt(eng, db)
         before = cs.current_offset

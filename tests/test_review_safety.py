@@ -31,8 +31,7 @@ def tuning(db, topo_single_ccd, mock_backend, monkeypatch):
     eng._session_id = tp.create_session(db, eng._config, "", "")
     eng._status = "running"
     eng._core_states = {
-        c: CoreState(core_id=c, phase=TunerPhase.CONFIRMED, current_offset=-20, best_offset=-20)
-        for c in (0, 1)
+        c: CoreState(core_id=c, phase=TunerPhase.CONFIRMED, current_offset=-20, best_offset=-20) for c in (0, 1)
     }
     for state in eng._core_states.values():
         tp.save_core_state(db, eng.session_id, state)
@@ -273,7 +272,7 @@ def test_backoff_floor_requires_confirmation_after_failed_probe(tuning, phase):
     assert cs.phase == TunerPhase.CONFIRMED
 
 
-def test_unparseable_kernel_timestamp_refuses_an_observation_window(monkeypatch):
+def test_unparsable_kernel_timestamp_refuses_an_observation_window(monkeypatch):
     result = MagicMock(returncode=0, stdout="[..] invalid timestamp", stderr="")
     monkeypatch.setattr("corecycler.engine.detector.subprocess.run", lambda *a, **kw: result)
     with pytest.raises(RuntimeError, match="baseline"):
@@ -283,8 +282,13 @@ def test_unparseable_kernel_timestamp_refuses_an_observation_window(monkeypatch)
 def test_idle_observation_failure_is_not_a_stability_verdict():
     detector = ErrorDetector()
     message = execution.watch_idle(
-        cpus=(0,), duration=0, thermal=MagicMock(), detector=detector,
-        stop_event=threading.Event(), observed=[], phase="idle",
+        cpus=(0,),
+        duration=0,
+        thermal=MagicMock(),
+        detector=detector,
+        stop_event=threading.Event(),
+        observed=[],
+        phase="idle",
     )
     assert execution.classify_error(message) == "startup"
 
@@ -310,9 +314,13 @@ def test_idle_thermal_stop_collects_concurrent_hardware_errors(monkeypatch):
     thermal.safe.return_value = False
     observed = []
     message = execution.watch_idle(
-        cpus=(0,), duration=1, thermal=thermal, detector=detector,
-        stop_event=threading.Event(), observed=observed, phase="idle",
+        cpus=(0,),
+        duration=1,
+        thermal=thermal,
+        detector=detector,
+        stop_event=threading.Event(),
+        observed=observed,
+        phase="idle",
     )
     assert execution.classify_error(message) == "thermal"
     assert [event.cpu for event in observed] == [1]
-

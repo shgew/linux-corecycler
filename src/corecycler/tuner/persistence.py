@@ -269,9 +269,7 @@ def evidence_summary(
         best = cs.best_offset if cs.best_offset is not None else cs.baseline_offset
         if direction * row["offset_tested"] < direction * best:
             continue
-        label = workload_label(
-            row["backend"], row["stress_mode"], row["fft_preset"], row["threads"], row["profile"]
-        )
+        label = workload_label(row["backend"], row["stress_mode"], row["fft_preset"], row["threads"], row["profile"])
         per_label = summary.setdefault(cs.core_id, {})
         per_label[label] = per_label.get(label, 0.0) + float(duration)
     return summary

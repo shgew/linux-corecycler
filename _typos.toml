@@ -1,0 +1,6 @@
+[default.extend-identifiers]
+CapInh = "CapInh"
+UE = "UE"
+confg = "confg"
+max_temperatur_c = "max_temperatur_c"
+ue = "ue"

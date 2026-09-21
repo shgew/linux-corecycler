@@ -59,9 +59,7 @@ class TestConfine:
     def test_empties_the_ambient_set_so_no_payload_inherits_raw_io(self):
         libc = FakeLibc(effective=_RAWIO_BIT)
         _confine_with(libc)
-        assert libc.prctl_calls == [
-            (capabilities._PR_CAP_AMBIENT, capabilities._PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)
-        ]
+        assert libc.prctl_calls == [(capabilities._PR_CAP_AMBIENT, capabilities._PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)]
 
     def test_keeps_the_capability_here_while_clearing_what_children_would_get(self):
         libc = FakeLibc(effective=_RAWIO_BIT)
@@ -127,8 +125,6 @@ class TestRealProcess:
         )
         out = subprocess.run([_sys.executable, "-c", script], capture_output=True, text=True, timeout=60)
         assert out.returncode == 0, out.stderr
-        sets = dict(
-            line.split(":", 1) for line in out.stdout.splitlines() if line.startswith(("CapInh", "CapAmb"))
-        )
+        sets = dict(line.split(":", 1) for line in out.stdout.splitlines() if line.startswith(("CapInh", "CapAmb")))
         assert int(sets["CapInh"], 16) == 0
         assert int(sets["CapAmb"], 16) == 0

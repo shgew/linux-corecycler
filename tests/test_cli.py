@@ -108,11 +108,18 @@ class TestArgHandling:
         assert cli.cli_main(args) == cli.EXIT_COMPLETED
         assert "corecycler tune" in capsys.readouterr().out
 
-    @pytest.mark.parametrize("args", [
-        [], ["tune", "--confg", "safe.json"], ["tune", "--config", "--help"],
-        ["tune", "--config", "a.json", "--config", "b.json"], ["resume", "--unknown"],
-        ["doctor", "unexpected"], ["status", "unexpected"],
-    ])
+    @pytest.mark.parametrize(
+        "args",
+        [
+            [],
+            ["tune", "--confg", "safe.json"],
+            ["tune", "--config", "--help"],
+            ["tune", "--config", "a.json", "--config", "b.json"],
+            ["resume", "--unknown"],
+            ["doctor", "unexpected"],
+            ["status", "unexpected"],
+        ],
+    )
     def test_bad_arguments_never_start_tuning(self, args, monkeypatch):
         monkeypatch.setattr(cli, "cmd_run", lambda **kw: pytest.fail("invalid arguments started tuning"))
         assert cli.cli_main(args) == cli.EXIT_REFUSED
@@ -187,8 +194,17 @@ class TestStatus:
             ),
         )
         tp.log_test_result(
-            db, sid, 0, -41, "endurance", True, duration=1200.0,
-            backend="mprime", stress_mode="AVX2", fft_preset="SMALL", threads=2,
+            db,
+            sid,
+            0,
+            -41,
+            "endurance",
+            True,
+            duration=1200.0,
+            backend="mprime",
+            stress_mode="AVX2",
+            fft_preset="SMALL",
+            threads=2,
         )
         tp.set_validation_position(db, sid, 9, 0, 0, False, "[]")
         tp.set_endurance_position(db, sid, 0, 0, 1)
@@ -268,14 +284,20 @@ class TestRunOutcomes:
         )
         assert code == cli.EXIT_REFUSED
 
-    @pytest.mark.parametrize("payload", ['{broken', '{"max_temperature_c": "80"}', '{"search_duration_seconds": NaN}'])
+    @pytest.mark.parametrize("payload", ["{broken", '{"max_temperature_c": "80"}', '{"search_duration_seconds": NaN}'])
     def test_corrupt_config_refused_before_engine_creation(self, db, tmp_path, payload):
         bad = tmp_path / "cfg.json"
         bad.write_text(payload)
-        assert cli.cmd_run(
-            str(bad), None, False,
-            engine_factory=lambda *_: pytest.fail("invalid config reached the engine"), db=db,
-        ) == cli.EXIT_REFUSED
+        assert (
+            cli.cmd_run(
+                str(bad),
+                None,
+                False,
+                engine_factory=lambda *_: pytest.fail("invalid config reached the engine"),
+                db=db,
+            )
+            == cli.EXIT_REFUSED
+        )
 
     def test_second_instance_locked(self, db, tmp_path):
         from PySide6.QtCore import QLockFile
@@ -305,11 +327,16 @@ class TestResumeConfigOverride:
         tp.update_session_status(db, sid, "completed")
         return sid
 
-    @pytest.mark.parametrize("args", [
-        ["resume", "--config", "f.json"], ["resume", "7", "f.json"],
-        ["resume", "7", "--config"], ["resume", "7", "--config", "--help"],
-        ["resume", "--config", "7", "f.json"],
-    ])
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["resume", "--config", "f.json"],
+            ["resume", "7", "f.json"],
+            ["resume", "7", "--config"],
+            ["resume", "7", "--config", "--help"],
+            ["resume", "--config", "7", "f.json"],
+        ],
+    )
     def test_malformed_invocations_never_start_tuning(self, args, monkeypatch):
         monkeypatch.setattr(cli, "cmd_run", lambda **kw: pytest.fail("invalid arguments started tuning"))
         assert cli.cli_main(args) == cli.EXIT_REFUSED

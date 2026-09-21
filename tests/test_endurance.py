@@ -255,9 +255,7 @@ class TestAllCoreWorkloadLaunch:
         worker = MagicMock()
         monkeypatch.setattr(engine_module, "_ParallelWorker", MagicMock(return_value=worker))
         runners = []
-        monkeypatch.setattr(
-            engine_module, "ParallelStress", lambda **kw: runners.append(kw) or MagicMock()
-        )
+        monkeypatch.setattr(engine_module, "ParallelStress", lambda **kw: runners.append(kw) or MagicMock())
 
         eng._start_multi_core_worker(
             ORDER, 600, workload={"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "LARGE", "threads": 1}
