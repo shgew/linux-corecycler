@@ -434,12 +434,12 @@ CPUINFO_ZEN4_7800X3D = _gen_cpuinfo(
     [(i, 0) for i in range(8)],
 )
 
-# Zen 4 X3D dual-CCD (7950X3D) — family 25, model 0x61, 16 cores (8+8)
-CPUINFO_ZEN4_7950X3D = _gen_cpuinfo(
-    25,
-    0x61,
-    "AMD Ryzen 9 7950X3D 16-Core Processor",
-    [(i, 0) for i in range(8)] + [(i, 0) for i in range(8)],
+# Zen 5 dual V-Cache (9950X3D2) — family 26, model 0x44, 16 cores (8+8), SMT: 32 logical
+CPUINFO_ZEN5_9950X3D2 = _gen_cpuinfo(
+    26,
+    0x44,
+    "AMD Ryzen 9 9950X3D2 16-Core Processor",
+    [(i, 0) for i in range(16)] + [(i, 0) for i in range(16)],
 )
 
 # Zen 4 Phoenix APU (7840U) — family 25, model 0x74, 8 cores

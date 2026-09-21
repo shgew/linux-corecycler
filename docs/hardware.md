@@ -26,7 +26,7 @@ AMD-specific.
 | Zen 4 (Dragon Range) | 7945HX, 7845HX | -50 to +30 | RSMU | PPT/TDC/EDC | Read/Write | Mobile, same silicon as Raphael |
 | Zen 4 (Storm Peak) | 7980X, 7970X TR | -50 to +30 | RSMU | PPT/TDC/EDC | Read/Write | Threadripper PRO |
 | Zen 5 (Granite Ridge) | 9600X, 9700X, 9900X, 9950X | -50 to +10 | RSMU | PPT/TDC/EDC | Read/Write | Widest negative CO range |
-| Zen 5 X3D (Granite Ridge) | 9800X3D, 9900X3D, 9950X3D | -50 to +10 | RSMU | PPT/TDC/EDC | Read/Write | V-Cache; same commands as Granite Ridge |
+| Zen 5 X3D (Granite Ridge) | 9800X3D, 9900X3D, 9950X3D, 9950X3D2 | -50 to +10 | RSMU | PPT/TDC/EDC | Read/Write | V-Cache on one CCD, or on both (9950X3D2); same commands as Granite Ridge |
 | Zen 5 (Strix Point) | Ryzen AI 9 HX 370 | -50 to +10 | MP1 set, RSMU get | PPT/TDC/EDC | Read/Write | Heterogeneous 4+8c, two CCX (set 0x4B/0x4C, get 0xAF); per-core index space publicly unresolved, all-core validated |
 | Zen 5 (Krackan Point) | Ryzen AI 7 350, AI 5 330 | -50 to +10 | MP1 set, RSMU get | PPT/TDC/EDC | Read/Write | Heterogeneous 4+4c / 1+3c (models 0x60/0x68); Strix commands |
 | Zen 5 (Strix Halo) | Ryzen AI Max | -50 to +10 | MP1 set, RSMU get | PPT/TDC/EDC | Read/Write | Classic 8-core CCDs, Strix commands; CO tuning unverified on this die |

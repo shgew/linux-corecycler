@@ -44,7 +44,6 @@ def _topo(cores: int = 2) -> CPUTopology:
         smt_enabled=True,
         ccds=2,
         is_x3d=True,
-        vcache_ccd=0,
     )
     for cid in range(cores):
         topo.cores[cid] = PhysicalCore(core_id=cid, ccd=cid, ccx=None, logical_cpus=(cid, cid + 8))
