@@ -10,6 +10,7 @@ from corecycler.tuner import bisect
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.persistence import (
     create_session,
+    evidence_summary,
     get_active_session,
     get_best_profile,
     get_latest_session,
@@ -131,10 +132,14 @@ class TestTunerSessions:
         assert get_session(db, 999) is None
 
     def test_hunt_state_round_trips_as_a_serialized_state_machine(self, db):
-        sid = create_session(db, TunerConfig(), "", "")
+        context_id = db.create_context(TuningContextRecord(bios_version="1.0", co_hash="ctx"))
+        sid = create_session(db, TunerConfig(), "", "", context_id=context_id)
         hunt = bisect.begin([0, 1, 2, 3], loaded=[1, 3])
-        hunt.control_fails = 1
-        hunt.level = 2
+        assert bisect.next_live_set(hunt) == []
+        bisect.record(hunt, reproduced=True, control_confirmations=2, max_no_reproduce=2)
+        assert bisect.next_live_set(hunt) == []
+        bisect.record(hunt, reproduced=False, control_confirmations=2, max_no_reproduce=2)
+        assert bisect.next_live_set(hunt) == [0, 1]
         tp_blob = hunt.to_json()
 
         set_hunt_state(db, sid, tp_blob)
@@ -264,17 +269,44 @@ class TestTestLog:
         assert e["duration_seconds"] == pytest.approx(45.5)
 
 
+class TestEvidenceSummary:
+    def test_legacy_search_is_excluded_without_dropping_validation_evidence(self, db):
+        context_id = db.create_context(TuningContextRecord(bios_version="1.0", co_hash="ctx"))
+        sid = create_session(db, TunerConfig(), "", "", context_id=context_id)
+        common = dict(backend="mprime", stress_mode="AVX2", fft_preset="SMALL")
+        log_test_result(db, sid, 0, -10, "coarse", True, duration=600.0, **common)
+        log_test_result(db, sid, 0, -10, "fine", True, duration=60.0, regime="current", **common)
+        log_test_result(db, sid, 0, -10, "validate_s1", True, duration=120.0, **common)
+        log_test_result(db, sid, 0, -10, "endurance", True, duration=180.0, **common)
+
+        summary = evidence_summary(db, sid, {0: CoreState(core_id=0, best_offset=-10)}, direction=-1)
+
+        assert summary == {0: {"mprime AVX2 SMALL": 360.0}}
+
+    def test_promoted_annealing_offset_contributes_evidence(self, db):
+        context_id = db.create_context(TuningContextRecord(bios_version="1.0", co_hash="ctx"))
+        sid = create_session(db, TunerConfig(), "", "", context_id=context_id)
+        common = dict(backend="mprime", stress_mode="AVX2", fft_preset="SMALL", regime="boost")
+        log_test_result(db, sid, 0, -10, TunerPhase.ANNEALING, True, duration=30.0, **common)
+        log_test_result(db, sid, 0, -11, TunerPhase.ANNEALING, True, duration=90.0, **common)
+
+        summary = evidence_summary(db, sid, {0: CoreState(core_id=0, best_offset=-11)}, direction=-1)
+
+        assert summary == {0: {"mprime AVX2 SMALL": 90.0}}
+
+
 class TestRegimeBanks:
     def test_clean_time_accumulates_per_regime_and_clear_is_core_scoped(self, db):
-        db.bank_regime_time("ctx", 0, "boost", -20, 30.0)
-        db.bank_regime_time("ctx", 0, "boost", -20, 45.0)
-        db.bank_regime_time("ctx", 0, "current", -20, 60.0)
-        db.bank_regime_time("ctx", 1, "boost", -18, 90.0)
+        context_id = db.create_context(TuningContextRecord(bios_version="1.0", co_hash="ctx"))
+        db.bank_regime_time(context_id, 0, "boost", -20, 30.0)
+        db.bank_regime_time(context_id, 0, "boost", -20, 45.0)
+        db.bank_regime_time(context_id, 0, "current", -20, 60.0)
+        db.bank_regime_time(context_id, 1, "boost", -18, 90.0)
 
-        assert db.get_regime_banks("ctx", 0, -20) == {"boost": 75.0, "current": 60.0}
-        db.clear_regime_banks("ctx", 0)
-        assert db.get_regime_banks("ctx", 0, -20) == {}
-        assert db.get_regime_banks("ctx", 1, -18) == {"boost": 90.0}
+        assert db.get_regime_banks(context_id, 0, -20) == {"boost": 75.0, "current": 60.0}
+        db.clear_regime_banks(context_id, 0)
+        assert db.get_regime_banks(context_id, 0, -20) == {}
+        assert db.get_regime_banks(context_id, 1, -18) == {"boost": 90.0}
 
     def test_regime_yield_groups_failures_and_time_by_context(self, db):
         context_id = db.create_context(TuningContextRecord(bios_version="1.0", co_hash="ctx"))
@@ -287,7 +319,7 @@ class TestRegimeBanks:
         other_sid = create_session(db, TunerConfig(), "1.0", "CPU", context_id=other_id)
         log_test_result(db, other_sid, 0, -20, "fine", False, duration=999.0, regime="boost")
 
-        assert db.regime_yield("ctx") == {"boost": (1, 90.0), "current": (1, 40.0)}
+        assert db.regime_yield(context_id) == {"boost": (1, 90.0), "current": (1, 40.0)}
 
 
 class TestBestProfile:

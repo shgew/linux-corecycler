@@ -3,7 +3,8 @@
 They fail loudly if an upstream y-cruncher update breaks a backend assumption
 (CLI flags, algorithm names, output format, or the kill-signal exit code),
 rather than letting the fixture-based unit tests pass on stale assumptions.
-Skipped only when no y-cruncher binary is present.
+The tests skip when no y-cruncher binary is present unless hardware-contract
+mode requires the resource.
 """
 
 from __future__ import annotations
@@ -22,9 +23,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from corecycler.engine.backends.base import KILLED_BY_US_CODES, StressConfig, StressMode
-from corecycler.engine.backends.ycruncher import MODE_TO_ALGORITHMS, YCruncherBackend
+from corecycler.engine.backends.ycruncher import VALID_COMPONENT_TESTS, YCruncherBackend
+from tests._contract_hw import require
 
-pytestmark = pytest.mark.slow
+pytestmark = [pytest.mark.slow, pytest.mark.contract]
 
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -41,12 +43,15 @@ def _discover_binary() -> str | None:
 
 _BINARY = _discover_binary()
 _WORKDIR = str(Path(_BINARY).parent) if _BINARY else "."
-_MAPPED_ALGORITHMS = sorted({algo for algos in MODE_TO_ALGORITHMS.values() for algo in algos})
+_COMPONENT_TESTS = sorted(VALID_COMPONENT_TESTS)
 
-requires_ycruncher = pytest.mark.skipif(
-    _BINARY is None,
-    reason="no y-cruncher binary (set YCRUNCHER_BIN or put y-cruncher on PATH)",
-)
+
+@pytest.fixture(autouse=True)
+def _require_ycruncher() -> None:
+    require(
+        _BINARY is not None,
+        "no y-cruncher binary (set YCRUNCHER_BIN or put y-cruncher on PATH)",
+    )
 
 
 def _run(args: list[str], run_seconds: float) -> tuple[int, str]:
@@ -77,7 +82,6 @@ def _stress(algorithms: list[str], run_seconds: float) -> tuple[int, str]:
     )
 
 
-@requires_ycruncher
 class TestYCruncherBinaryContract:
     def test_backend_command_reaches_stress_loop(self):
         backend = YCruncherBackend()
@@ -103,8 +107,8 @@ class TestYCruncherBinaryContract:
             "y-cruncher stopped emitting the 'Running <algo>: Passed' line the backend was built against"
         )
 
-    @pytest.mark.parametrize("algo", _MAPPED_ALGORITHMS)
-    def test_mapped_algorithm_still_accepted(self, algo):
+    @pytest.mark.parametrize("algo", _COMPONENT_TESTS)
+    def test_valid_component_test_still_accepted(self, algo):
         rc, out = _stress([algo], 3)
         assert "Invalid Parameter" not in out, f"y-cruncher rejected {algo!r}; upstream may have renamed it"
         assert "Start Stress-Testing!" in out

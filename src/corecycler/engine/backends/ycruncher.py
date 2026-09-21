@@ -42,12 +42,12 @@ class YCruncherBackend(StressBackend):
     name = "y-cruncher"
 
     def get_command(self, config: StressConfig, work_dir: Path) -> list[str]:
-        binary = self.require_binary()
-        memory_mib = config.memory_mb if config.memory_mb and config.memory_mb > 0 else _DEFAULT_MEMORY_MIB
         algorithms = config.tests if config.tests is not None else MODE_TO_ALGORITHMS.get(config.mode, ())
         unknown_tests = sorted(set(algorithms) - VALID_COMPONENT_TESTS)
         if unknown_tests:
             raise ValueError(f"Unknown y-cruncher component test(s): {', '.join(unknown_tests)}")
+        binary = self.require_binary()
+        memory_mib = config.memory_mb if config.memory_mb and config.memory_mb > 0 else _DEFAULT_MEMORY_MIB
         test_seconds = max(config.test_seconds if config.test_seconds is not None else _PER_TEST_SECONDS, 1)
         cmd = [
             binary,

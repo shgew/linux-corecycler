@@ -55,6 +55,9 @@ class _LaneRun:
     last_active: float = 0.0
     last_watchdog: float = 0.0
     prev_times: dict[int, tuple[int, int]] = field(default_factory=dict)
+    last_stall_check: float | None = None
+    observed_duty_idle_seconds: float = 0.0
+    inactive_runnable_seconds: float = 0.0
     unit: str | None = None
     cgroup: str | None = None
     stdout: str = ""
@@ -67,7 +70,7 @@ class _LaneRun:
 
     @property
     def running(self) -> bool:
-        return self.verdict is None and self.proc is not None and self.proc.poll() is None
+        return self.verdict is None and self.proc is not None and self.proc.returncode is None
 
 
 @dataclass(slots=True)
@@ -168,21 +171,56 @@ def make_preexec():
     return _preexec
 
 
+def _exited_without_reaping(proc: subprocess.Popen) -> bool:
+    if proc.returncode is not None:
+        return True
+    try:
+        return os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    except ChildProcessError:
+        return True
+    except OSError:
+        return False
+
+
+def _wait_for_exit_without_reaping(proc: subprocess.Popen, timeout: float) -> bool | None:
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            exited = os.waitid(os.P_PID, proc.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+        except (ChildProcessError, OSError):
+            return None
+        if exited is not None:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
+
+
 def kill_process_group(proc: subprocess.Popen) -> None:
     try:
         pgid = os.getpgid(proc.pid)
     except ProcessLookupError:
-        pgid = proc.pid
-    if pgid != proc.pid:
-        raise RuntimeError("Refusing to signal an unowned process group")
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(pgid, signal.SIGTERM)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=3)
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(pgid, signal.SIGKILL)
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        proc.wait(timeout=2)
+        pgid = None
+    if pgid is not None:
+        if pgid != proc.pid:
+            raise RuntimeError("Refusing to signal an unowned process group")
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGTERM)
+        observed_exit = _wait_for_exit_without_reaping(proc, 3)
+        if observed_exit is None:
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(pgid, signal.SIGKILL)
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(timeout=2)
+        else:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(pgid, signal.SIGKILL)
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(timeout=2)
     for stream in (proc.stdout, proc.stderr):
         if stream:
             with contextlib.suppress(OSError):
@@ -311,6 +349,9 @@ class Supervisor:
             return False
         run.started_at = time.monotonic()
         run.last_active = run.started_at
+        run.last_stall_check = run.started_at
+        if run.duty_driver is not None:
+            run.observed_duty_idle_seconds = getattr(run.duty_driver, "intentional_idle_seconds", 0.0)
         return True
 
     def _poll_until_done(self, runs: list[_LaneRun], start: float, duration: float) -> None:
@@ -390,7 +431,7 @@ class Supervisor:
         for run in runs:
             if run.verdict is not None or run.proc is None:
                 continue
-            rc = run.proc.poll()
+            rc = self._poll_process(run, start)
             if rc is not None:
                 self._drain(run)
                 if run.verdict is not None:
@@ -460,6 +501,24 @@ class Supervisor:
                 return self.stop_on_first_failure
         return False
 
+    def _poll_process(self, run: _LaneRun, start: float) -> int | None:
+        proc = run.proc
+        if proc is None or not _exited_without_reaping(proc):
+            return None
+        self._stop_duty_driver(run, start)
+        return proc.poll()
+
+    def _stop_duty_driver(self, run: _LaneRun, start: float) -> None:
+        driver = run.duty_driver
+        if driver is None:
+            return
+        run.duty_driver = None
+        try:
+            driver.stop()
+        except RuntimeError as exc:
+            log.error("core %d: duty-cycle driver failed to stop: %s", run.lane.core_id, exc)
+            self._fail(run, f"Failed to stop duty-cycle driver: {exc}", start, error_type="startup")
+
     def _containment_fault(self, run: _LaneRun, now: float) -> str | None:
         if run.proc is None or run.unit is None:
             return None
@@ -497,10 +556,17 @@ class Supervisor:
                 any_sample = True
                 if busy > 0.05:
                     active = True
-        if active or not any_sample:
+        duty_idle = run.duty_driver.intentional_idle_seconds if run.duty_driver is not None else 0.0
+        previous_check = run.last_stall_check
+        run.last_stall_check = now
+        idle_delta = max(0.0, duty_idle - run.observed_duty_idle_seconds)
+        run.observed_duty_idle_seconds = duty_idle
+        if active or not any_sample or previous_check is None:
+            run.inactive_runnable_seconds = 0.0
             run.last_active = now
             return False
-        return now - run.last_active > self.stall_timeout
+        run.inactive_runnable_seconds += max(0.0, now - previous_check - idle_delta)
+        return run.inactive_runnable_seconds > self.stall_timeout
 
     def _drain(self, run: _LaneRun) -> None:
 
@@ -538,11 +604,10 @@ class Supervisor:
         elapsed = time.monotonic() - start
         interrupted = self.stop_event.is_set() and elapsed < duration
         for run in runs:
-            if run.duty_driver is not None:
-                run.duty_driver.stop()
+            self._stop_duty_driver(run, start)
             if run.proc is None:
                 continue
-            run.we_killed = run.proc.poll() is None
+            run.we_killed = not _exited_without_reaping(run.proc)
             try:
                 kill_process_group(run.proc)
                 if run.proc.poll() is None:

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
+
+import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
@@ -46,6 +49,13 @@ class TestTunerConfigValidation:
     def test_battery_unknown_profile(self):
         entry = {**TunerConfig().battery[0], "profile": "unknown"}
         assert _errors(battery=[entry]) == ["battery[0].profile must be one of ['spectrum', 'sustained', 'transient']"]
+
+    @pytest.mark.parametrize("value", [True, 1, None, [], {}, "unknown"])
+    def test_coarse_regime_elements_are_rejected_from_json(self, value):
+        with pytest.raises(ValueError) as exc_info:
+            TunerConfig.from_json(json.dumps({"coarse_regimes": [value]}))
+
+        assert str(exc_info.value) == ("coarse_regimes[0] must be one of ['boost', 'coupled', 'current', 'transient']")
 
     def test_ycruncher_unknown_test_tag(self):
         entry = {**TunerConfig().battery[1], "tests": ["NOPE"]}

@@ -81,12 +81,11 @@ class TunerConfig:
     resume_crash_quarantine_threshold: int = 3
 
     # Crash hunt (evidence-based attribution). When a hard crash cannot be
-    # attributed — no kernel MCE trace and multiple cores held offsets — the
-    # tuner never guesses a culprit: it runs isolated per-core hunt slots
+    # attributed - no kernel MCE trace and multiple cores held offsets - the
+    # tuner never guesses a culprit: it runs isolated per-core hunts
     # (candidate at its tuned value, every other core at stock) under
-    # variable/idle load. Slot length per core, and how many fruitless hunts
-    # in a row pause the session for the user instead of continuing blind.
-    hunt_slot_seconds: int = 60
+    # variable/idle load. Repeated fruitless hunts pause the session for the
+    # user instead of continuing blind.
     max_unattributed_crash_hunts: int = 2
 
     # Fail closed when no CPU temperature sensor is readable: refuse to drive a
@@ -236,8 +235,6 @@ class TunerConfig:
             errors.append("crash_penalty_steps must be 1-10")
         if not 1 <= self.resume_crash_quarantine_threshold <= 20:
             errors.append("resume_crash_quarantine_threshold must be 1-20")
-        if not 30 <= self.hunt_slot_seconds <= 600:
-            errors.append("hunt_slot_seconds must be 30-600")
         if not 30 <= self.spectrum_slot_seconds <= 600:
             errors.append("spectrum_slot_seconds must be 30-600")
         if not 60 <= self.soak_duration_seconds <= 14400:
@@ -261,11 +258,23 @@ class TunerConfig:
             missing = sorted(str(r) for r in regime.Regime if r not in covered)
             if missing:
                 errors.append(f"battery does not cover regimes: {', '.join(missing)}")
-            unknown_coarse = sorted(set(self.coarse_regimes) - {str(r) for r in covered})
-            if unknown_coarse:
-                errors.append(f"coarse_regimes not present in battery: {', '.join(unknown_coarse)}")
-            if not self.coarse_regimes:
+            valid_regimes = {str(r) for r in regime.Regime}
+            if not isinstance(self.coarse_regimes, list):
+                errors.append("coarse_regimes must be a list of regime names")
+            elif not self.coarse_regimes:
                 errors.append("coarse_regimes must name at least one regime")
+            else:
+                invalid_coarse = [
+                    i
+                    for i, value in enumerate(self.coarse_regimes)
+                    if type(value) is not str or value not in valid_regimes
+                ]
+                for i in invalid_coarse:
+                    errors.append(f"coarse_regimes[{i}] must be one of {sorted(valid_regimes)}")
+                if not invalid_coarse:
+                    missing_coarse = sorted(set(self.coarse_regimes) - {str(r) for r in covered})
+                    if missing_coarse:
+                        errors.append(f"coarse_regimes not present in battery: {', '.join(missing_coarse)}")
         if not 0 < self.regime_floor_pct <= 100 / len(regime.Regime):
             errors.append(f"regime_floor_pct must be 0-{100 / len(regime.Regime):.0f}")
         if not 1 <= self.control_run_confirmations <= 10:

@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, mock_open, patch
 
 from corecycler.config import tools
 from corecycler.engine import containment
-from corecycler.engine.backends import BACKEND_REGISTRY, load_all
+from corecycler.engine.backends import BACKEND_REGISTRY, load_all, ycruncher
 from corecycler.engine.execution import cpu_times as _cpu_times
 from corecycler.monitor.memory import parse_dmidecode_output
 from corecycler.monitor.msr import (
@@ -306,6 +306,10 @@ def _pin_core_slot_mapping() -> None:
     }
 
 
+def _pin_ycruncher_component_tests() -> None:
+    assert sorted(ycruncher.VALID_COMPONENT_TESTS) == ["BBP", "BKT", "FFTv4", "N63", "SFTv4", "SNT", "SVT", "VT3"]
+
+
 def _pin_external_tool_discovery() -> None:
     assert tools.env_var("y-cruncher") == "CORECYCLER_Y_CRUNCHER_BIN"
     assert tools.env_var("stress-ng") == "CORECYCLER_STRESS_NG_BIN"
@@ -436,6 +440,14 @@ CONTRACTS: list[Contract] = [
         ),
         ring_a=_pin_desktop_pbo_command_ids,
         live_verifiable=False,
+    ),
+    Contract(
+        name="ycruncher-component-tests",
+        kind="tool",
+        source="y-cruncher component stress-test identifiers accepted by its stress command",
+        ring_a=_pin_ycruncher_component_tests,
+        live_verifiable=True,
+        ring_b_test=("test_ycruncher_binary.py::TestYCruncherBinaryContract::test_valid_component_test_still_accepted"),
     ),
     Contract(
         name="external-tool-discovery",

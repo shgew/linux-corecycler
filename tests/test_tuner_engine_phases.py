@@ -332,6 +332,14 @@ class TestHuntSlots:
         for cid in candidates:
             _confirm(engine, cid, -20)
         engine._hunt = bisect.begin(candidates, loaded=[0])
+        engine._hunt.vector = dict.fromkeys(candidates, -20)
+        engine._hunt.workload = {
+            "regime": "current",
+            "backend": "mprime",
+            "stress_mode": "avx2",
+            "fft_preset": "small",
+            "profile": "sustained",
+        }
         engine._hunting = True
         engine._set_status("hunting")
         engine._save_hunt()
@@ -605,9 +613,11 @@ class TestVerdictRouter:
     def test_a_thermal_stop_during_a_hunt_retries_the_same_probe(self, engine):
         state = bisect.HuntState(
             stage=bisect.Stage.PROBE,
-            pending=[[0, 1, 2, 3]],
+            pending=[],
             queue=[[2, 3]],
             in_flight=[0, 1],
+            parent=[0, 1, 2, 3],
+            level=1,
             loaded=[0],
         )
         engine._hunt = state
@@ -737,13 +747,11 @@ class TestAbortTeardown:
     def test_aborting_a_hunt_requeues_the_in_flight_probe(self, engine):
         state = bisect.HuntState(
             stage=bisect.Stage.PROBE,
-            pending=[[0, 1, 2, 3]],
+            pending=[],
             queue=[[2, 3]],
             in_flight=[0, 1],
             parent=[0, 1, 2, 3],
-            found=[3],
-            exonerated=[2],
-            level=2,
+            level=1,
             loaded=[0],
         )
         engine._hunt = state
@@ -1189,6 +1197,7 @@ class TestResumeGuards:
         tp.update_session_status(engine._db, sid, "validating")
         tp.journal_mark_survived(engine._db, sid)
         monkeypatch.setattr(eng, "_rebooted_since", lambda *_a, **_kw: True)
+        monkeypatch.setattr(eng, "last_boot_ended_cleanly", lambda **_kw: False)
         monkeypatch.setattr(engine, "_forensics", lambda *_a, **_kw: ([], True))
         start_hunt = MagicMock()
         monkeypatch.setattr(engine, "_start_hunt", start_hunt)
@@ -1444,7 +1453,7 @@ class TestHuntDecisions:
         assert all(cs.best_offset == -20 for cs in restored.values())
         assert all(cs.crash_count == 0 for cs in restored.values())
         assert engine.status == "running"
-        assert tp.get_unattributed_crashes(engine._db, engine._session_id) == 0
+        assert tp.get_unattributed_crashes(engine._db, engine._session_id) == engine._config.suspicion_min_failures
 
     def test_exhausted_clear_winner_is_demoted_and_loses_banked_evidence(self, engine):
         for core_id in engine._core_states:
@@ -1452,8 +1461,8 @@ class TestHuntDecisions:
             cs.suspicion = 30.0 if core_id == 0 else 1.0
             tp.save_core_state(engine._db, engine._session_id, cs)
         tp.set_unattributed_crashes(engine._db, engine._session_id, engine._config.suspicion_min_failures)
-        engine._db.bank_regime_time("ctx", 0, "boost", -20, 600.0)
-        engine.context_hash = lambda: "ctx"
+        context_id = tp.get_session(engine._db, engine._session_id).context_id
+        engine._db.bank_regime_time(context_id, 0, "boost", -20, 600.0)
         engine._co_applied = dict.fromkeys(engine._core_states, -20)
         engine._last_tested_core = 0
         engine._hunt = bisect.HuntState(stage=bisect.Stage.EXHAUSTED, loaded=[0])
@@ -1465,7 +1474,7 @@ class TestHuntDecisions:
         assert restored[0].current_offset == -19
         assert restored[0].suspicion == 0.0
         assert all(restored[cid].current_offset == -20 for cid in (1, 2, 3))
-        assert engine._db.get_regime_banks("ctx", 0, -20) == {}
+        assert engine._db.get_regime_banks(context_id, 0, -20) == {}
 
     @pytest.mark.parametrize("failure", [False, OSError("smu gone")])
     def test_failed_stock_restoration_stops_the_hunt(self, engine, failure):
@@ -1483,6 +1492,8 @@ class TestHuntDecisions:
     def test_platform_fault_with_no_live_candidates_is_final(self, engine):
         faults = []
         engine.platform_fault.connect(faults.append)
+        for core_id in engine._core_states:
+            tp.journal_co_intent(engine._db, engine._session_id, core_id, 0, survived=True)
         engine._start_hunt(loaded=[0])
 
         assert engine.status == "quarantined"
@@ -1590,7 +1601,12 @@ class TestRemainingHuntCoverage:
     def test_completed_probe_state_resolves_to_a_persisted_culprit_verdict(self, engine):
         for core_id in engine._core_states:
             _confirm(engine, core_id, -20)
-        engine._hunt = bisect.HuntState(stage=bisect.Stage.CULPRIT, found=[0], loaded=[0])
+        engine._hunt = bisect.HuntState(
+            stage=bisect.Stage.CULPRIT,
+            in_flight=[0],
+            found=[0],
+            loaded=[0],
+        )
         engine._hunting = True
         engine._save_hunt()
 
@@ -1642,9 +1658,13 @@ class TestRemainingHuntCoverage:
             max_no_reproduce=engine._config.max_unattributed_crash_hunts,
         )
         failed_live = bisect.next_live_set(state)
+        state.vector = dict.fromkeys(engine._core_states, -20)
+        state.workload = {"regime": "current", "backend": "mprime", "stress_mode": "avx2", "fft_preset": "small"}
+        state.armed = True
         tp.set_hunt_state(engine._db, sid, state.to_json())
         tp.update_session_status(engine._db, sid, "hunting")
         monkeypatch.setattr(eng, "_rebooted_since", lambda *_a, **_kw: True)
+        monkeypatch.setattr(eng, "last_boot_ended_cleanly", lambda **_kw: False)
         monkeypatch.setattr(engine, "_apply_hunt_mask", lambda _live: True)
         engine._worker = None
 
@@ -1654,3 +1674,143 @@ class TestRemainingHuntCoverage:
         assert persisted is not None
         assert persisted.guilty_halves == [failed_live]
         assert set(persisted.in_flight).isdisjoint(failed_live)
+
+
+class TestEngineSafetyReviewRegressions:
+    def test_in_test_mismatch_with_the_only_nonstock_resident_starts_a_hunt(self, engine, monkeypatch):
+        sid = engine._session_id
+        tested = engine._core_states[0]
+        tested.in_test = True
+        tp.save_core_state(engine._db, sid, tested)
+        tp.journal_co_intent(engine._db, sid, 0, 0, survived=True)
+        tp.journal_co_intent(engine._db, sid, 1, -17, survived=False)
+        monkeypatch.setattr(engine, "_forensics", lambda *_a, **_kw: ([], True))
+
+        crashed, pending = engine._attribute_crash_after_reboot(tp.get_session(engine._db, sid))
+
+        assert crashed == []
+        assert pending is True
+        assert engine._pending_hunt_loaded == [0]
+        assert engine._core_states[0].current_offset != 0
+        assert engine._core_states[1].current_offset != -16
+
+    def test_hunt_probe_is_armed_and_in_test_before_worker_launch(self, engine, monkeypatch):
+        for core_id in engine._core_states:
+            _confirm(engine, core_id, -20)
+        engine._hunt = bisect.begin(sorted(engine._core_states), loaded=[0, 1])
+        engine._hunt.vector = dict.fromkeys(engine._core_states, -20)
+        engine._hunt.workload = {
+            "regime": "current",
+            "backend": "mprime",
+            "stress_mode": "avx2",
+            "fft_preset": "small",
+        }
+        engine._hunting = True
+        observed = {}
+
+        class Worker:
+            def __init__(self, *_args, **_kwargs):
+                self.finished = MagicMock()
+
+            def start(self):
+                persisted = bisect.HuntState.from_json(tp.get_session(engine._db, engine._session_id).hunt_state)
+                observed["armed"] = persisted.armed
+                observed["in_test"] = tp.load_core_states(engine._db, engine._session_id)[0].in_test
+
+        monkeypatch.setattr(eng, "ParallelStress", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(eng, "_ParallelWorker", Worker)
+        monkeypatch.setattr(engine, "_get_backend_for_name", lambda _name: engine._backend)
+        monkeypatch.setattr(engine, "_start_freeze_monitor", lambda: None)
+        engine._run_next_hunt_slot()
+
+        assert observed == {"armed": True, "in_test": True}
+
+    def test_unarmed_persisted_hunt_resumes_without_a_reproduction(self, engine, monkeypatch):
+        sid = engine._session_id
+        for core_id in engine._core_states:
+            _confirm(engine, core_id, -20)
+        state = bisect.begin(sorted(engine._core_states), loaded=[0])
+        state.vector = dict.fromkeys(engine._core_states, -20)
+        state.workload = {
+            "regime": "current",
+            "backend": "mprime",
+            "stress_mode": "avx2",
+            "fft_preset": "small",
+        }
+        tp.set_hunt_state(engine._db, sid, state.to_json())
+        tp.update_session_status(engine._db, sid, "hunting")
+        monkeypatch.setattr(eng, "_rebooted_since", lambda *_a, **_kw: True)
+        monkeypatch.setattr(engine, "_forensics", lambda *_a, **_kw: ([], True))
+        monkeypatch.setattr(engine, "_run_next_hunt_slot", lambda: None)
+        engine._worker = None
+
+        engine.resume(sid)
+
+        persisted = bisect.HuntState.from_json(tp.get_session(engine._db, sid).hunt_state)
+        assert persisted.stage is bisect.Stage.CONTROL
+        assert persisted.control_fails == 0
+
+    def test_candidate_write_failure_restores_the_baseline(self, engine):
+        cs = engine._core_states[0]
+        cs.baseline_offset = -4
+        engine._co_applied = {core_id: state.baseline_offset for core_id, state in engine._core_states.items()}
+        engine._smu.set_co_offset.side_effect = [False, True]
+
+        assert engine._apply_co_mask(0, -20, eng.Mask.ISOLATED) is False
+
+        assert engine._smu.set_co_offset.call_args_list[-1].args == (0, -4)
+        assert engine._co_applied[0] == -4
+
+    def test_freeze_monitor_receives_slot_context_before_it_starts(self, engine, monkeypatch, tmp_path):
+        events = []
+
+        class Monitor:
+            def __init__(self, _path):
+                events.append("constructed")
+
+            def set_context(self, context):
+                events.append(("context", context))
+
+            def start(self):
+                events.append("started")
+
+            def stop(self):
+                pass
+
+        monkeypatch.setattr(eng, "MicroFreezeMonitor", Monitor)
+        monkeypatch.setattr(engine, "_breadcrumb_path", lambda: tmp_path / "crumb")
+        engine._freeze_context("core 0 at -20")
+        engine._start_freeze_monitor()
+
+        assert events == ["constructed", ("context", "core 0 at -20"), "started"]
+
+    def test_proven_clean_reboot_does_not_start_a_crash_hunt(self, engine, monkeypatch):
+        sid = engine._session_id
+        for core_id in engine._core_states:
+            cs = _confirm(engine, core_id, -20)
+            cs.in_test = True
+            tp.save_core_state(engine._db, sid, cs)
+        tp.update_session_status(engine._db, sid, "validating")
+        monkeypatch.setattr(eng, "_rebooted_since", lambda *_a, **_kw: True)
+        monkeypatch.setattr(eng, "last_boot_ended_cleanly", lambda **_kw: True)
+        start_hunt = MagicMock()
+        monkeypatch.setattr(engine, "_start_hunt", start_hunt)
+        monkeypatch.setattr(engine, "_run_next", lambda: None)
+        monkeypatch.setattr(engine, "_enter_auto_validation", lambda *_a, **_kw: None)
+        engine._worker = None
+
+        engine.resume(sid)
+
+        start_hunt.assert_not_called()
+        assert all(not cs.in_test for cs in tp.load_core_states(engine._db, sid).values())
+
+    def test_explicit_profile_validation_uses_the_selected_battery_recipe(self, engine):
+        cs = engine._core_states[0]
+        cs.phase = TunerPhase.CONFIRMING
+        cs.battery_index = 0
+        engine._validation_stage = 0
+        engine._set_status("validating")
+        selected = engine._battery_entry(cs)
+
+        assert engine._active_workload(cs) == selected
+        assert engine._get_active_stress_config(cs)[0] == selected["backend"]

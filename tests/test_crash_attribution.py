@@ -286,6 +286,9 @@ class TestCrashHunt:
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         _seed_confirmed_validating(eng, db, BEST, BASELINES)
         state = bisect.begin(sorted(BEST), loaded=[5])
+        state.vector = dict(BEST)
+        state.workload = eng._workload_snapshot(eng._core_states[5])
+        state.armed = True
         tp.set_hunt_state(db, eng._session_id, state.to_json())
         tp.update_session_status(db, eng._session_id, "hunting")
         for core_id in BEST:
@@ -327,6 +330,103 @@ class TestCrashHunt:
         eng._on_test_finished(5, True, "", "", 60.0, 0.0)
 
         assert tp.get_resume_crash_streak(db, eng._session_id) == 0
+
+    @pytest.mark.parametrize(
+        ("error_type", "message", "events"),
+        [
+            ("thermal", "temperature limit", ""),
+            ("stall", "worker stalled", ""),
+            ("killed", "worker killed externally", ""),
+            (
+                "mce_unattributed",
+                "machine check without a CPU",
+                json.dumps([{"cpu": -1, "corrected": False, "message": "uncore MCE"}]),
+            ),
+        ],
+    )
+    def test_hunt_non_verdict_preserves_crash_streak_and_learned_offsets(
+        self,
+        db,
+        topo_dual_ccd_x3d,
+        mock_backend,
+        monkeypatch,
+        error_type,
+        message,
+        events,
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_confirmed_validating(eng, db, BEST, BASELINES)
+        tp.set_resume_crash_streak(db, eng._session_id, 3)
+        learned = {c: (cs.current_offset, cs.best_offset) for c, cs in eng._core_states.items()}
+        monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
+        eng._start_worker = lambda *a, **k: None
+        eng._start_multi_core_worker = lambda *a, **k: None
+
+        eng._start_hunt(loaded=[5])
+        eng._on_test_finished(5, False, message, error_type, 60.0, 0.0, events)
+
+        assert tp.get_resume_crash_streak(db, eng._session_id) == 3
+        assert {c: (cs.current_offset, cs.best_offset) for c, cs in eng._core_states.items()} == learned
+
+    def test_passing_probes_and_exhausted_hunt_preserve_crash_streak_and_learned_offsets(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        eng = _make_engine(
+            db,
+            topo_dual_ccd_x3d,
+            mock_backend,
+            max_unattributed_crash_hunts=1,
+            suspicion_min_failures=99,
+        )
+        _seed_confirmed_validating(eng, db, BEST, BASELINES)
+        tp.set_resume_crash_streak(db, eng._session_id, 3)
+        learned = {c: (cs.current_offset, cs.best_offset) for c, cs in eng._core_states.items()}
+        monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
+        eng._start_worker = lambda *a, **k: None
+        eng._start_multi_core_worker = lambda *a, **k: None
+
+        eng._start_hunt(loaded=[5])
+        eng._on_test_finished(5, True, "", "", 60.0, 0.0)
+
+        assert tp.get_resume_crash_streak(db, eng._session_id) == 3
+        assert {c: (cs.current_offset, cs.best_offset) for c, cs in eng._core_states.items()} == learned
+
+        while eng._hunt is not None:
+            eng._run_next_hunt_slot()
+            if eng._hunt is not None:
+                eng._on_test_finished(5, True, "", "", 60.0, 0.0)
+
+        assert tp.get_resume_crash_streak(db, eng._session_id) == 3
+        assert {c: (cs.current_offset, cs.best_offset) for c, cs in eng._core_states.items()} == learned
+
+    def test_completed_hunt_probe_then_reboot_is_not_another_reproduction(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=3)
+        _seed_confirmed_validating(eng, db, BEST, BASELINES)
+        monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
+        eng._start_worker = lambda *a, **k: None
+        eng._start_multi_core_worker = lambda *a, **k: None
+        eng._start_hunt(loaded=[5])
+        eng._on_test_finished(5, True, "", "", 60.0, 0.0)
+        eng._run_next_hunt_slot()
+
+        eng._on_test_finished(5, True, "", "", 60.0, 0.0)
+
+        session = tp.get_session(db, eng._session_id)
+        completed = bisect.HuntState.from_json(session.hunt_state)
+        assert completed is not None
+        assert completed.armed is False
+        eng._forensics = lambda *a, **k: ([], True)
+        eng._run_next_hunt_slot = lambda: None
+
+        crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
+        eng._hunt = bisect.HuntState.from_json(session.hunt_state)
+
+        assert crashed == []
+        assert pending_hunt is True
+        assert eng._hunt is not None
+        assert eng._hunt.to_json() == completed.to_json()
 
 
 class TestForeignMceEvidence:

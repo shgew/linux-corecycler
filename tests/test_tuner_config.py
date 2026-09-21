@@ -38,9 +38,13 @@ class TestTunerConfigDefaults:
         with pytest.raises(ValueError):
             TunerConfig.from_json(payload)
 
-    def test_unknown_field_is_rejected(self):
-        with pytest.raises(ValueError, match="^unknown tuner config fields: hardening_tiers$"):
-            TunerConfig.from_json('{"hardening_tiers": []}')
+    @pytest.mark.parametrize("field", ["hardening_tiers", "hunt_slot_seconds"])
+    def test_unknown_field_is_rejected(self, field):
+        with pytest.raises(ValueError, match=rf"^unknown tuner config fields: {field}$"):
+            TunerConfig.from_json(json.dumps({field: 60}))
+
+    def test_removed_hunt_slot_is_not_serialized(self):
+        assert "hunt_slot_seconds" not in json.loads(TunerConfig().to_json())
 
     def test_direct_config_rejects_wrong_types_before_comparisons(self):
         cfg = TunerConfig(coarse_step="five", search_duration_seconds=float("nan"))
@@ -253,8 +257,10 @@ class TestConfigValidationFailsClosed:
             "battery does not cover regimes: boost, coupled, transient"
         ]
 
-    def test_coarse_regimes_must_be_present_in_the_battery(self):
-        assert self._cfg(coarse_regimes=["unknown"]).validate() == ["coarse_regimes not present in battery: unknown"]
+    def test_coarse_regimes_must_name_known_regimes(self):
+        assert self._cfg(coarse_regimes=["unknown"]).validate() == [
+            "coarse_regimes[0] must be one of ['boost', 'coupled', 'current', 'transient']"
+        ]
 
     def test_at_least_one_coarse_regime_is_required(self):
         assert self._cfg(coarse_regimes=[]).validate() == ["coarse_regimes must name at least one regime"]
@@ -268,7 +274,6 @@ class TestConfigValidationFailsClosed:
             "backoff_preconfirm_multiplier": 0.0,
             "stretch_threshold_pct": -1.0,
             "resume_crash_quarantine_threshold": 0,
-            "hunt_slot_seconds": 10,
             "max_unattributed_crash_hunts": 0,
             "spectrum_slot_seconds": 10,
             "soak_duration_seconds": 10,

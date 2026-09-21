@@ -982,10 +982,11 @@ class TunerTab(QWidget):
         """
         if offset is None or not self._db or not self._engine:
             return {}
-        context = self._engine.context_hash()
-        if not context:
+        session = tp.get_session(self._db, self._engine.session_id)
+        context_id = session.context_id if session is not None else None
+        if context_id is None:
             return {}
-        banks = self._db.get_regime_banks(context, core_id, offset)
+        banks = self._db.get_regime_banks(context_id, core_id, offset)
         return {r: banks.get(r, 0.0) / 3600.0 for r in _REGIMES}
 
     def _find_core_row(self, core_id: int) -> int:

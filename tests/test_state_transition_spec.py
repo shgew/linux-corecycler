@@ -323,6 +323,15 @@ def test_every_crash_penalty_transition_is_declared():
 
             eng._apply_crash_penalty(cs)
 
+            if current == 0:
+                assert cs.phase is phase, label
+                assert eng.status == "paused", label
+                assert cs.best_offset == best, label
+                assert cs.backoff_fail_bound == fail_bound, label
+                assert cs.crash_count == 1 and cs.crash_cooldown == 0, label
+                assert cs.current_offset == 0, label
+                check_invariants(eng, cs, label)
+                continue
             assert cs.phase is CRASH_RELATION[phase], f"UNDECLARED CRASH TRANSITION {label}: {phase} -> {cs.phase}"
             assert cs.best_offset is not None, f"{label}: best is None after crash"
             assert cs.crash_count >= 1 and cs.crash_cooldown >= 1, label

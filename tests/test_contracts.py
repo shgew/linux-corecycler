@@ -34,6 +34,22 @@ def test_every_contract_has_a_hermetic_pin():
         assert callable(c.ring_a), f"{c.name}: no Ring A pin"
 
 
+def test_ycruncher_component_test_pin_is_independent_of_production_mapping(monkeypatch):
+    from corecycler.engine.backends import ycruncher
+
+    contract = next(c for c in CONTRACTS if c.name == "ycruncher-component-tests")
+    invalid = frozenset({"NOT-A-Y-CRUNCHER-TEST"})
+    monkeypatch.setattr(ycruncher, "VALID_COMPONENT_TESTS", invalid)
+    monkeypatch.setattr(
+        ycruncher,
+        "MODE_TO_ALGORITHMS",
+        {mode: tuple(invalid) for mode in ycruncher.MODE_TO_ALGORITHMS},
+    )
+
+    with pytest.raises(AssertionError):
+        contract.ring_a()
+
+
 def test_no_dormant_drift_seam():
     tests_dir = Path(__file__).parent
     for c in CONTRACTS:

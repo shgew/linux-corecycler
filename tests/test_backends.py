@@ -675,6 +675,11 @@ class TestYCruncherBackend:
             backend.get_command(StressConfig(tests=("UNKNOWN", "BKT", "BAD")), tmp_path)
         assert str(exc_info.value) == "Unknown y-cruncher component test(s): BAD, UNKNOWN"
 
+    def test_get_command_validates_component_tests_before_resolving_binary(self, tmp_path: Path, on_path) -> None:
+        on_path({})
+        with pytest.raises(ValueError, match="Unknown y-cruncher component test"):
+            YCruncherBackend().get_command(StressConfig(tests=("UNKNOWN",)), tmp_path)
+
     @pytest.mark.parametrize(("test_seconds", "duration_arg"), [(45, "-D:45"), (0, "-D:1")])
     def test_get_command_uses_clamped_test_duration(self, tmp_path: Path, test_seconds: int, duration_arg: str) -> None:
         backend = YCruncherBackend()

@@ -139,15 +139,19 @@ def workload_errors(name: str, index: int, item: object) -> list[str]:
     if not isinstance(item, dict):
         return [f"{name}[{index}] must be a dict"]
     try:
-        Regime(item.get("regime"))
-    except ValueError:
+        workload_regime = Regime(item.get("regime"))
+    except (TypeError, ValueError):
         return [f"{name}[{index}].regime must be one of {sorted(r.value for r in Regime)}"]
     if not all(isinstance(item.get(k), str) and item[k].strip() for k in ("backend", "stress_mode", "fft_preset")):
         return [f"{name}[{index}] requires non-blank string backend, stress_mode, fft_preset"]
     try:
-        Profile(item.get("profile", "sustained"))
-    except ValueError:
+        profile = Profile(item.get("profile", "sustained"))
+    except (TypeError, ValueError):
         return [f"{name}[{index}].profile must be one of {sorted(p.value for p in Profile)}"]
+    if workload_regime is Regime.TRANSIENT and profile is not Profile.TRANSIENT:
+        return [f"{name}[{index}].regime transient requires profile transient"]
+    if profile is Profile.TRANSIENT and workload_regime is not Regime.TRANSIENT:
+        return [f"{name}[{index}].profile transient requires regime transient"]
     threads = item.get("threads")
     if not (threads is None or (type(threads) is int and threads >= 1)):
         return [f"{name}[{index}].threads must be a positive integer"]

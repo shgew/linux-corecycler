@@ -26,12 +26,22 @@ def user_home() -> Path:
     return Path.home()
 
 
-def atomic_write(path: Path, content: str) -> None:
-    """Write via temp file + rename, then hand the file back to the user."""
+def atomic_write(path: Path, content: str, *, durable: bool = False) -> None:
+    """Atomically replace a file, optionally syncing its data and directory entry."""
     tmp = path.with_suffix(".tmp")
-    tmp.write_text(content, encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as stream:
+        stream.write(content)
+        if durable:
+            stream.flush()
+            os.fsync(stream.fileno())
     tmp.replace(path)
     fix_sudo_ownership(path.parent, path)
+    if durable:
+        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
 
 
 def invoking_uid() -> int:

@@ -308,9 +308,13 @@ class TestResumeFromCrash:
                 in_test=True,  # was actively testing when crash happened
             ),
         )
+        tp.journal_co_intent(db, sid, 1, -10, survived=False)
 
         # Patch _run_next to prevent actual test execution
-        with patch.object(eng, "_run_next"):
+        with (
+            patch.object(eng, "_run_next"),
+            patch("corecycler.tuner.engine.last_boot_ended_cleanly", return_value=False),
+        ):
             eng.resume(sid)
 
         assert eng._session_id == sid
@@ -385,8 +389,12 @@ class TestResumeFromCrash:
                 coarse_fail_offset=-12,
             ),
         )
+        tp.journal_co_intent(db, sid, 0, -15, survived=False)
 
-        with patch.object(eng, "_run_next"):
+        with (
+            patch.object(eng, "_run_next"),
+            patch("corecycler.tuner.engine.last_boot_ended_cleanly", return_value=False),
+        ):
             eng.resume(sid)
 
         # Core 0 was in_test — should be advanced (fail → fine_search)
@@ -1184,7 +1192,11 @@ class TestBackoffAlgorithm:
                 in_test=True,  # was actively testing when crash happened
             ),
         )
-        with patch.object(eng, "_run_next"):
+        tp.journal_co_intent(db, sid, 0, -10, survived=False)
+        with (
+            patch.object(eng, "_run_next"),
+            patch("corecycler.tuner.engine.last_boot_ended_cleanly", return_value=False),
+        ):
             eng.resume(sid)
         # Should have advanced (treated as failure) — backed off from -10
         cs = eng._core_states[0]
@@ -1346,6 +1358,7 @@ class TestCrashDetection:
             0: CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-10, in_test=True),
             1: CoreState(core_id=1, phase=TunerPhase.FINE_SEARCH, current_offset=-8, in_test=False),
         }
+        tp.journal_co_intent(db, eng._session_id, 0, -10, survived=False)
         session = tp.get_session(db, eng._session_id)
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
         assert crashed == [0]
@@ -1376,6 +1389,7 @@ class TestCrashDetection:
             in_test=True,
         )
         eng._core_states = {0: cs}
+        tp.journal_co_intent(db, eng._session_id, 0, -15, survived=False)
         eng._attribute_crash_after_reboot(tp.get_session(db, eng._session_id))
         # Penalty: -15 - ((-1)*3*1) = -15 + 3 = -12
         assert cs.current_offset == -12
@@ -1392,6 +1406,7 @@ class TestCrashDetection:
             in_test=True,
         )
         eng._core_states = {0: cs}
+        tp.journal_co_intent(db, eng._session_id, 0, -10, survived=False)
         eng._attribute_crash_after_reboot(tp.get_session(db, eng._session_id))
         log_entries = tp.get_test_log(db, eng._session_id, core_id=0)
         assert any(e.get("error_type") == "crash" for e in log_entries)
@@ -1422,7 +1437,11 @@ class TestCrashDetection:
                 in_test=True,
             ),
         )
-        with patch.object(eng, "_run_next"):
+        tp.journal_co_intent(db, sid, 0, -15, survived=False)
+        with (
+            patch.object(eng, "_run_next"),
+            patch("corecycler.tuner.engine.last_boot_ended_cleanly", return_value=False),
+        ):
             eng.resume(sid)
         cs = eng._core_states[0]
         # Should have been crash-penalized: -15 + 3 = -12
@@ -1844,7 +1863,7 @@ class TestRegimeBatteryAndAnnealing:
         )
         cs = CoreState(core_id=0, phase=TunerPhase.FINE_SEARCH, current_offset=-6, best_offset=-5)
         with (
-            patch.object(eng, "context_hash", return_value="ctx"),
+            patch.object(eng, "context_id", return_value=7),
             patch.object(
                 db,
                 "regime_yield",
@@ -1870,6 +1889,83 @@ class TestRegimeBatteryAndAnnealing:
         assert productive["regime"] == "boost"
         assert never_failed["regime"] == "current"
         assert productive_seconds > floor_seconds >= 1
+
+    def test_regime_order_is_frozen_until_the_offset_battery_finishes(
+        self, db, simple_topology, mock_smu, mock_backend
+    ):
+        eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
+        cs = CoreState(core_id=0, phase=TunerPhase.FINE_SEARCH, current_offset=-6, best_offset=-5)
+        eng._core_states = {0: cs}
+        first = {"boost": 4.0, "current": 3.0, "transient": 2.0, "coupled": 1.0}
+        second = {"boost": 1.0, "current": 2.0, "transient": 3.0, "coupled": 4.0}
+        with patch.object(eng, "_regime_weights", side_effect=[first, second]):
+            initial = eng._slot_regimes(cs)
+            cs.battery_index = 1
+            remaining = eng._slot_regimes(cs)
+        assert remaining == initial
+
+    def test_regime_floor_is_reserved_for_each_regime(self, db, simple_topology, mock_smu, mock_backend):
+        eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, regime_floor_pct=20.0)
+        with (
+            patch.object(eng, "context_id", return_value=7),
+            patch.object(
+                db,
+                "regime_yield",
+                return_value={"boost": (100, 1.0), "current": (0, 100000.0)},
+            ),
+        ):
+            weights = eng._regime_weights()
+        assert all(weight >= 0.20 for weight in weights.values())
+        assert sum(weights.values()) == pytest.approx(1.0)
+
+    def test_annealing_uses_the_configured_fine_step_for_eligibility_and_candidate(
+        self, db, simple_topology, mock_smu, mock_backend
+    ):
+        eng = self._make_engine(
+            db,
+            simple_topology,
+            mock_smu,
+            mock_backend,
+            fine_step=3,
+            max_offset=-12,
+            anneal_bank_hours=1.0,
+        )
+        cs = CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-10, best_offset=-10)
+        eng._core_states = {0: cs}
+        with patch.object(eng, "_banked_hours", return_value=2.0):
+            assert eng._anneal_candidate() is None
+        assert cs.current_offset == -10
+
+        eng._config.max_offset = -13
+        with patch.object(eng, "_banked_hours", return_value=2.0):
+            assert eng._anneal_candidate() == 0
+        assert cs.current_offset == -13
+
+    def test_crash_penalty_restarts_the_candidate_battery(self, db, simple_topology, mock_smu, mock_backend):
+        eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
+        cs = CoreState(
+            core_id=0,
+            phase=TunerPhase.FINE_SEARCH,
+            current_offset=-10,
+            best_offset=-8,
+            battery_index=3,
+            confirm_attempts=2,
+        )
+        eng._core_states = {0: cs}
+        eng._apply_crash_penalty(cs)
+        assert cs.battery_index == 0
+        assert cs.confirm_attempts == 0
+
+    def test_a_crash_at_stock_pauses_without_inventing_a_safer_candidate(
+        self, db, simple_topology, mock_smu, mock_backend
+    ):
+        eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
+        cs = CoreState(core_id=0, phase=TunerPhase.CONFIRMING, current_offset=0, best_offset=0)
+        eng._core_states = {0: cs}
+        eng._apply_crash_penalty(cs)
+        assert eng.status == "paused"
+        assert cs.current_offset == 0
+        assert cs.best_offset == 0
 
     def test_annealing_pass_promotes_the_probe(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, anneal_bank_hours=6.0)
@@ -2308,6 +2404,7 @@ class TestStateMachineGaps:
             core_id=0, phase=TunerPhase.CONFIRMING, current_offset=-10, best_offset=-10, baseline_offset=0, in_test=True
         )
         eng._core_states = {0: cs}
+        tp.journal_co_intent(db, eng._session_id, 0, -10, survived=False)
         crashed, _ = eng._attribute_crash_after_reboot(tp.get_session(db, eng._session_id))
         assert 0 in crashed
         assert cs.in_test is False

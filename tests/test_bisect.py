@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from corecycler.tuner import bisect
-from corecycler.tuner.bisect import HuntState, Stage
+from corecycler.tuner.bisect import HuntState, InvalidHuntState, Stage
 
 
 def run_hunt(
@@ -83,6 +85,35 @@ class TestIsolation:
         assert state.exonerated == [3]
         assert state.stage is Stage.EXHAUSTED
 
+    def test_exonerated_singleton_does_not_convict_first_core_of_next_set(self):
+        state = bisect.begin(list(range(8)), [0])
+        responses = {
+            (0, 1, 2, 3): True,
+            (4, 5, 6, 7): True,
+            (0, 1): True,
+            (2, 3): False,
+            (0,): True,
+            (1,): False,
+            (4, 5): True,
+            (6, 7): False,
+            (4,): False,
+            (5,): True,
+        }
+
+        while state.stage not in (Stage.CULPRIT, Stage.PLATFORM, Stage.EXHAUSTED):
+            live = bisect.next_live_set(state)
+            assert live is not None
+            reproduced = False if state.stage is Stage.CONTROL else responses[tuple(live)]
+            if state.stage is Stage.CONFIRM and live == [0]:
+                reproduced = False
+            bisect.record(state, reproduced=reproduced, control_confirmations=2, max_no_reproduce=3)
+            if state.exonerated == [0] and state.stage is Stage.PROBE:
+                assert state.found == []
+
+        assert state.stage is Stage.CULPRIT
+        assert state.found == [5]
+        assert state.exonerated == [0]
+
 
 class TestNonReproduction:
     def test_a_failure_that_never_recurs_exhausts(self):
@@ -148,9 +179,109 @@ class TestPersistence:
         restored = HuntState.from_json(state.to_json())
         assert restored == state
 
-    @pytest.mark.parametrize("blob", ["", "not json", "{}", '{"stage":"nonsense"}', "[]"])
-    def test_unusable_state_restarts_the_hunt(self, blob):
-        assert HuntState.from_json(blob) is None
+    def test_armed_probe_evidence_survives_a_round_trip(self):
+        state = bisect.begin([0, 1], [0])
+        state.armed = True
+        state.vector = {0: -20, 1: 0}
+        state.workload = {
+            "regime": "current",
+            "backend": "mprime",
+            "stress_mode": "AVX2",
+            "fft_preset": "SMALL",
+            "threads": 2,
+        }
+
+        restored = HuntState.from_json(state.to_json())
+
+        assert restored == state
+
+    def test_empty_state_is_absent(self):
+        assert HuntState.from_json("") is None
+
+    @pytest.mark.parametrize("blob", [" ", "not json", "{}", '{"stage":"nonsense"}', "[]"])
+    def test_nonempty_unusable_state_is_explicitly_invalid(self, blob):
+        with pytest.raises(InvalidHuntState):
+            HuntState.from_json(blob)
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("version", 2),
+            ("stage", "nonsense"),
+            ("control_fails", True),
+            ("control_fails", -1),
+            ("control_fails", 2**31),
+            ("level", float("nan")),
+            ("no_reproduce", float("inf")),
+            ("loaded", [True]),
+            ("loaded", [-1]),
+            ("loaded", [0, 0]),
+            ("loaded", [1, 0]),
+            ("pending", [[]]),
+            ("pending", [[0, 0]]),
+            ("pending", [[0], [0]]),
+            ("queue", [[0]]),
+            ("armed", 1),
+            ("vector", {"0": True}),
+            ("workload", []),
+        ],
+    )
+    def test_decoded_types_bounds_and_sets_are_validated(self, field, value):
+        raw = json.loads(bisect.begin([0, 1], [0]).to_json())
+        raw[field] = value
+        with pytest.raises(InvalidHuntState):
+            HuntState.from_json(json.dumps(raw))
+
+    @pytest.mark.parametrize(
+        "changes",
+        [
+            {"stage": "confirm", "pending": [], "in_flight": []},
+            {"stage": "confirm", "pending": [], "in_flight": [0, 1]},
+            {"stage": "confirm", "pending": [], "in_flight": [0], "queue": [[1]]},
+            {"stage": "probe", "pending": [], "queue": [[0]], "parent": []},
+            {"stage": "probe", "pending": [], "queue": [[0], [0]], "parent": [0, 1], "level": 1},
+            {"stage": "culprit", "pending": [], "found": []},
+            {"stage": "exhausted", "pending": [[0, 1]]},
+            {"armed": True},
+        ],
+    )
+    def test_stage_invariants_are_validated(self, changes):
+        raw = json.loads(bisect.begin([0, 1], [0]).to_json())
+        raw.update(changes)
+        with pytest.raises(InvalidHuntState):
+            HuntState.from_json(json.dumps(raw))
+
+    def test_fresh_process_resume_matches_uninterrupted_search(self):
+        uninterrupted, _ = run_hunt(list(range(8)), {6})
+        state = bisect.begin(list(range(8)), [0])
+        stages = set()
+        requeued = False
+
+        while state.stage not in (Stage.CULPRIT, Stage.PLATFORM, Stage.EXHAUSTED):
+            restored = HuntState.from_json(state.to_json())
+            assert restored is not state
+            state = restored
+            live = bisect.next_live_set(state)
+            assert live is not None
+            stages.add(state.stage)
+            state = HuntState.from_json(state.to_json())
+
+            if state.stage is Stage.PROBE and state.queue and not requeued:
+                interrupted = list(state.in_flight)
+                state.queue.insert(0, interrupted)
+                state.in_flight = []
+                state = HuntState.from_json(state.to_json())
+                assert bisect.next_live_set(state) == interrupted
+                state = HuntState.from_json(state.to_json())
+                requeued = True
+
+            reproduced = state.stage is not Stage.CONTROL and 6 in state.in_flight
+            bisect.record(state, reproduced=reproduced, control_confirmations=2, max_no_reproduce=3)
+            state = HuntState.from_json(state.to_json())
+
+        assert requeued
+        assert stages == {Stage.CONTROL, Stage.PROBE, Stage.CONFIRM}
+        assert state == uninterrupted
 
 
 def test_split_puts_the_larger_half_first():

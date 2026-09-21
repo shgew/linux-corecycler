@@ -444,3 +444,47 @@ class TestMemoryValidationStage:
         # In the test/sandbox environment stressapptest is not installed, so the
         # real availability check must yield None (not raise, not a CPU backend).
         assert eng._get_memory_backend() is None
+
+
+class TestEngineReviewAccounting:
+    def test_endurance_banks_only_lanes_with_explicit_pass_results(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_validating(eng, db)
+        eng._validation_stage = 9
+        eng._validation_core_order = sorted(BEST)
+        eng._endurance_workload = 0
+        eng._cores_under_stress = [0, 1, 2]
+        banked = []
+        monkeypatch.setattr(eng, "_bank_clean_time", lambda core, *_args: banked.append(core))
+        monkeypatch.setattr(eng, "_on_validation_test_finished", lambda *_args: None)
+        results = '[{"core":0,"passed":true},{"core":1,"passed":false}]'
+
+        eng._on_test_finished(0, True, "", "", 10.0, 0.0, "", results)
+
+        assert banked == [0]
+
+    def test_solo_transient_endurance_applies_its_duty_cycle(self, db, topo_dual_ccd_x3d, mock_backend):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_validating(eng, db)
+        eng._validation_stage = 9
+        eng._validation_core_order = sorted(BEST)
+        eng._config.endurance_workloads = [
+            {
+                "backend": eng._config.backend,
+                "stress_mode": "avx2",
+                "fft_preset": "small",
+                "profile": "transient",
+                "random_phases": True,
+                "regime": "transient",
+            }
+        ]
+        calls = []
+        eng._start_worker = lambda core, duration, **kwargs: calls.append((core, duration, kwargs))
+
+        eng._run_endurance_next()
+
+        duty = calls[0][2]["duty_cycle"]
+        assert duty is not None
+        assert duty.random_phases is True

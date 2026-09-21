@@ -7,10 +7,47 @@ must never raise, since a root-owned file beats losing the write.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import patch
 
 from corecycler.config import paths
+
+
+class TestAtomicWrite:
+    def test_durable_write_fsyncs_file_before_replace_and_parent_after(self, tmp_path, monkeypatch):
+        destination = tmp_path / "state"
+        events = []
+        directory_fd = 12345
+        real_replace = Path.replace
+
+        def replace(source, target):
+            events.append("replace")
+            return real_replace(source, target)
+
+        def open_directory(path, flags):
+            assert path == tmp_path
+            assert flags == os.O_RDONLY | os.O_DIRECTORY
+            events.append("open parent")
+            return directory_fd
+
+        def fsync(fd):
+            events.append("fsync parent" if fd == directory_fd else "fsync temporary")
+
+        def close(fd):
+            assert fd == directory_fd
+            events.append("close parent")
+
+        monkeypatch.setattr(Path, "replace", replace)
+        monkeypatch.setattr(paths.os, "open", open_directory)
+        monkeypatch.setattr(paths.os, "fsync", fsync)
+        monkeypatch.setattr(paths.os, "close", close)
+        monkeypatch.setattr(paths, "fix_sudo_ownership", lambda *_paths: None)
+
+        paths.atomic_write(destination, "saved", durable=True)
+
+        assert destination.read_text(encoding="utf-8") == "saved"
+        assert events == ["fsync temporary", "replace", "open parent", "fsync parent", "close parent"]
 
 
 class TestUserHome:

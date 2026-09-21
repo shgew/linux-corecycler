@@ -18,7 +18,12 @@ if TYPE_CHECKING:
     from corecycler.history.db import HistoryDB
 
 
-def _core_rows(db: HistoryDB, session_id: int, context_hash: str) -> list[dict]:
+def _core_rows(
+    db: HistoryDB,
+    session_id: int,
+    context_id: int | None,
+    quarantined: bool,
+) -> list[dict]:
     from corecycler.tuner import persistence as tp
 
     states = tp.load_core_states(db, session_id)
@@ -26,11 +31,13 @@ def _core_rows(db: HistoryDB, session_id: int, context_hash: str) -> list[dict]:
     rows = []
     for core_id in sorted(states):
         cs = states[core_id]
-        offset = cs.best_offset if cs.best_offset is not None else cs.current_offset
-        banks = db.get_regime_banks(context_hash, core_id, offset) if context_hash else {}
+        accepted_offset = None if quarantined else cs.best_offset
+        evidence_offset = cs.best_offset if cs.best_offset is not None else cs.current_offset
+        banks = db.get_regime_banks(context_id, core_id, evidence_offset) if context_id is not None else {}
         hours = {r: banks.get(r, 0.0) / 3600.0 for r in regimes}
         failures: dict[str, int] = {}
-        for entry in db.get_tuner_test_log(session_id, core_id):
+        entries = db.get_tuner_test_log(session_id, core_id)
+        for entry in entries:
             if entry["passed"]:
                 continue
             kind = entry["error_type"] or "unknown"
@@ -38,16 +45,14 @@ def _core_rows(db: HistoryDB, session_id: int, context_hash: str) -> list[dict]:
         rows.append(
             {
                 "core": core_id,
-                "offset": offset,
-                "current": cs.current_offset,
+                "accepted_offset": accepted_offset,
+                "candidate_offset": cs.current_offset,
                 "phase": str(cs.phase),
                 "hours": hours,
-                # The weakest regime is the confidence, not the total: one
-                # cheap regime must not buy trust the others never earned.
                 "confidence_hours": min(hours.values()) if hours else 0.0,
                 "anneal_strikes": cs.anneal_strikes,
                 "suspicion": cs.suspicion,
-                "stress_hours": cs.cumulative_test_time / 3600.0,
+                "stress_hours": sum(float(entry["duration_seconds"] or 0.0) for entry in entries) / 3600.0,
                 "crashes": cs.crash_count,
                 "failures": failures,
             }
@@ -62,10 +67,11 @@ def build(db: HistoryDB, session_id: int) -> dict:
     session = tp.get_session(db, session_id)
     if session is None:
         raise ValueError(f"no tuner session {session_id}")
-    context = db.get_context(session.context_id) if session.context_id else None
+    context_id = session.context_id
+    context = db.get_context(context_id) if context_id is not None else None
     context_hash = context.co_hash if context else ""
-    cores = _core_rows(db, session_id, context_hash)
-    yields = db.regime_yield(context_hash) if context_hash else {}
+    cores = _core_rows(db, session_id, context_id, session.status == "quarantined")
+    yields = db.regime_yield(context_id) if context_id is not None else {}
     return {
         "session": session_id,
         "status": session.status,
@@ -116,13 +122,23 @@ def render(report: dict) -> list[str]:
         f"{report['unattributed_crashes']} unattributed crash(es)"
     )
     lines.append("")
-    header = f"{'core':>4}  {'offset':>6}  {'proven':>6}  " + "  ".join(f"{r:>9}" for r in regimes)
+    if report["status"] == "quarantined":
+        lines.append("Historical offsets are unsafe. Remain at stock CO=0.")
+        lines.append("")
+    header = f"{'core':>4}  {'candidate':>9}  {'accepted':>8}  {'proven':>6}  " + "  ".join(f"{r:>9}" for r in regimes)
     lines.append(header)
-    # Deepest offset first: the silicon-quality ordering is the thing a human
-    # actually reads this table for.
-    for row in sorted(report["cores"], key=lambda r: r["offset"]):
+    for row in sorted(
+        report["cores"],
+        key=lambda r: (
+            r["accepted_offset"] is None,
+            r["accepted_offset"] if r["accepted_offset"] is not None else r["candidate_offset"],
+        ),
+    ):
         banked = "  ".join(f"{row['hours'].get(r, 0.0):>8.1f}h" for r in regimes)
-        lines.append(f"{row['core']:>4}  {row['offset']:>6}  {row['confidence_hours']:>5.1f}h  {banked}")
+        accepted = "-" if row["accepted_offset"] is None else str(row["accepted_offset"])
+        lines.append(
+            f"{row['core']:>4}  {row['candidate_offset']:>9}  {accepted:>8}  {row['confidence_hours']:>5.1f}h  {banked}"
+        )
     lines.append("")
     for row in sorted(report["cores"], key=lambda r: r["core"]):
         detail = ", ".join(f"{k}x{v}" for k, v in sorted(row["failures"].items())) or "no failures"
@@ -134,8 +150,13 @@ def render(report: dict) -> list[str]:
     lines.append("regime yield (what each load class has actually caught here)")
     for regime, stats in report["regime_yield"].items():
         lines.append(f"  {regime:<10} {stats['failures']:>4} failure(s) in {stats['hours']:.1f}h")
-    lines.append("")
-    lines.append("Offsets are volatile SMU overlays; enter them in BIOS to keep them across a reboot.")
+    if (
+        report["status"] != "quarantined"
+        and report["cores"]
+        and all(row["accepted_offset"] is not None for row in report["cores"])
+    ):
+        lines.append("")
+        lines.append("Accepted offsets are volatile SMU overlays; enter them in BIOS to keep them across a reboot.")
     return lines
 
 

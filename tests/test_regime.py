@@ -88,6 +88,13 @@ def test_workload_errors_explain_malformed_entries_exactly():
     assert workload_errors("battery", 2, _entry(profile="bursty")) == [
         "battery[2].profile must be one of ['spectrum', 'sustained', 'transient']"
     ]
+    assert workload_errors("battery", 2, _entry(regime="transient")) == [
+        "battery[2].regime transient requires profile transient"
+    ]
+    assert workload_errors("battery", 2, _entry(regime="transient", profile="transient")) == []
+    assert workload_errors("battery", 2, _entry(profile="transient")) == [
+        "battery[2].profile transient requires regime transient"
+    ]
     assert workload_errors("battery", 2, _entry(threads=0)) == ["battery[2].threads must be a positive integer"]
     assert workload_errors("battery", 2, _entry(threads=True)) == ["battery[2].threads must be a positive integer"]
     assert workload_errors("battery", 2, _entry(tests="BKT")) == ["battery[2].tests must be a list of strings"]

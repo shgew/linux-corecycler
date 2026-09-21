@@ -235,14 +235,21 @@ def get_session_offsets(db: HistoryDB, session_id: int) -> dict[int, int]:
 # Only all-offsets-live phases count as evidence. A hunt probe deliberately
 # parks cores at stock, which holds the shared VDDCR rail high and overstates
 # what the profile survives in use, so hunt slots never bank as evidence.
-# Ordinary search does run the live mask and does count.
-LIVE_EVIDENCE_PHASES = frozenset(
+# Search rows need a named regime to prove they were recorded by the live-mask
+# regime battery rather than the pre-v19 isolated search path. Validation and
+# endurance were already all-live before regime provenance was recorded.
+SEARCH_EVIDENCE_PHASES = frozenset(
     {
         "coarse",
         "fine",
         "confirm",
         "backoff_preconfirm",
         "backoff_confirm",
+        "annealing",
+    }
+)
+VALIDATION_EVIDENCE_PHASES = frozenset(
+    {
         "validate_s1",
         "validate_s2",
         "validate_s3",
@@ -251,6 +258,7 @@ LIVE_EVIDENCE_PHASES = frozenset(
         "endurance",
     }
 )
+LIVE_EVIDENCE_PHASES = SEARCH_EVIDENCE_PHASES | VALIDATION_EVIDENCE_PHASES
 
 
 def workload_label(
@@ -284,7 +292,10 @@ def evidence_summary(
         duration = row["duration_seconds"]
         if cs is None or not row["passed"] or not isinstance(duration, (int, float)):
             continue
-        if row["phase"] not in LIVE_EVIDENCE_PHASES:
+        phase = row["phase"]
+        if phase not in LIVE_EVIDENCE_PHASES:
+            continue
+        if phase in SEARCH_EVIDENCE_PHASES and row["regime"] is None:
             continue
         best = cs.best_offset if cs.best_offset is not None else cs.baseline_offset
         if direction * row["offset_tested"] < direction * best:

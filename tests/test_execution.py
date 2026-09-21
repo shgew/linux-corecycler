@@ -244,6 +244,7 @@ class TestVerdictProvenance:
             lambda proc: setattr(proc, "returncode", -15) if proc.returncode is None else None,
         )
         monkeypatch.setattr(execution, "reap_zombies", lambda: None)
+        monkeypatch.setattr(execution, "_exited_without_reaping", lambda proc: proc.returncode is not None)
         supervisor._finish([dead, live], time.monotonic() - 10, 10)
         assert dead.verdict is not None and dead.verdict.error_type == "killed"
         assert live.verdict is not None and live.verdict.passed
@@ -265,6 +266,7 @@ class TestVerdictProvenance:
 
         monkeypatch.setattr(execution, "kill_process_group", finish)
         monkeypatch.setattr(execution, "reap_zombies", lambda: None)
+        monkeypatch.setattr(execution, "_exited_without_reaping", lambda _proc: False)
         stop.set()
         supervisor._finish([stopped], 0.0, 10.0)
         assert stopped.verdict is None

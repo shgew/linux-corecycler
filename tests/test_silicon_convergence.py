@@ -14,7 +14,7 @@ from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
 from tests.silicon import CoreSilicon, FakeSilicon, converged
-from tests.silicon_driver import drive
+from tests.silicon_driver import TerminalReason, drive
 
 
 @pytest.fixture(autouse=True)
@@ -23,7 +23,10 @@ def _synchronous_qtimer():
     Real PySide6 would queue them on an idle loop and the driver would stall."""
     from unittest.mock import patch
 
-    with patch("corecycler.tuner.engine.QTimer.singleShot", new=lambda _ms, fn: fn()):
+    with (
+        patch("corecycler.tuner.engine.QTimer.singleShot", new=lambda _ms, fn: fn()),
+        patch("corecycler.tuner.engine.last_boot_ended_cleanly", return_value=False),
+    ):
         yield
 
 
@@ -50,6 +53,20 @@ def _uniform(n_cores: int, load: int, idle: int) -> FakeSilicon:
     return FakeSilicon(cores={i: CoreSilicon(load_limit=load, idle_limit=idle) for i in range(n_cores)})
 
 
+def _assert_clean_convergence(run, silicon: FakeSilicon) -> None:
+    assert run.terminal_reason is TerminalReason.CLEAN_CONVERGED, run.terminal_reason
+    assert run.context_id is not None
+    assert all(bank and all(seconds > 0 for seconds in bank.values()) for bank in run.regime_banks.values())
+    assert run.anneal_eligible <= run.annealed_cores
+    assert run.anneal_probes >= len(run.annealed_cores)
+    assert run.regime_weights
+    assert sum(run.regime_weights.values()) == pytest.approx(1.0)
+    for core_id, limits in silicon.cores.items():
+        assert run.final[core_id] >= limits.true_limit
+    ok, problems = converged(silicon, run.final)
+    assert ok, problems
+
+
 class TestLoadOnlyInstability:
     """The regime the current engine was built for: every fault is attributable."""
 
@@ -63,9 +80,7 @@ class TestLoadOnlyInstability:
             }
         )
         run = drive(db, _topo(4), mock_backend, silicon)
-        ok, problems = converged(silicon, run.final)
-        assert not run.stalled, f"engine handed back control: {run.status}"
-        assert ok, problems
+        _assert_clean_convergence(run, silicon)
 
 
 class TestIdleInstability:
@@ -88,9 +103,7 @@ class TestIdleInstability:
             }
         )
         run = drive(db, _topo(4), mock_backend, silicon)
-        ok, problems = converged(silicon, run.final)
-        assert not run.stalled, f"engine handed back control: {run.status}"
-        assert ok, problems
+        _assert_clean_convergence(run, silicon)
 
     def test_innocent_cores_keep_their_offsets(self, db, mock_backend):
         """Attribution matters: only the idle-limited core may lose depth."""
@@ -103,7 +116,7 @@ class TestIdleInstability:
             }
         )
         run = drive(db, _topo(4), mock_backend, silicon)
-        assert not run.stalled, f"engine handed back control: {run.status}"
+        _assert_clean_convergence(run, silicon)
         for core_id in (0, 2, 3):
             assert run.final[core_id] <= -39, f"innocent core {core_id} punished to {run.final[core_id]}"
 
@@ -118,9 +131,7 @@ class TestIdleInstability:
             }
         )
         run = drive(db, _topo(4), mock_backend, silicon)
-        ok, problems = converged(silicon, run.final)
-        assert not run.stalled, f"engine handed back control: {run.status}"
-        assert ok, problems
+        _assert_clean_convergence(run, silicon)
 
 
 class TestNeverHandsBack:
@@ -129,7 +140,7 @@ class TestNeverHandsBack:
     def test_unattributable_crashes_do_not_pause(self, db, mock_backend):
         silicon = _uniform(4, load=-40, idle=-24)
         run = drive(db, _topo(4), mock_backend, silicon)
-        assert not run.stalled, f"engine handed back control: {run.status}"
+        _assert_clean_convergence(run, silicon)
 
     def test_flaky_instability_still_converges(self, db, mock_backend):
         """A marginal offset that passes twice before biting must not be trusted."""
@@ -142,9 +153,7 @@ class TestNeverHandsBack:
             }
         )
         run = drive(db, _topo(4), mock_backend, silicon)
-        ok, problems = converged(silicon, run.final)
-        assert not run.stalled, f"engine handed back control: {run.status}"
-        assert ok, problems
+        _assert_clean_convergence(run, silicon)
 
 
 class TestConvergenceProperty:
@@ -156,9 +165,7 @@ class TestConvergenceProperty:
     def test_converges_from_any_silicon(self, db, mock_backend, load, idle):
         silicon = FakeSilicon(cores={i: CoreSilicon(load_limit=load[i], idle_limit=idle[i]) for i in range(4)})
         run = drive(db, _topo(4), mock_backend, silicon)
-        ok, problems = converged(silicon, run.final)
-        assert not run.stalled, f"engine handed back control: {run.status}"
-        assert ok, problems
+        _assert_clean_convergence(run, silicon)
 
 
 @pytest.mark.parametrize("n_cores", [2, 8])
@@ -167,6 +174,11 @@ def test_scales_with_core_count(db, mock_backend, n_cores):
         cores={i: CoreSilicon(load_limit=-38, idle_limit=-27 if i == n_cores - 1 else -60) for i in range(n_cores)}
     )
     run = drive(db, _topo(n_cores), mock_backend, silicon)
-    ok, problems = converged(silicon, run.final)
-    assert not run.stalled, f"engine handed back control: {run.status}"
-    assert ok, problems
+    _assert_clean_convergence(run, silicon)
+
+
+def test_step_cap_is_reported_as_incomplete(db, mock_backend):
+    silicon = _uniform(2, load=-30, idle=-30)
+    run = drive(db, _topo(2), mock_backend, silicon, cap=1)
+    assert run.terminal_reason is TerminalReason.STEP_CAP
+    assert not run.clean_converged

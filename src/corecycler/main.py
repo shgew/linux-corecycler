@@ -319,7 +319,7 @@ def main() -> int:
 
     capabilities.confine()
 
-    if argv and argv[0] in ("doctor", "status", "tune", "resume"):
+    if argv and argv[0] in ("doctor", "status", "report", "tune", "resume"):
         from corecycler.cli import cli_main
 
         return cli_main(argv)

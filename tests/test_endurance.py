@@ -8,6 +8,7 @@ and keeps a per-core evidence ledger that survives a reboot.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -18,7 +19,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from unittest.mock import MagicMock
 
 from corecycler.engine.backends.base import DutyCycle, FFTPreset, StressMode
-from corecycler.history.db import HistoryDB
+from corecycler.history.db import HistoryDB, TuningContextRecord
+from corecycler.tuner import bisect
 from corecycler.tuner import engine as engine_module
 from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
@@ -43,6 +45,9 @@ def db(tmp_path):
 def _seed(db, topo, backend, **cfg):
     """A session that already passed staged validation, poised at stage 9."""
     eng = _make_engine(db, topo, backend, endurance=True, **cfg)
+    context_id = db.create_context(TuningContextRecord(bios_version="Test BIOS", co_hash="ctx"))
+    db.delete_tuner_session(eng._session_id)
+    eng._session_id = tp.create_session(db, eng._config, "Test BIOS", "Test CPU", context_id)
     _seed_confirmed_validating(eng, db, BEST, BASELINES)
     for cs in eng._core_states.values():
         cs.in_test = False
@@ -51,7 +56,9 @@ def _seed(db, topo, backend, **cfg):
     eng._validation_core_order = list(ORDER)
     eng.solo = []
     eng.multi = []
-    eng._start_worker = lambda core, duration, *, spectrum=False: eng.solo.append((core, duration, spectrum))
+    eng._start_worker = lambda core, duration, *, spectrum=False, duty_cycle=None: eng.solo.append(
+        (core, duration, spectrum)
+    )
     eng._start_multi_core_worker = lambda cores, duration, **kw: eng.multi.append((list(cores), duration, kw))
     eng._run_validation_stage4 = lambda *a, **k: None
     return eng
@@ -106,6 +113,44 @@ class TestSlotDispatch:
         # all offsets stay live: nobody was written back to baseline
         assert eng._smu.written == {c: BEST[c] for c in ORDER}
 
+    def test_spectrum_solo_dispatch_uses_the_selected_workload(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch, tmp_path
+    ):
+        eng = _at(_seed(db, topo_dual_ccd_x3d, mock_backend), index=1)
+        workload = {
+            **eng._config.endurance_workloads[0],
+            "stress_mode": "AVX2",
+            "fft_preset": "LARGE",
+            "threads": 1,
+            "profile": "spectrum",
+        }
+        eng._config.endurance_workloads[0] = workload
+        eng._work_dir = tmp_path
+        eng._start_worker = engine_module.TunerEngine._start_worker.__get__(eng)
+
+        class ParkedWorker:
+            def __init__(self, _core_id, _logical_cpu, scheduler, **_kwargs):
+                self.scheduler = scheduler
+                self.finished = MagicMock()
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+        monkeypatch.setattr(engine_module, "_TunerWorker", ParkedWorker)
+        monkeypatch.setattr(eng, "_start_freeze_monitor", lambda: None)
+
+        eng._run_validation_next()
+
+        worker = eng._worker
+        assert worker.started is True
+        assert worker.scheduler.stress_config.mode is StressMode.AVX2
+        assert worker.scheduler.stress_config.fft_preset is FFTPreset.LARGE
+        assert worker.scheduler.stress_config.threads == 1
+        assert worker.scheduler.config.variable_load is True
+        assert worker.scheduler.config.idle_stability_test > 0
+        assert eng._worker_profile == "spectrum"
+
     def test_the_all_core_slot_follows_the_solo_slots(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _at(_seed(db, topo_dual_ccd_x3d, mock_backend), index=len(ORDER))
 
@@ -155,7 +200,16 @@ class TestAllCoreWorkloadLaunch:
         monkeypatch.setattr(engine_module, "ParallelStress", lambda **kw: runners.append(kw) or MagicMock())
 
         eng._start_multi_core_worker(
-            ORDER, 600, workload={"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "LARGE", "threads": 1}
+            ORDER,
+            600,
+            workload={
+                "regime": "current",
+                "backend": "mprime",
+                "stress_mode": "AVX2",
+                "fft_preset": "LARGE",
+                "threads": 1,
+                "profile": "sustained",
+            },
         )
 
         stress_config = runners[0]["stress_config"]
@@ -213,22 +267,80 @@ class TestWorkloadSelection:
         assert eng._threads_for(0, 8) == width
         assert eng._threads_for(999, 4) == 1  # unknown core never asks for SMT it has not got
 
-    def test_hunt_probe_selects_its_recorded_workload(self, db, topo_dual_ccd_x3d, mock_backend):
-        eng = _at(_seed(db, topo_dual_ccd_x3d, mock_backend))
-        eng._hunting = True
-        eng._hunt_workload = {
+    def test_hunt_replays_the_persisted_endurance_workload_and_duration(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch, tmp_path
+    ):
+        workloads = [dict(workload) for workload in TunerConfig().endurance_workloads]
+        workloads[1] = {
+            **workloads[1],
             "backend": "mprime",
             "stress_mode": "AVX2",
             "fft_preset": "LARGE",
             "threads": 1,
+            "profile": "spectrum",
         }
-
-        assert eng._get_active_stress_config(eng._core_states[0]) == (
-            "mprime",
-            "AVX2",
-            "LARGE",
-            1,
+        eng = _seed(
+            db,
+            topo_dual_ccd_x3d,
+            mock_backend,
+            endurance_workloads=workloads,
         )
+        eng._work_dir = tmp_path
+        eng._start_worker = engine_module.TunerEngine._start_worker.__get__(eng)
+        eng._config.backend = "mock"
+        tp.set_validation_position(db, eng._session_id, 9, 0, 0, False, "[]")
+        tp.set_endurance_position(db, eng._session_id, 1, 1, 2)
+        eng._validation_stage = 0
+        eng._endurance_round = 0
+        eng._endurance_workload = 0
+        eng._endurance_index = 0
+        monkeypatch.setattr(eng, "_has_stage1_pass_at_current_best", lambda _core: True)
+
+        class ParkedWorker:
+            def __init__(self, _core_id, _logical_cpu, scheduler, **_kwargs):
+                self.scheduler = scheduler
+                self.finished = MagicMock()
+                self.started = False
+
+            def start(self):
+                self.started = True
+
+        monkeypatch.setattr(engine_module, "_TunerWorker", ParkedWorker)
+        monkeypatch.setattr(eng, "_start_freeze_monitor", lambda: None)
+
+        session = tp.get_session(db, eng._session_id)
+        eng._enter_auto_validation(dict(BEST), resume_from=session)
+
+        assert (eng._endurance_round, eng._endurance_workload, eng._endurance_index) == (1, 1, 2)
+        checkpoint = bisect.HuntState.from_json(tp.get_session(db, eng._session_id).hunt_state)
+        assert checkpoint is not None
+        assert checkpoint.workload is not None
+        assert {
+            key: checkpoint.workload[key] for key in ("backend", "stress_mode", "fft_preset", "threads", "profile")
+        } == {
+            "backend": "mprime",
+            "stress_mode": "AVX2",
+            "fft_preset": "LARGE",
+            "threads": 1,
+            "profile": "spectrum",
+        }
+        assert checkpoint.workload["duration_seconds"] == 1200
+
+        eng._worker = None
+        eng._hunt = checkpoint
+        eng._hunting = True
+        eng._set_status("hunting")
+        eng._run_next_hunt_slot()
+
+        worker = eng._worker
+        assert worker.started is True
+        assert worker.scheduler.backend.name == "mprime"
+        assert worker.scheduler.stress_config.mode is StressMode.AVX2
+        assert worker.scheduler.stress_config.fft_preset is FFTPreset.LARGE
+        assert worker.scheduler.stress_config.threads == 1
+        assert worker.scheduler.config.variable_load is True
+        assert worker.scheduler.config.seconds_per_core == 1200
+        assert eng._worker_profile == "spectrum"
 
     def test_transient_slot_reaches_the_scheduler_as_a_duty_cycled_workload(
         self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch, tmp_path
@@ -236,6 +348,8 @@ class TestWorkloadSelection:
         eng = _at(_seed(db, topo_dual_ccd_x3d, mock_backend))
         eng._work_dir = tmp_path
         eng._start_worker = engine_module.TunerEngine._start_worker.__get__(eng)
+        transient = next(workload for workload in eng._config.battery if workload["regime"] == "transient")
+        eng._config.endurance_workloads[0] = dict(transient)
 
         class ParkedWorker:
             def __init__(self, _core_id, _logical_cpu, scheduler, **_kwargs):
@@ -266,13 +380,20 @@ class TestWorkloadSelection:
         eng = _at(_seed(db, topo_dual_ccd_x3d, mock_backend))
         eng._work_dir = tmp_path
         eng._start_worker = engine_module.TunerEngine._start_worker.__get__(eng)
-        eng._hunting = True
-        eng._hunt_workload = {
+        eng._hunt = bisect.begin(ORDER, [0])
+        eng._hunt.vector = dict(BEST)
+        eng._hunt.workload = {
+            "regime": "current",
             "backend": "mprime",
             "stress_mode": "unknown-mode",
             "fft_preset": "unknown-preset",
             "threads": 1,
+            "profile": "sustained",
+            "duration_seconds": 30,
         }
+        eng._hunt.armed = False
+        eng._hunting = True
+        eng._set_status("hunting")
 
         class ParkedWorker:
             def __init__(self, _core_id, _logical_cpu, scheduler, **_kwargs):
@@ -285,7 +406,7 @@ class TestWorkloadSelection:
         monkeypatch.setattr(engine_module, "_TunerWorker", ParkedWorker)
         monkeypatch.setattr(eng, "_start_freeze_monitor", lambda: None)
 
-        eng._start_worker(0, 30)
+        eng._run_next_hunt_slot()
 
         assert eng._worker.scheduler.stress_config.mode is StressMode.SSE
         assert eng._worker.scheduler.stress_config.fft_preset is FFTPreset.SMALL
@@ -363,11 +484,13 @@ class TestRounds:
     def test_a_round_boundary_hands_a_fully_banked_core_to_annealing(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _seed(db, topo_dual_ccd_x3d, mock_backend)
         _at(eng, workload=len(eng._config.endurance_workloads))
-        eng.context_hash = lambda: "ctx"
+        session = tp.get_session(db, eng._session_id)
+        assert session is not None
+        assert session.context_id is not None
         eng._config.anneal_bank_hours = 1.0
         candidate = ORDER[0]
         for regime in {workload["regime"] for workload in eng._config.battery}:
-            db.bank_regime_time("ctx", candidate, regime, BEST[candidate], 3600.0)
+            db.bank_regime_time(session.context_id, candidate, regime, BEST[candidate], 3600.0)
 
         eng._run_validation_next()
 
@@ -446,15 +569,18 @@ class TestTestLogRows:
 
     def test_a_clean_all_core_slot_banks_every_live_lane(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _at(_seed(db, topo_dual_ccd_x3d, mock_backend), index=len(ORDER))
-        eng.context_hash = lambda: "ctx"
+        session = tp.get_session(db, eng._session_id)
+        assert session is not None
+        assert session.context_id is not None
         eng._cores_under_stress = list(ORDER)
         eng._co_applied = dict(BEST)
         regime = eng._config.endurance_workloads[0]["regime"]
 
-        eng._on_test_finished(ORDER[0], True, "", "", 600.0, 0.0, "", "")
+        lane_results = json.dumps([{"core": core_id, "passed": True, "duration": 600.0} for core_id in ORDER])
+        eng._on_test_finished(ORDER[0], True, "", "", 600.0, 0.0, "", lane_results)
 
         for core_id in ORDER:
-            assert db.get_regime_banks("ctx", core_id, BEST[core_id]) == {regime: 600.0}
+            assert db.get_regime_banks(session.context_id, core_id, BEST[core_id]) == {regime: 600.0}
 
 
 class TestResume:
@@ -531,7 +657,18 @@ class TestEvidenceLedger:
         common = dict(backend="mprime", stress_mode="AVX2", fft_preset="SMALL")
         tp.log_test_result(db, sid, 0, -41, "validate_s1", True, duration=600.0, threads=2, **common)
         tp.log_test_result(db, sid, 0, -40, "endurance", True, duration=600.0, threads=1, **common)
-        tp.log_test_result(db, sid, 0, -41, "coarse", True, duration=300.0, threads=2, **common)
+        tp.log_test_result(
+            db,
+            sid,
+            0,
+            -41,
+            "coarse",
+            True,
+            duration=300.0,
+            threads=2,
+            regime="current",
+            **common,
+        )
         tp.log_test_result(db, sid, 0, -41, "hunt", True, duration=300.0, threads=2, **common)
         tp.log_test_result(db, sid, 0, -40, "endurance", False, duration=300.0, threads=2, **common)
         tp.log_test_result(db, sid, 0, -38, "validate_s1", True, duration=600.0, threads=2, **common)
@@ -544,7 +681,9 @@ class TestEvidenceLedger:
 
         summary = tp.evidence_summary(db, sid, states, direction=-1)
 
-        assert summary == {0: {"mprime AVX2 SMALL 2T": 900.0, "mprime AVX2 SMALL 1T": 600.0}}
+        two_thread = tp.workload_label("mprime", "AVX2", "SMALL", 2, None)
+        one_thread = tp.workload_label("mprime", "AVX2", "SMALL", 1, None)
+        assert summary == {0: {two_thread: 900.0, one_thread: 600.0}}
 
     def test_a_core_without_a_best_offset_falls_back_to_its_baseline(self, db):
         sid = tp.create_session(db, TunerConfig(), "", "")

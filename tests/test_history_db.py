@@ -329,13 +329,26 @@ class TestTunerSessionMethods:
         assert db.get_tuner_session(sid) is None
         assert db.get_context(ctx_id) is None
 
-    def test_regime_bank_summary_returns_persisted_evidence(self, db):
-        db.bank_regime_time("ctx", 3, "boost", -25, 1800.0)
-        db.bank_regime_time("ctx", 3, "boost", -25, 900.0)
+    def test_regime_evidence_isolated_by_complete_context(self, db):
+        ctx_a = db.create_context(TuningContextRecord(bios_version="A", co_hash="same"))
+        ctx_b = db.create_context(TuningContextRecord(bios_version="B", co_hash="same"))
+        db.bank_regime_time(ctx_a, 3, "boost", -25, 1800.0)
+        db.bank_regime_time(ctx_a, 3, "boost", -25, 900.0)
+        db.bank_regime_time(ctx_b, 3, "boost", -25, 120.0)
 
-        assert db.regime_bank_summary("ctx") == [
+        sid_a = db.create_tuner_session("{}", "A", "CPU", context_id=ctx_a)
+        sid_b = db.create_tuner_session("{}", "B", "CPU", context_id=ctx_b)
+        db.insert_tuner_test_log(sid_a, 3, -25, "confirm", False, duration=90.0, regime="boost")
+        db.insert_tuner_test_log(sid_b, 3, -25, "confirm", True, duration=40.0, regime="boost")
+
+        assert db.regime_bank_summary(ctx_a) == [
             {"core_id": 3, "regime": "boost", "offset_value": -25, "clean_seconds": 2700.0}
         ]
+        assert db.regime_bank_summary(ctx_b) == [
+            {"core_id": 3, "regime": "boost", "offset_value": -25, "clean_seconds": 120.0}
+        ]
+        assert db.regime_yield(ctx_a) == {"boost": (1, 90.0)}
+        assert db.regime_yield(ctx_b) == {"boost": (0, 40.0)}
 
 
 class TestBooleanConversion:
@@ -659,9 +672,39 @@ class TestMergeFrom:
         src.upsert_tuner_core_state(
             sid, CoreState(core_id=3, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)
         )
-        src.insert_tuner_test_log(sid, 3, -30, "confirm", True, duration=300.0, run_id=rid)
+        src.insert_tuner_test_log(sid, 3, -30, "confirm", True, duration=300.0, run_id=rid, regime="boost")
+        src.set_hunt_state(sid, '{"low":-35,"high":-30}')
+        src.bank_regime_time(src_ctx, 3, "boost", -30, 1800.0)
         src.journal_co_intent(sid, 3, -30, survived=True)
         src.close()
+        dst.bank_regime_time(dst_ctx, 3, "boost", -30, 900.0)
+
+        import sqlite3
+
+        legacy = sqlite3.connect(tmp_path / "src.db", isolation_level=None)
+        legacy.executescript(
+            """\
+BEGIN IMMEDIATE;
+ALTER TABLE tuner_regime_banks RENAME TO tuner_regime_banks_v20;
+CREATE TABLE tuner_regime_banks (
+    context_hash TEXT NOT NULL,
+    core_id INTEGER NOT NULL,
+    regime TEXT NOT NULL,
+    offset_value INTEGER NOT NULL,
+    clean_seconds REAL NOT NULL DEFAULT 0.0,
+    updated_at TEXT NOT NULL,
+    UNIQUE(context_hash, core_id, regime, offset_value)
+);
+INSERT INTO tuner_regime_banks
+SELECT 'h1', core_id, regime, offset_value, clean_seconds, updated_at
+FROM tuner_regime_banks_v20;
+DROP TABLE tuner_regime_banks_v20;
+CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_hash, core_id);
+UPDATE schema_version SET version=19;
+COMMIT;
+"""
+        )
+        legacy.close()
 
         counts = dst.merge_from(tmp_path / "src.db")
         assert counts == {"contexts": 0, "runs": 1, "tuner_sessions": 1}
@@ -684,6 +727,9 @@ class TestMergeFrom:
         log_rows = dst.get_tuner_test_log(sess.id)
         assert len(log_rows) == 1
         assert log_rows[0]["run_id"] == merged_run.id  # cross-reference remapped
+        assert log_rows[0]["regime"] == "boost"
+        assert sess.hunt_state == '{"low":-35,"high":-30}'
+        assert dst.get_regime_banks(dst_ctx, 3, -30) == {"boost": 2700.0}
         assert dst.journal_survived_values(sess.id) == {3: -30}
         dst.close()
 
@@ -724,6 +770,48 @@ class TestMigrationCrashSafety:
             assert version == HistoryDB.SCHEMA_VERSION
         finally:
             db.close()
+
+    def test_v19_ambiguous_hash_bank_fails_closed_and_is_reentrant(self, tmp_path):
+        import sqlite3
+
+        path = tmp_path / "history.db"
+        db = HistoryDB(path)
+        ctx_a = db.create_context(TuningContextRecord(bios_version="A", co_hash="same"))
+        ctx_b = db.create_context(TuningContextRecord(bios_version="B", co_hash="same"))
+        db.close()
+
+        conn = sqlite3.connect(path, isolation_level=None)
+        conn.executescript(
+            """\
+BEGIN IMMEDIATE;
+ALTER TABLE tuner_regime_banks RENAME TO tuner_regime_banks_v20;
+CREATE TABLE tuner_regime_banks (
+    context_hash TEXT NOT NULL,
+    core_id INTEGER NOT NULL,
+    regime TEXT NOT NULL,
+    offset_value INTEGER NOT NULL,
+    clean_seconds REAL NOT NULL DEFAULT 0.0,
+    updated_at TEXT NOT NULL,
+    UNIQUE(context_hash, core_id, regime, offset_value)
+);
+INSERT INTO tuner_regime_banks VALUES ('same', 0, 'boost', -20, 3600.0, 'now');
+DROP TABLE tuner_regime_banks_v20;
+CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_hash, core_id);
+UPDATE schema_version SET version=19;
+COMMIT;
+"""
+        )
+        conn.close()
+
+        migrated = HistoryDB(path)
+        assert migrated.regime_bank_summary(ctx_a) == []
+        assert migrated.regime_bank_summary(ctx_b) == []
+        migrated.close()
+
+        reopened = HistoryDB(path)
+        assert reopened.regime_bank_summary(ctx_a) == []
+        assert reopened.regime_bank_summary(ctx_b) == []
+        reopened.close()
 
 
 class TestAdoptLegacyRootDb:

@@ -149,6 +149,28 @@ class TestArgHandling:
         assert cli.cli_main([flag]) == cli.EXIT_COMPLETED
         assert capsys.readouterr().out == f"corecycler {__version__}\n"
 
+    def test_installed_main_routes_report_before_gui_startup(self, monkeypatch):
+        from corecycler import capabilities
+        from corecycler import main as app_main
+
+        seen = {}
+        monkeypatch.setattr(_sys, "argv", ["corecycler", "report", "--json"])
+        monkeypatch.setattr(app_main, "setup_logging", lambda: None)
+        monkeypatch.setattr(capabilities, "confine", lambda: None)
+        monkeypatch.setattr(
+            cli,
+            "cmd_report",
+            lambda **kwargs: seen.update(kwargs) or cli.EXIT_COMPLETED,
+        )
+        monkeypatch.setattr(
+            app_main,
+            "_bootstrap_sudo_session",
+            lambda: pytest.fail("report reached GUI startup and its instance lock"),
+        )
+
+        assert app_main.main() == cli.EXIT_COMPLETED
+        assert seen == {"session_id": None, "as_json": True}
+
 
 class TestStatus:
     def test_empty_db(self, db, capsys):
@@ -234,6 +256,12 @@ class TestReport:
         assert cli.cmd_report(db=db) == cli.EXIT_COMPLETED
         assert capsys.readouterr().out == "no tuner sessions\n"
 
+    def test_empty_db_is_valid_json_without_prose(self, db, capsys):
+        assert cli.cmd_report(db=db, as_json=True) == cli.EXIT_COMPLETED
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert json.loads(captured.out) is None
+
     def test_unknown_session_id_is_refused(self, db, capsys):
         assert cli.cmd_report(session_id=999, db=db) == cli.EXIT_REFUSED
         assert "no tuner session 999" in capsys.readouterr().err
@@ -263,6 +291,46 @@ class TestReport:
         assert captured.err == ""
         assert captured.out.startswith(f"session #{latest}  running  New CPU\n")
 
+    def test_history_open_failure_is_an_actionable_refusal_with_clean_json_stdout(self, monkeypatch, capsys):
+        from corecycler.history import db as history_db
+
+        def fail_to_open():
+            raise PermissionError("permission denied")
+
+        monkeypatch.setattr(history_db, "HistoryDB", fail_to_open)
+
+        assert cli.cli_main(["report", "--json"]) == cli.EXIT_REFUSED
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == ("corecycler report: cannot read tuner history: permission denied\n")
+
+    def test_corrupt_history_is_an_actionable_refusal_with_clean_json_stdout(self, tmp_path, monkeypatch, capsys):
+        from corecycler.history import db as history_db
+
+        path = tmp_path / "corrupt.sqlite"
+        path.write_bytes(b"not a sqlite database")
+        monkeypatch.setattr(history_db, "HistoryDB", lambda: HistoryDB(path))
+
+        assert cli.cli_main(["report", "--json"]) == cli.EXIT_REFUSED
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert "corecycler report: cannot read tuner history" in captured.err
+        assert "database" in captured.err.lower()
+
+    def test_report_failure_is_refused_without_breaking_json_stdout(self, db, monkeypatch, capsys):
+        from corecycler.tuner import report as tuner_report
+
+        def fail(*_args):
+            raise RuntimeError("boom")
+
+        sid = tp.create_session(db, TunerConfig(), "", "")
+        monkeypatch.setattr(tuner_report, "build", fail)
+
+        assert cli.cmd_report(session_id=sid, as_json=True, db=db) == cli.EXIT_REFUSED
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "corecycler report: cannot read tuner history: boom\n"
+
     def test_json_reports_per_core_offsets(self, db, monkeypatch, capsys):
         sid = tp.create_session(db, TunerConfig(cores_to_test=[0, 1]), "Test BIOS", "Test CPU")
         tp.save_core_state(
@@ -280,7 +348,7 @@ class TestReport:
         assert cli.cli_main(["report", str(sid), "--json"]) == cli.EXIT_COMPLETED
         report = json.loads(capsys.readouterr().out)
         assert report["session"] == sid
-        assert [(core["core"], core["offset"]) for core in report["cores"]] == [(0, -30), (1, -22)]
+        assert [(core["core"], core["accepted_offset"]) for core in report["cores"]] == [(0, -30), (1, -22)]
 
 
 class TestSeedFrom:
@@ -334,6 +402,60 @@ class TestSeedFrom:
         assert code == cli.EXIT_REFUSED
         assert engine is None
         assert "learned no offsets" in capsys.readouterr().err
+
+    def test_a_quarantined_source_is_rejected_before_reading_offsets(self, db, monkeypatch, capsys):
+        sid = self._prior(db, {0: -30})
+        tp.update_session_status(db, sid, "quarantined")
+        monkeypatch.setattr(
+            tp,
+            "get_session_offsets",
+            lambda *_: pytest.fail("quarantined offsets were treated as seed hypotheses"),
+        )
+
+        code, engine = self._run(db, sid)
+
+        assert code == cli.EXIT_REFUSED
+        assert engine is None
+        assert "quarantined" in capsys.readouterr().err
+
+    @pytest.mark.parametrize(
+        ("mark_unresolved", "description"),
+        [
+            (
+                lambda db, sid: tp.set_resume_crash_streak(db, sid, 1),
+                "crash recovery",
+            ),
+            (
+                lambda db, sid: tp.set_unattributed_crashes(db, sid, 1),
+                "unattributed crash",
+            ),
+            (lambda db, sid: tp.set_hunting_core(db, sid, 0), "isolated hunt"),
+            (
+                lambda db, sid: tp.set_hunt_state(db, sid, '{"stage":"control"}'),
+                "crash hunt",
+            ),
+            (
+                lambda db, sid: tp.journal_co_intent(db, sid, 0, -30, False),
+                "crash evidence",
+            ),
+        ],
+    )
+    def test_an_unresolved_crash_or_hunt_source_is_rejected_before_offsets(
+        self, db, monkeypatch, capsys, mark_unresolved, description
+    ):
+        sid = self._prior(db, {0: -30})
+        mark_unresolved(db, sid)
+        monkeypatch.setattr(
+            tp,
+            "get_session_offsets",
+            lambda *_: pytest.fail("unresolved offsets were treated as seed hypotheses"),
+        )
+
+        code, engine = self._run(db, sid)
+
+        assert code == cli.EXIT_REFUSED
+        assert engine is None
+        assert description in capsys.readouterr().err
 
     def test_the_flag_reaches_cmd_run(self, db, monkeypatch):
         sid = self._prior(db, {0: -37})

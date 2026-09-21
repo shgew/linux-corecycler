@@ -15,7 +15,7 @@ if not hasattr(_sys.modules.get("PySide6", None), "__path__"):
     pytest.skip("GUI tests require real PySide6", allow_module_level=True)
 
 from corecycler.engine.topology import CPUTopology, PhysicalCore
-from corecycler.history.db import HistoryDB
+from corecycler.history.db import HistoryDB, TuningContextRecord
 from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.state import CoreState, TunerPhase
@@ -44,35 +44,36 @@ def _tab(db):
     return TunerTab(db=db, topology=_topo(), smu=None)
 
 
-def _engine(sid, states, context_hash=""):
+def _engine(sid, states):
     eng = MagicMock()
     eng.session_id = sid
     eng.status = "validating"
     eng.core_states = states
-    eng.context_hash = lambda: context_hash
     return eng
 
 
-def _sid(db):
-    return tp.create_session(db, TunerConfig(), bios_version="2402", cpu_model="Test 8C")
+def _sid(db, context_id=None):
+    return tp.create_session(db, TunerConfig(), bios_version="2402", cpu_model="Test 8C", context_id=context_id)
 
 
 class TestCoreRow:
-    def test_update_core_row_shows_banked_evidence_not_just_a_phase(self, db):
-        """The row's job is to say how much the offset is worth.
+    def test_update_core_row_shows_only_selected_context_banked_evidence(self, db):
+        """The row reports evidence from the selected session's complete context.
 
-        The weakest regime is the headline number, so a core with hours in
-        three regimes and nothing in the fourth must still read as unproven.
+        The two BIOS contexts intentionally share a CO hash. The weaker regime
+        is still the headline number, so a missing fourth regime is unproven.
         """
-        sid = _sid(db)
+        selected_context = db.create_context(TuningContextRecord(bios_version="2402", co_hash="same"))
+        other_context = db.create_context(TuningContextRecord(bios_version="2403", co_hash="same"))
+        sid = _sid(db, selected_context)
         tp.log_test_result(db, sid, 0, -30, "confirm", True, duration=60.0)
         for regime in ("boost", "current", "transient"):
-            db.bank_regime_time("ctx", 0, regime, -30, 7200.0)
+            db.bank_regime_time(selected_context, 0, regime, -30, 7200.0)
+            db.bank_regime_time(other_context, 0, regime, -30, 18000.0)
         tab = _tab(db)
         tab._engine = _engine(
             sid,
             {0: CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)},
-            context_hash="ctx",
         )
         tab._update_core_row(0)
         assert tab._find_core_row(0) == 0

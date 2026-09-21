@@ -14,6 +14,7 @@ from corecycler.history.db import HistoryDB
 from corecycler.tuner import engine as engine_mod
 from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
+from corecycler.tuner.regime import Mask
 from corecycler.tuner.state import CoreState, TunerPhase
 from tests.test_tuner_faults import FaultSMU, make_engine
 
@@ -41,6 +42,32 @@ def tuning(db, topo_single_ccd, mock_backend, monkeypatch):
     monkeypatch.setattr(eng, "_run_validation_next", lambda: None)
     monkeypatch.setattr(eng, "_start_worker", lambda *_: None)
     return eng
+
+
+def test_failed_readback_cannot_skip_abort_restoration(tuning, monkeypatch):
+    smu = tuning._smu
+
+    def partially_verified(core, value):
+        smu.applied[core] = value
+        smu.writes.append((core, value))
+        return value == 0
+
+    monkeypatch.setattr(smu, "set_co_offset", partially_verified)
+
+    assert not tuning._apply_co_mask(0, -10, Mask.ISOLATED)
+    assert smu.applied[0] == 0
+    assert smu.writes[-1] == (0, 0)
+
+    # An abort must not trust the write cache: hardware can diverge after the
+    # failed operation and still needs an unconditional baseline write.
+    assert tuning._co_applied[0] == 0
+    smu.applied[0] = -10
+    writes_before_abort = len(smu.writes)
+
+    tuning.abort()
+
+    assert smu.applied[0] == 0
+    assert (0, 0) in smu.writes[writes_before_abort:]
 
 
 @pytest.mark.parametrize("action", ["start", "resume", "validate_profile"])

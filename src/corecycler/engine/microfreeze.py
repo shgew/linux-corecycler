@@ -49,7 +49,7 @@ class MicroFreezeMonitor:
         """Start monitoring in a daemon thread."""
         if self._thread is not None and self._thread.is_alive():
             return
-        self._stop_event.clear()
+        self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, name="micro-freeze-monitor", daemon=True)
         self._thread.start()
 
@@ -58,7 +58,8 @@ class MicroFreezeMonitor:
         self._stop_event.set()
         if self._thread is not None:
             self._thread.join(timeout=2.0)
-            self._thread = None
+            if not self._thread.is_alive():
+                self._thread = None
 
     def set_context(self, context: str) -> None:
         with self._lock:
@@ -111,6 +112,6 @@ class MicroFreezeMonitor:
             worst_ms = max((hitch.latency_ms for hitch in self._hitches), default=0.0)
         content = f"timestamp={datetime.now(UTC).isoformat()}\ncontext={context}\nworst_latency_ms={worst_ms:.3f}\n"
         try:
-            atomic_write(self.breadcrumb_path, content)
+            atomic_write(self.breadcrumb_path, content, durable=True)
         except OSError as exc:
             log.warning("Could not write micro-freeze breadcrumb %s: %s", self.breadcrumb_path, exc)

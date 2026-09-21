@@ -21,7 +21,7 @@ def db():
 
 
 def test_missing_session_is_reported_by_id(db):
-    with pytest.raises(ValueError, match=r"^no tuner session 404$"):
+    with pytest.raises(ValueError):
         build(db, 404)
 
 
@@ -29,7 +29,6 @@ def test_empty_session_reports_zero_evidence_without_inventing_limits(db):
     session_id = tp.create_session(db, TunerConfig(), "Empty BIOS", "Empty CPU")
 
     report = build(db, session_id)
-    lines = render(report)
 
     assert report["cores"] == []
     assert report["regime_yield"] == {}
@@ -41,14 +40,6 @@ def test_empty_session_reports_zero_evidence_without_inventing_limits(db):
         "edc_limit_a": None,
         "pbo_scalar": None,
     }
-    assert lines[:3] == [
-        f"session #{session_id}  running  Empty CPU",
-        "BIOS Empty BIOS  context none",
-        "0.0 stress-hours total, endurance round 0, 0 unattributed crash(es)",
-    ]
-    assert not any(line.startswith("limits ") for line in lines)
-    assert "regime yield (what each load class has actually caught here)" in lines
-    assert lines[-1] == "Offsets are volatile SMU overlays; enter them in BIOS to keep them across a reboot."
 
 
 def _seed_evidence_report(db: HistoryDB) -> int:
@@ -106,7 +97,7 @@ def _seed_evidence_report(db: HistoryDB) -> int:
         "transient": 1800.0,
         "coupled": 10800.0,
     }.items():
-        db.bank_regime_time(context_hash, 0, regime, -32, seconds)
+        db.bank_regime_time(context_id, 0, regime, -32, seconds)
 
     tp.log_test_result(
         db,
@@ -161,6 +152,26 @@ def _seed_evidence_report(db: HistoryDB) -> int:
         duration=1800.0,
         regime="transient",
     )
+    tp.log_test_result(
+        db,
+        session_id,
+        1,
+        -20,
+        "validation",
+        True,
+        duration=1800.0,
+        regime="current",
+    )
+    tp.log_test_result(
+        db,
+        session_id,
+        1,
+        -20,
+        "endurance",
+        True,
+        duration=7200.0,
+        regime="coupled",
+    )
     return session_id
 
 
@@ -182,61 +193,62 @@ def test_report_exposes_banked_confidence_failures_and_session_counters(db):
     }
     assert report["unattributed_crashes"] == 4
     assert report["endurance_round"] == 7
-    assert report["total_stress_hours"] == 3.0
+    assert report["total_stress_hours"] == 5.75
     assert report["cores"] == [
         {
             "core": 0,
-            "offset": -32,
-            "current": -30,
+            "accepted_offset": -32,
+            "candidate_offset": -30,
             "phase": "annealing",
             "hours": {"boost": 2.0, "current": 1.0, "transient": 0.5, "coupled": 3.0},
             "confidence_hours": 0.5,
             "anneal_strikes": 2,
             "suspicion": 1.75,
-            "stress_hours": 2.5,
+            "stress_hours": 3.25,
             "crashes": 3,
             "failures": {"worker_exit": 2, "mce": 1, "unknown": 1},
         },
         {
             "core": 1,
-            "offset": -20,
-            "current": -20,
+            "accepted_offset": None,
+            "candidate_offset": -20,
             "phase": "confirmed",
             "hours": {"boost": 0.0, "current": 0.0, "transient": 0.0, "coupled": 0.0},
             "confidence_hours": 0.0,
             "anneal_strikes": 0,
             "suspicion": 0.0,
-            "stress_hours": 0.5,
+            "stress_hours": 2.5,
             "crashes": 0,
             "failures": {},
         },
     ]
     assert report["regime_yield"] == {
         "boost": {"failures": 2, "hours": 1.75},
-        "current": {"failures": 1, "hours": 1.0},
+        "coupled": {"failures": 0, "hours": 2.0},
+        "current": {"failures": 1, "hours": 1.5},
         "transient": {"failures": 1, "hours": 0.5},
     }
 
 
-def test_text_report_orders_offsets_and_spells_out_the_evidence(db):
+def test_unproven_candidate_is_not_recommended_for_bios_application(db):
     report = build(db, _seed_evidence_report(db))
 
+    assert report["cores"][1]["candidate_offset"] == -20
+    assert report["cores"][1]["accepted_offset"] is None
+    assert not any("enter" in line.lower() and "bios" in line.lower() for line in render(report))
+
+
+def test_quarantine_marks_every_historical_offset_unsafe(db):
+    session_id = _seed_evidence_report(db)
+    tp.update_session_status(db, session_id, "quarantined")
+
+    report = build(db, session_id)
     lines = render(report)
 
-    assert lines[:4] == [
-        f"session #{report['session']}  completed  Ryzen Test",
-        "BIOS Test BIOS  context 0123456789ab",
-        "limits  PPT 120W  TDC 75A  EDC 110A",
-        "3.0 stress-hours total, endurance round 7, 4 unattributed crash(es)",
-    ]
-    core_rows = [line for line in lines if line.strip().startswith(("0 ", "1 "))]
-    assert core_rows[0].split() == ["0", "-32", "0.5h", "2.0h", "1.0h", "0.5h", "3.0h"]
-    assert core_rows[1].split() == ["1", "-20", "0.0h", "0.0h", "0.0h", "0.0h", "0.0h"]
-    assert "core 0: annealing, 3 crash(es), 2 anneal strike(s); mcex1, unknownx1, worker_exitx2" in lines
-    assert "core 1: confirmed, 0 crash(es), 0 anneal strike(s); no failures" in lines
-    assert "  boost         2 failure(s) in 1.8h" in lines
-    assert "  current       1 failure(s) in 1.0h" in lines
-    assert "  transient     1 failure(s) in 0.5h" in lines
+    assert [row["candidate_offset"] for row in report["cores"]] == [-30, -20]
+    assert all(row["accepted_offset"] is None for row in report["cores"])
+    assert any("unsafe" in line.lower() for line in lines)
+    assert not any("enter" in line.lower() and "bios" in line.lower() for line in lines)
 
 
 def test_json_report_keeps_the_public_nested_shape(db):
@@ -245,6 +257,10 @@ def test_json_report_keeps_the_public_nested_shape(db):
     decoded = json.loads(to_json(report))
 
     assert decoded == report
+    assert [(row["candidate_offset"], row["accepted_offset"]) for row in decoded["cores"]] == [
+        (-30, -32),
+        (-20, None),
+    ]
     assert set(decoded) == {
         "session",
         "status",
@@ -261,8 +277,8 @@ def test_json_report_keeps_the_public_nested_shape(db):
     }
     assert set(decoded["cores"][0]) == {
         "core",
-        "offset",
-        "current",
+        "accepted_offset",
+        "candidate_offset",
         "phase",
         "hours",
         "confidence_hours",

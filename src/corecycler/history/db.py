@@ -163,7 +163,7 @@ class TelemetrySample:
 class HistoryDB:
     """Crash-safe SQLite database for test run history."""
 
-    SCHEMA_VERSION = 19
+    SCHEMA_VERSION = 20
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
@@ -415,15 +415,15 @@ CREATE TABLE IF NOT EXISTS tuner_co_journal (
 );
 
 CREATE TABLE IF NOT EXISTS tuner_regime_banks (
-    context_hash TEXT    NOT NULL,
+    context_id   INTEGER NOT NULL REFERENCES tuning_contexts(id) ON DELETE CASCADE,
     core_id      INTEGER NOT NULL,
     regime       TEXT    NOT NULL,
     offset_value INTEGER NOT NULL,
     clean_seconds REAL   NOT NULL DEFAULT 0.0,
     updated_at   TEXT    NOT NULL,
-    UNIQUE(context_hash, core_id, regime, offset_value)
+    UNIQUE(context_id, core_id, regime, offset_value)
 );
-CREATE INDEX IF NOT EXISTS idx_regime_bank_core ON tuner_regime_banks(context_hash, core_id);
+CREATE INDEX IF NOT EXISTS idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
 """
     ).replace("__SCHEMA_VERSION__", str(SCHEMA_VERSION))
 
@@ -802,6 +802,79 @@ CREATE INDEX IF NOT EXISTS idx_regime_bank_core ON tuner_regime_banks(context_ha
 COMMIT;
 """
 
+    @staticmethod
+    def _migrate_v20(conn: sqlite3.Connection) -> None:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(tuner_regime_banks)").fetchall()}
+        current_columns = {
+            "context_id",
+            "core_id",
+            "regime",
+            "offset_value",
+            "clean_seconds",
+            "updated_at",
+        }
+        if columns == current_columns:
+            foreign_keys = conn.execute("PRAGMA foreign_key_list(tuner_regime_banks)").fetchall()
+            context_fk = any(
+                row["from"] == "context_id"
+                and row["table"] == "tuning_contexts"
+                and row["to"] == "id"
+                and row["on_delete"] == "CASCADE"
+                for row in foreign_keys
+            )
+            unique_key = False
+            for index in conn.execute("PRAGMA index_list(tuner_regime_banks)").fetchall():
+                if not index["unique"]:
+                    continue
+                indexed = conn.execute(
+                    "SELECT name FROM pragma_index_info(?) ORDER BY seqno", (index["name"],)
+                ).fetchall()
+                if [row["name"] for row in indexed] == [
+                    "context_id",
+                    "core_id",
+                    "regime",
+                    "offset_value",
+                ]:
+                    unique_key = True
+                    break
+            if not context_fk or not unique_key:
+                raise RuntimeError("Invalid tuner_regime_banks schema: unsafe context identity")
+            conn.execute("UPDATE schema_version SET version=20")
+            return
+        if "context_hash" not in columns or "context_id" in columns:
+            raise RuntimeError("Invalid tuner_regime_banks schema: unsafe context key")
+        conn.executescript(HistoryDB._DDL_MIGRATE_V20)
+
+    _DDL_MIGRATE_V20 = """\
+BEGIN IMMEDIATE;
+CREATE TABLE tuner_regime_banks_v20 (
+    context_id   INTEGER NOT NULL REFERENCES tuning_contexts(id) ON DELETE CASCADE,
+    core_id      INTEGER NOT NULL,
+    regime       TEXT    NOT NULL,
+    offset_value INTEGER NOT NULL,
+    clean_seconds REAL   NOT NULL DEFAULT 0.0,
+    updated_at   TEXT    NOT NULL,
+    UNIQUE(context_id, core_id, regime, offset_value)
+);
+INSERT INTO tuner_regime_banks_v20 (
+    context_id, core_id, regime, offset_value, clean_seconds, updated_at
+)
+SELECT c.id, b.core_id, b.regime, b.offset_value, b.clean_seconds, b.updated_at
+FROM tuner_regime_banks b
+JOIN tuning_contexts c ON c.co_hash = b.context_hash
+JOIN (
+    SELECT co_hash
+    FROM tuning_contexts
+    GROUP BY co_hash
+    HAVING COUNT(*) = 1
+) unambiguous ON unambiguous.co_hash = b.context_hash;
+DROP TABLE tuner_regime_banks;
+ALTER TABLE tuner_regime_banks_v20 RENAME TO tuner_regime_banks;
+CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
+UPDATE schema_version SET version=20;
+COMMIT;
+"""
+
     _MIGRATIONS: dict[int, str | callable] = {
         2: _migrate_v2,
         3: _DDL_MIGRATE_V3,
@@ -821,6 +894,7 @@ COMMIT;
         17: _migrate_v17,
         18: _migrate_v18,
         19: _migrate_v19,
+        20: _migrate_v20,
     }
 
     # ------------------------------------------------------------------
@@ -1686,56 +1760,55 @@ COMMIT;
     # Per-regime confidence banks
     # ------------------------------------------------------------------
 
-    def bank_regime_time(self, context_hash: str, core_id: int, regime: str, offset_value: int, seconds: float) -> None:
+    def bank_regime_time(
+        self,
+        context_id: int,
+        core_id: int,
+        regime: str,
+        offset_value: int,
+        seconds: float,
+    ) -> None:
         """Credit clean time to one (context, core, regime, offset) bucket.
 
-        Keyed on the context hash rather than the session so confidence
-        accumulates across reboots and sessions, and is invalidated the moment
-        the operating point it was earned under changes.
+        The complete context identity keeps evidence isolated by BIOS while it
+        accumulates across reboots and sessions at one operating point.
         """
         self.__conn.execute(
             """\
             INSERT INTO tuner_regime_banks
-                (context_hash, core_id, regime, offset_value, clean_seconds, updated_at)
+                (context_id, core_id, regime, offset_value, clean_seconds, updated_at)
             VALUES (?,?,?,?,?,?)
-            ON CONFLICT(context_hash, core_id, regime, offset_value) DO UPDATE SET
+            ON CONFLICT(context_id, core_id, regime, offset_value) DO UPDATE SET
                 clean_seconds = clean_seconds + excluded.clean_seconds,
                 updated_at = excluded.updated_at
             """,
-            (context_hash, core_id, regime, offset_value, float(seconds), self._now_iso()),
+            (context_id, core_id, regime, offset_value, float(seconds), self._now_iso()),
         )
 
-    def get_regime_banks(self, context_hash: str, core_id: int, offset_value: int) -> dict[str, float]:
+    def get_regime_banks(self, context_id: int, core_id: int, offset_value: int) -> dict[str, float]:
         rows = self.__conn.execute(
-            "SELECT regime, clean_seconds FROM tuner_regime_banks "
-            "WHERE context_hash=? AND core_id=? AND offset_value=?",
-            (context_hash, core_id, offset_value),
+            "SELECT regime, clean_seconds FROM tuner_regime_banks WHERE context_id=? AND core_id=? AND offset_value=?",
+            (context_id, core_id, offset_value),
         ).fetchall()
         return {r["regime"]: r["clean_seconds"] for r in rows}
 
-    def clear_regime_banks(self, context_hash: str, core_id: int) -> None:
-        """Drop a core's banked confidence: its offset moved, so nothing it
-        earned at the old depth says anything about the new one."""
+    def clear_regime_banks(self, context_id: int, core_id: int) -> None:
+        """Drop banked confidence for one core at one operating point."""
         self.__conn.execute(
-            "DELETE FROM tuner_regime_banks WHERE context_hash=? AND core_id=?",
-            (context_hash, core_id),
+            "DELETE FROM tuner_regime_banks WHERE context_id=? AND core_id=?",
+            (context_id, core_id),
         )
 
-    def regime_bank_summary(self, context_hash: str) -> list[dict[str, object]]:
+    def regime_bank_summary(self, context_id: int) -> list[dict[str, object]]:
         rows = self.__conn.execute(
             "SELECT core_id, regime, offset_value, clean_seconds FROM tuner_regime_banks "
-            "WHERE context_hash=? ORDER BY core_id, regime",
-            (context_hash,),
+            "WHERE context_id=? ORDER BY core_id, regime",
+            (context_id,),
         ).fetchall()
         return [dict(r) for r in rows]
 
-    def regime_yield(self, context_hash: str) -> dict[str, tuple[int, float]]:
-        """(failures, seconds) per regime across every session in a context.
-
-        This is how the scheduler learns which regimes actually catch things
-        on this silicon. It is context-scoped for the same reason the banks
-        are: a different operating point is a different experiment.
-        """
+    def regime_yield(self, context_id: int) -> dict[str, tuple[int, float]]:
+        """Return (failures, seconds) per regime for one complete context."""
         rows = self.__conn.execute(
             """\
             SELECT l.regime AS regime,
@@ -1743,11 +1816,10 @@ COMMIT;
                    COALESCE(SUM(l.duration_seconds), 0.0) AS seconds
             FROM tuner_test_log l
             JOIN tuner_sessions s ON s.id = l.session_id
-            JOIN tuning_contexts c ON c.id = s.context_id
-            WHERE c.co_hash = ? AND l.regime IS NOT NULL
+            WHERE s.context_id = ? AND l.regime IS NOT NULL
             GROUP BY l.regime
             """,
-            (context_hash,),
+            (context_id,),
         ).fetchall()
         return {r["regime"]: (int(r["failures"]), float(r["seconds"])) for r in rows}
 
@@ -1963,6 +2035,7 @@ COMMIT;
                 "peak_stretch_pct",
                 "threads",
                 "profile",
+                "regime",
             ),
             {"session_id": "tuner_sessions", "run_id": "runs"},
         ),
@@ -2094,6 +2167,7 @@ COMMIT;
                     "endurance_index",
                     "boot_id",
                     "app_version",
+                    "hunt_state",
                 ),
             )
             counts["tuner_sessions"] = len(maps["tuner_sessions"])
@@ -2127,6 +2201,35 @@ COMMIT;
                     "INSERT INTO tuner_co_journal (session_id, core_id, value, survived, updated_at) "
                     "VALUES (?,?,?,?,?)",
                     (new_sid, row["core_id"], row["value"], row["survived"], row["updated_at"]),
+                )
+
+            for row in conn.execute(
+                "SELECT * FROM src.tuner_regime_banks ORDER BY context_id, core_id, regime, offset_value"
+            ).fetchall():
+                context_id = ctx_map.get(row["context_id"])
+                if context_id is None:
+                    continue
+                conn.execute(
+                    """\
+                    INSERT INTO tuner_regime_banks
+                        (context_id, core_id, regime, offset_value, clean_seconds, updated_at)
+                    VALUES (?,?,?,?,?,?)
+                    ON CONFLICT(context_id, core_id, regime, offset_value) DO UPDATE SET
+                        clean_seconds = (
+                            tuner_regime_banks.clean_seconds + excluded.clean_seconds
+                        ),
+                        updated_at = MAX(
+                            tuner_regime_banks.updated_at, excluded.updated_at
+                        )
+                    """,
+                    (
+                        context_id,
+                        row["core_id"],
+                        row["regime"],
+                        row["offset_value"],
+                        row["clean_seconds"],
+                        row["updated_at"],
+                    ),
                 )
 
             conn.execute("COMMIT")

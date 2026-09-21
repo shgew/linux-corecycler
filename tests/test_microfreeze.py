@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from typing import TYPE_CHECKING
+from unittest.mock import Mock
 
 import pytest
 
@@ -85,7 +86,8 @@ def test_periodic_breadcrumb_contains_context_and_worst_latency(
 def test_breadcrumb_write_error_is_logged_and_swallowed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    def fail_write(_path: Path, _content: str) -> None:
+    def fail_write(_path: Path, _content: str, *, durable: bool) -> None:
+        assert durable
         raise OSError("disk unavailable")
 
     monkeypatch.setattr(microfreeze, "atomic_write", fail_write)
@@ -110,6 +112,41 @@ def test_monitor_start_is_idempotent_and_stop_joins(monkeypatch: pytest.MonkeyPa
     assert thread is not None
     assert thread.daemon
     assert not thread.is_alive()
+
+
+def test_timed_out_writer_remains_owned_and_blocks_replacement(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    threads: list[Mock] = []
+
+    def make_thread(**_kwargs: object) -> Mock:
+        thread = Mock()
+        thread.is_alive.return_value = True
+        threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(microfreeze.threading, "Thread", make_thread)
+    monitor = MicroFreezeMonitor(tmp_path / "breadcrumb")
+
+    monitor.start()
+    writer = threads[0]
+    stop_event = monitor._stop_event
+    monitor.stop()
+
+    writer.join.assert_called_once_with(timeout=2.0)
+    assert monitor._thread is writer
+    assert stop_event.is_set()
+
+    monitor.start()
+    assert threads == [writer]
+    assert monitor._stop_event is stop_event
+    assert stop_event.is_set()
+
+    writer.is_alive.return_value = False
+    monitor.start()
+
+    assert len(threads) == 2
+    assert monitor._thread is threads[1]
+    assert monitor._stop_event is not stop_event
+    assert not monitor._stop_event.is_set()
 
 
 def test_thread_configuration_is_best_effort(

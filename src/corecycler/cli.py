@@ -194,25 +194,36 @@ def cmd_report(session_id: int | None = None, as_json: bool = False, db=None) ->
     from corecycler.tuner import report as tuner_report
 
     own_db = db is None
-    if db is None:
-        db = HistoryDB()
+    error: Exception | None = None
+    output = ""
     try:
+        if db is None:
+            db = HistoryDB()
         if session_id is None:
             sessions = db.list_tuner_sessions(limit=1)
             if not sessions:
-                print("no tuner sessions")
-                return EXIT_COMPLETED
-            session_id = sessions[0].id
-        try:
+                output = "null" if as_json else "no tuner sessions"
+            else:
+                session_id = sessions[0].id
+        if session_id is not None:
             data = tuner_report.build(db, session_id)
-        except ValueError as e:
-            print(f"corecycler report: {e}", file=sys.stderr)
-            return EXIT_REFUSED
-        print(tuner_report.to_json(data) if as_json else "\n".join(tuner_report.render(data)))
-        return EXIT_COMPLETED
-    finally:
-        if own_db:
+            output = tuner_report.to_json(data) if as_json else "\n".join(tuner_report.render(data))
+    except Exception as e:
+        error = e
+
+    if own_db and db is not None:
+        try:
             db.close()
+        except Exception as e:
+            if error is None:
+                error = e
+
+    if error is not None:
+        detail = str(error) or type(error).__name__
+        print(f"corecycler report: cannot read tuner history: {detail}", file=sys.stderr)
+        return EXIT_REFUSED
+    print(output)
+    return EXIT_COMPLETED
 
 
 def cmd_status(db=None) -> int:
@@ -322,8 +333,29 @@ def cmd_run(
         return EXIT_REFUSED
     seeds: dict[int, int] | None = None
     if seed_from is not None:
-        if tp.get_session(db, seed_from) is None:
+        source = tp.get_session(db, seed_from)
+        if source is None:
             print(f"corecycler: no session {seed_from} to seed from", file=sys.stderr)
+            return EXIT_REFUSED
+        if source.status == "quarantined":
+            print(f"corecycler: session {seed_from} is quarantined and cannot seed a new search", file=sys.stderr)
+            return EXIT_REFUSED
+        unresolved = None
+        if source.resume_crash_streak:
+            unresolved = "crash recovery"
+        elif source.unattributed_crashes:
+            unresolved = "unattributed crash evidence"
+        elif source.hunting_core is not None:
+            unresolved = "isolated hunt"
+        elif source.hunt_state:
+            unresolved = "crash hunt"
+        elif tp.journal_suspects(db, seed_from):
+            unresolved = "crash evidence"
+        if unresolved is not None:
+            print(
+                f"corecycler: session {seed_from} has unresolved {unresolved} and cannot seed a new search",
+                file=sys.stderr,
+            )
             return EXIT_REFUSED
         seeds = tp.get_session_offsets(db, seed_from)
         if not seeds:
