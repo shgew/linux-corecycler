@@ -1,7 +1,6 @@
 import re
 from pathlib import Path
 
-
 _NO_COVER_WITHOUT_REASON = re.compile(r"pragma:\s*no cover(?!\s*#\s*reason:\s+\S)")
 
 
