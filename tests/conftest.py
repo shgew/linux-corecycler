@@ -2,17 +2,52 @@
 
 from __future__ import annotations
 
+import os
+import shutil
+import socket
 import struct
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
+from tests._contract_hw import ring_b_requested
+
 # add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
+
+# Nothing hermetic may touch the invoking user's home or desktop, and it has to
+# be decided before the first corecycler import: history.db computes DATA_DIR
+# from user_home() at module scope, and Qt binds its platform plugin at the
+# first QApplication. Left alone, the suite created ~/.local/share/corecycler
+# and drove the real compositor - the clipboard tests overwrote whatever the
+# developer had copied. tmp_path is per-test; this is the process-wide floor
+# under it.
+#
+# Ring B is the exception and keeps the real environment: its whole point is
+# the live session, and a fake XDG_RUNTIME_DIR hides the systemd user manager
+# that containment needs.
+_LIVE_TIER = ring_b_requested(" ".join(sys.argv[1:]))
+_TEST_HOME = None if _LIVE_TIER else Path(tempfile.mkdtemp(prefix="corecycler-test-home-"))
+
+if _TEST_HOME is not None:
+    (_TEST_HOME / "run").mkdir(mode=0o700)
+    os.environ["HOME"] = str(_TEST_HOME)
+    os.environ["XDG_CONFIG_HOME"] = str(_TEST_HOME / ".config")
+    os.environ["XDG_DATA_HOME"] = str(_TEST_HOME / ".local" / "share")
+    os.environ["XDG_CACHE_HOME"] = str(_TEST_HOME / ".cache")
+    os.environ["XDG_RUNTIME_DIR"] = str(_TEST_HOME / "run")
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if _TEST_HOME is not None:
+        shutil.rmtree(_TEST_HOME, ignore_errors=True)
+
 
 # Mock PySide6 if not installed — allows running state machine tests without Qt.
 # TunerEngine inherits QObject and uses Signal/Slot, but the state machine logic
@@ -822,3 +857,59 @@ def assume_clean_shutdown(monkeypatch):
     import corecycler.tuner.engine as engine_mod
 
     monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0, **kwargs: True)
+
+
+_REAL_CONNECT = socket.socket.connect
+_REAL_CONNECT_EX = socket.socket.connect_ex
+
+
+@pytest.fixture(autouse=True)
+def no_network(monkeypatch):
+    """Nothing hermetic may reach the network.
+
+    Not one line of corecycler talks to a remote host, so an outbound
+    connection from the suite is a dependency nobody declared - a mock that
+    fell through, a library phoning home, a fixture resolving a name. It would
+    pass on a dev box and fail in the sandbox, and it leaks whatever it sends.
+    AF_UNIX stays open: that is local IPC, and the Qt and journal seams use it.
+    """
+
+    def refuse(what: str, address: object) -> RuntimeError:
+        return RuntimeError(f"hermetic tests must not touch the network ({what} {address!r})")
+
+    def connect(sock, address):
+        if sock.family == socket.AF_UNIX:
+            return _REAL_CONNECT(sock, address)
+        raise refuse("connect", address)
+
+    def connect_ex(sock, address):
+        if sock.family == socket.AF_UNIX:
+            return _REAL_CONNECT_EX(sock, address)
+        raise refuse("connect_ex", address)
+
+    def create_connection(address, *_args, **_kwargs):
+        raise refuse("create_connection", address)
+
+    def getaddrinfo(host, port, *_args, **_kwargs):
+        raise refuse("getaddrinfo", (host, port))
+
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    monkeypatch.setattr(socket.socket, "connect_ex", connect_ex)
+    monkeypatch.setattr(socket, "create_connection", create_connection)
+    monkeypatch.setattr(socket, "getaddrinfo", getaddrinfo)
+
+
+def pytest_collection_modifyitems(config, items):
+    """Ring B is opt-in, never a side effect of the everyday gate.
+
+    `-m "not slow"` does not filter `contract`, so on a box with systemd cpuset
+    delegation or a stress backend installed, the hermetic run was spawning
+    real scopes and real binaries. Selecting the live tier now takes `-m
+    contract` or CORECYCLER_HW_CONTRACTS=1.
+    """
+    if ring_b_requested(config.getoption("markexpr")):
+        return
+    opt_in = pytest.mark.skip(reason="Ring B is opt-in: run `pytest -m contract -n0` or set CORECYCLER_HW_CONTRACTS=1")
+    for item in items:
+        if item.get_closest_marker("contract"):
+            item.add_marker(opt_in)

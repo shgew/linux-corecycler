@@ -18,11 +18,33 @@ with its reason.
 from __future__ import annotations
 
 import os
+import re
+from typing import TYPE_CHECKING
 
 import pytest
 
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 HW_CONTRACTS = os.environ.get("CORECYCLER_HW_CONTRACTS") == "1"
 HW_PRIVILEGED = os.environ.get("CORECYCLER_HW_PRIVILEGED") == "1"
+
+# `contract`, but not the `not contract` that excludes it.
+_ASKS_FOR_CONTRACT = re.compile(r"(?<!\bnot )\bcontract\b")
+
+
+def ring_b_requested(markexpr: str, env: Mapping[str, str] | None = None) -> bool:
+    """Whether this run deliberately asked for the live tier.
+
+    Ring B drives real systemd scopes, real stress binaries and real hardware.
+    `-m "not slow"` does not filter the `contract` marker, so without this gate
+    the everyday hermetic run spawns them as a side effect on any box that
+    happens to have the resources. Selecting them has to be deliberate.
+    """
+    environ = os.environ if env is None else env
+    if environ.get("CORECYCLER_HW_CONTRACTS") == "1" or environ.get("CORECYCLER_HW_PRIVILEGED") == "1":
+        return True
+    return bool(_ASKS_FOR_CONTRACT.search(markexpr or ""))
 
 
 def require(resource_present: bool, reason: str) -> None:

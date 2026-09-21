@@ -132,6 +132,10 @@ Flake checks include `default`, `coverage`, `ruff`, `ruff-format`, `nixfmt`, `fu
 
 pytest (`pythonpath = ["src"]`, `testpaths = ["tests"]`) with Hypothesis. Markers: `slow`, `hardware`, `contract`. Register new markers in `pyproject.toml`.
 
+`addopts` in `pyproject.toml` is `-n auto --dist worksteal`: the hermetic gate is ~3200 short tests and process fan-out is the only knob that matters (82s serial, ~15s parallel on 16 threads). Three consequences. Any run that touches real hardware, real stress binaries, or wall-clock budgets - `-m slow`, `-m contract`, `scripts/live_scenarios.py` - MUST pass `-n0`, because 16 workers competing for cores invalidate every timing assumption. `-n0` is also what you want for `pdb` and `-s`. And a new hermetic test that shells out and waits on a real child must size its deadline for a fully loaded box, not an idle one.
+
+While iterating, run the focused module or class rather than the whole gate, always with `-n0` - worker startup costs more than a few hundred short tests. Run the full gate before handing work back, not on every edit.
+
 Test-driven development is required for every behavior change. Follow the cycle in order:
 
 1. **Red:** Before editing production code, add or change the smallest test that expresses the desired observable behavior. Run that test and confirm it fails for the expected reason; an unrelated failure or an immediately passing test does not establish the red step.
@@ -143,11 +147,12 @@ Every bug fix starts with a regression test that reproduces the bug. Exercise ha
 ```bash
 python -m pytest -m "not slow" --cov=corecycler --cov-report=term --cov-fail-under=100
 python -m pytest -m "not slow" --cov=corecycler --cov-report=term-missing   # find gaps
-python -m pytest tests/test_smu_commands.py -v                              # one module
+python -m pytest tests/test_smu_commands.py -n0 -v                          # one module
+python -m pytest tests/test_smu_commands.py::TestCoEncoding -n0 -v          # one class
 QT_QPA_PLATFORM=offscreen python -m pytest -m 'not slow'                    # headless
-CORECYCLER_HW_CONTRACTS=1 python -m pytest -m contract                      # Ring B live
+CORECYCLER_HW_CONTRACTS=1 python -m pytest -m contract -n0                  # Ring B live
 sudo -E env CORECYCLER_HW_CONTRACTS=1 CORECYCLER_HW_PRIVILEGED=1 \
-  python -m pytest -m contract                                              # privileged
+  python -m pytest -m contract -n0                                          # privileged
 python3 scripts/mutate.py --src src/corecycler/smu/commands.py \
   --tests tests/test_smu_commands.py --max 60                               # mutation
 ```
@@ -158,9 +163,18 @@ Three rings:
 
 - **Hermetic** (the normal gate): `tmp_path`, in-memory `HistoryDB`, dictionary-backed fake sysfs, fake SMU mailboxes, scripted supervisors, patched `subprocess`. No test may depend on the host CPU, `/proc`, `/sys`, `/dev/cpu`, the kernel journal, installed tools, or real SMU writes.
 - **Ring A**: constant pins in `tests/test_contracts.py` driven by `tests/contract_inventory.py`. Runs in the normal gate.
-- **Ring B**: `@pytest.mark.contract` (usually plus `slow`), real binaries and hardware. `tests/_contract_hw.py` makes an absent resource skip normally but **fail** under `CORECYCLER_HW_CONTRACTS=1`. A meta-test requires every live-verifiable inventory entry to name its Ring B test, so a new external assumption needs an inventory entry, a Ring A pin, and a Ring B test.
+- **Ring B**: `@pytest.mark.contract` (usually plus `slow`), real binaries and hardware. `tests/_contract_hw.py` makes an absent resource skip normally but **fail** under `CORECYCLER_HW_CONTRACTS=1`. A meta-test requires every live-verifiable inventory entry to name its Ring B test, so a new external assumption needs an inventory entry, a Ring A pin, and a Ring B test. Ring B is **opt-in**: `-m "not slow"` does not filter `contract`, so `conftest.pytest_collection_modifyitems` skips those items unless the run asked for them with `-m contract` or `CORECYCLER_HW_CONTRACTS=1`. Before that gate existed, the everyday run on a developer box really did spawn systemd scopes and, wherever a backend was installed, real stress binaries.
 
-`tests/conftest.py` is the only conftest. Key fixtures: `topo_dual_ccd_x3d`/`topo_single_ccd`/`topo_intel`, `build_topology`, `mock_sysfs`, `mock_backend`, `mock_ryzen_smu_sysfs`, `zen3_commands`/`zen5_commands`, `db`, `exec_tmp_path` (falls back off a `noexec` `/tmp`), `on_path`. Autouse: `tool_search_roots` (strips every `CORECYCLER_*_BIN`), `no_blocking_dialogs` (any modal raises with the name of the helper to patch), `assume_rebooted`, `no_real_forensics`, `assume_clean_shutdown`.
+What the hermetic tier is structurally prevented from touching, all set up in `tests/conftest.py` and asserted by `tests/test_hermeticity.py`:
+
+- **The network.** The autouse `no_network` fixture turns `socket.connect`, `connect_ex`, `create_connection` and `getaddrinfo` into a `RuntimeError`. AF_UNIX stays open for local IPC. Nothing in corecycler talks to a remote host, so any hit is a mock that fell through.
+- **The user's home.** Before the first corecycler import, conftest points `HOME` and every `XDG_*` at a throwaway under the system temp dir, removed at session finish. This has to happen at import: `history.db.DATA_DIR` is a module constant built from `user_home()`. The suite used to create `~/.local/share/corecycler`.
+- **The desktop.** `QT_QPA_PLATFORM=offscreen` is forced for the same reason: the GUI tests were driving the real compositor, and the clipboard tests overwrote whatever the developer had copied.
+- Ring B skips all three: a faked `XDG_RUNTIME_DIR` hides the systemd user manager its containment checks need.
+
+What remains deliberately live in the hermetic tier, because the behavior under test *is* the OS: short-lived local child processes (`python -c` sleepers and busy loops) in `test_duty_cycle.py`, `test_execution.py`, `test_engine_edges.py` and `test_inhibit.py`, which exercise real `SIGSTOP`/`SIGCONT`, process-group kills and reaping. They spawn nothing outside the test's own process tree and write nothing outside `tmp_path`. Mocking them away would delete the only proof those paths work.
+
+`tests/conftest.py` is the only conftest. Key fixtures: `topo_dual_ccd_x3d`/`topo_single_ccd`/`topo_intel`, `build_topology`, `mock_sysfs`, `mock_backend`, `mock_ryzen_smu_sysfs`, `zen3_commands`/`zen5_commands`, `db`, `exec_tmp_path` (falls back off a `noexec` `/tmp`), `on_path`. Autouse: `no_network`, `tool_search_roots` (strips every `CORECYCLER_*_BIN`), `no_real_sleep_inhibitor`, `no_real_freeze_monitor`, `no_desktop_notifications`, `no_blocking_dialogs` (any modal raises with the name of the helper to patch), `assume_rebooted`, `no_real_forensics`, `assume_clean_shutdown`.
 
 Conventions and gotchas:
 

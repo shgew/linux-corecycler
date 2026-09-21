@@ -23,9 +23,7 @@ from corecycler.engine.topology import (
     get_first_logical_cpu,
     get_physical_core_list,
 )
-
-sys.path.insert(0, str(Path(__file__).parent))
-from conftest import (
+from tests.conftest import (
     CPUINFO_DUAL_CCD_SMT,
     CPUINFO_INTEL_10CORE_SMT,
     CPUINFO_SINGLE_CCD_NO_SMT,
@@ -650,7 +648,7 @@ class TestTopologyEdgeCases:
 
     def test_harvested_cpu_core_ids_not_sequential(self):
         """Harvested CPU: core IDs skip numbers (0,1,2,3,4,5 + 8,9,10,11,12,13)."""
-        from conftest import CPUINFO_ZEN5_9900X_HARVESTED
+        from tests.conftest import CPUINFO_ZEN5_9900X_HARVESTED
 
         topo = parse_cpuinfo_from_text(CPUINFO_ZEN5_9900X_HARVESTED)
         assert topo.physical_cores == 12
