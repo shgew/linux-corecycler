@@ -14,8 +14,8 @@ import pytest
 
 from corecycler.engine.topology import CPUTopology, PhysicalCore
 from corecycler.history.db import HistoryDB
-from corecycler.tuner import engine as eng
 from corecycler.tuner import bisect
+from corecycler.tuner import engine as eng
 from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine
