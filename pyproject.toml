@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "corecycler"
-version = "0.0.1"
+dynamic = ["version"]
 description = "Per-core CPU stability tester and PBO Curve Optimizer tuner for AMD Ryzen on Linux"
 readme = "README.md"
 license = "GPL-3.0-or-later"
 requires-python = ">=3.12"
 authors = [{ name = "Daaboulex" }]
+maintainers = [{ name = "Hleb Shauchenka" }]
 dependencies = ["PySide6>=6.7"]
 
 [project.scripts]
@@ -20,6 +21,12 @@ dev = ["pytest>=8.0", "ruff>=0.8", "hypothesis>=6.100"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+# The release line this tree belongs to. Git checkouts derive the real version
+# from tags (<next>.devN+g<sha>); this literal is what a tree without .git
+# reports, and the flake appends the commit to it. Bump it when cutting a tag.
+[tool.setuptools_scm]
+fallback_version = "0.1.0"
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

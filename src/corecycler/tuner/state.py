@@ -64,6 +64,8 @@ class TunerSession:
     status: str = "running"  # running, paused, completed, validating, aborted, quarantined
     bios_version: str = ""
     cpu_model: str = ""
+    # The build that created the row; the rules its evidence was judged by.
+    app_version: str = ""
     config_json: str = "{}"
     context_id: int | None = None
     resume_crash_streak: int = 0

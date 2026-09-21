@@ -5,25 +5,27 @@
 ### NixOS (recommended)
 
 ```bash
-git clone https://github.com/Daaboulex/linux-corecycler.git
+git clone https://github.com/shgew/linux-corecycler.git
 cd linux-corecycler
-nix develop                  # ruff, nixfmt, pre-commit hooks
+nix develop                  # the package's Python env (PySide6, pytest, hypothesis,
+                             # pytest-cov) plus ruff, nixfmt, pre-commit hooks
 ruff check src/              # the Python lint gate
-
-# The suite runs in the package build's own environment (the dev shell has no Python):
-nix develop '.#packages.x86_64-linux.default' --command python -m pytest -m 'not slow'
+python -m pytest -m 'not slow'
 ```
 
 ### Other Distros
 
 ```bash
-git clone https://github.com/Daaboulex/linux-corecycler.git
+git clone https://github.com/shgew/linux-corecycler.git
 cd linux-corecycler
 python3 -m venv .venv && source .venv/bin/activate   # PEP 668: system pip is managed
 pip install -e ".[dev]"   # installs pytest, ruff, hypothesis
 pip install PySide6       # Qt6 bindings (required for tuner engine tests)
 pytest tests/ -v
 ```
+
+The version comes from git via setuptools-scm, so build from a clone, not a source
+tarball: a tree without `.git` reports `fallback_version` from `pyproject.toml`.
 
 ## Workflow
 
@@ -38,7 +40,7 @@ pytest tests/ -v
 
 ### Running Tests
 
-Prefix each with `nix develop '.#packages.x86_64-linux.default' --command` on NixOS.
+Run these inside `nix develop` on NixOS.
 
 ```bash
 # Everything the gate runs
@@ -203,6 +205,22 @@ test(tuner): add crash-during-hardening gap test
 
 The scope names the area touched -- e.g. `tuner`, `smu`, `gui`, `engine`,
 `backends`, `history`, `topology`, `tests`, `ci`, `nix`.
+
+## Versioning and Releases
+
+There is no version literal to bump per commit. setuptools-scm derives the version from
+the nearest tag: at a tag it is the tag (`0.1.0`), after it `0.1.1.devN+g<sha>`. The Nix
+package cannot see tags (the sandbox strips `.git`), so it reports
+`<fallback_version>+g<sha>`: the release line from `[tool.setuptools_scm]` in
+`pyproject.toml` plus the commit it was built from. Both forms carry the commit, which is
+what `corecycler --version`, the startup log line, the `doctor` header, and
+`tuner_sessions.app_version` exist to show.
+
+Cutting a release:
+
+1. Set `fallback_version` in `pyproject.toml` to the new version.
+2. Move the `[Unreleased]` entries in `CHANGELOG.md` under a dated `## [X.Y.Z]` heading.
+3. Commit, then tag that commit `vX.Y.Z` and push the tag.
 
 ## Review Process
 

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
 
+from corecycler import __version__
 from corecycler.config.paths import resolve_work_dir
 from corecycler.engine.backends import get_backend, load_all
 from corecycler.engine.backends.base import StressConfig
@@ -710,6 +711,10 @@ class TunerEngine(QObject):
             f"(previous={session.boot_id or 'unknown'}, current={self._boot_id or 'unknown'}; "
             f"last execution={last_activity or 'unknown'})"
         )
+        if session.app_version != __version__:
+            self.log_message.emit(
+                f"Session created by corecycler {session.app_version or 'unknown'}; resuming with {__version__}"
+            )
 
         # Check for CO drift — warn only when the SMU differs from what the
         # TUNER last wrote (the CO journal); validation deliberately leaves the

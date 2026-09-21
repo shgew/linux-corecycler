@@ -297,9 +297,19 @@ def setup_logging() -> None:
         print(f"corecycler: debug log unavailable: {e}", file=sys.stderr)
     logging.basicConfig(level=logging.DEBUG, handlers=handlers)
 
+    from corecycler import __version__
+
+    logging.getLogger("corecycler").info("corecycler %s", __version__)
+
 
 def main() -> int:
     import os
+
+    argv = sys.argv[1:]
+    if argv and argv[0] in ("-h", "--help", "-V", "--version"):
+        from corecycler.cli import cli_main
+
+        return cli_main(argv[:1])
 
     setup_logging()
 
@@ -309,12 +319,6 @@ def main() -> int:
 
     capabilities.confine()
 
-    argv = sys.argv[1:]
-    if argv and argv[0] in ("-h", "--help"):
-        from corecycler.cli import USAGE
-
-        print(USAGE)
-        return 0
     if argv and argv[0] in ("doctor", "status", "tune", "resume"):
         from corecycler.cli import cli_main
 

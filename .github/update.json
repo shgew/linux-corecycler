@@ -2,7 +2,7 @@
   "package": "corecycler",
   "upstream": {
     "type": "none",
-    "owner": "Daaboulex",
+    "owner": "shgew",
     "repo": "linux-corecycler"
   },
   "packageFile": "flake.nix",
