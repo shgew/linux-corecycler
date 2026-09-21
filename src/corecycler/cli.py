@@ -47,7 +47,9 @@ corecycler headless commands:
   corecycler status               list tuner sessions; newest one with per-core offsets and live-evidence hours
   corecycler report [SESSION_ID] [--json]
                                   per-core offsets with the banked evidence behind each
-  corecycler tune [--config F]    start a NEW tuning session and run to the end
+  corecycler tune [--config F] [--seed-from SESSION_ID]
+                                  start a NEW tuning session and run to the end; --seed-from
+                                  begins each core at what that session learned, retested first
   corecycler resume [SESSION_ID [--config F]]
                                   resume a session (newest if omitted); --config replaces its
                                   saved settings (search fields must match)
@@ -87,10 +89,7 @@ def cli_main(argv: list[str]) -> int:
     if command == "status":
         return cmd_status()
     if command == "tune":
-        if args and (len(args) != 2 or args[0] != "--config" or args[1].startswith("-")):
-            print("corecycler tune: expected --config FILE or no arguments", file=sys.stderr)
-            return EXIT_REFUSED
-        return cmd_run(config_path=args[1] if args else None, resume_id=None, auto_resume=False)
+        return _dispatch_tune(args)
     if command == "resume":
         if not args:
             return cmd_run(config_path=None, resume_id=None, auto_resume=True)
@@ -158,6 +157,38 @@ def _dispatch_report(args: list[str]) -> int:
             print(f"corecycler report: invalid session id {rest[0]!r}", file=sys.stderr)
             return EXIT_REFUSED
     return cmd_report(session_id=session_id, as_json=as_json)
+
+
+_TUNE_SHAPE = "corecycler tune: expected [--config FILE] [--seed-from SESSION_ID]"
+
+
+def _dispatch_tune(args: list[str]) -> int:
+    """Parse ``tune [--config FILE] [--seed-from SESSION_ID]``.
+
+    A repeated flag is a refusal rather than a last-one-wins: an operator who
+    named two configs does not know which search is about to run.
+    """
+    values: dict[str, str] = {}
+    rest = list(args)
+    while rest:
+        flag = rest.pop(0)
+        if flag in values or flag not in ("--config", "--seed-from") or not rest or rest[0].startswith("-"):
+            print(_TUNE_SHAPE, file=sys.stderr)
+            return EXIT_REFUSED
+        values[flag] = rest.pop(0)
+    seed_from = None
+    if "--seed-from" in values:
+        try:
+            seed_from = int(values["--seed-from"])
+        except ValueError:
+            print(f"corecycler tune: invalid session id {values['--seed-from']!r}", file=sys.stderr)
+            return EXIT_REFUSED
+    return cmd_run(
+        config_path=values.get("--config"),
+        resume_id=None,
+        auto_resume=False,
+        seed_from=seed_from,
+    )
 
 
 def cmd_report(session_id: int | None = None, as_json: bool = False, db=None) -> int:
@@ -252,6 +283,7 @@ def cmd_run(
     resume_id: int | None,
     auto_resume: bool,
     *,
+    seed_from: int | None = None,
     engine_factory=None,
     db=None,
 ) -> int:
@@ -290,6 +322,15 @@ def cmd_run(
     if (resume_id is not None or auto_resume) and session is None:
         print("corecycler: no resumable session", file=sys.stderr)
         return EXIT_REFUSED
+    seeds: dict[int, int] | None = None
+    if seed_from is not None:
+        if tp.get_session(db, seed_from) is None:
+            print(f"corecycler: no session {seed_from} to seed from", file=sys.stderr)
+            return EXIT_REFUSED
+        seeds = tp.get_session_offsets(db, seed_from)
+        if not seeds:
+            print(f"corecycler: session {seed_from} learned no offsets to seed from", file=sys.stderr)
+            return EXIT_REFUSED
     override = None
     try:
         if session is not None:
@@ -408,7 +449,7 @@ def cmd_run(
     if session is not None:
         engine.resume(session.id)
     else:
-        engine.start()
+        engine.start(seeds)
 
     if "exit" in outcome:
         return outcome["exit"]

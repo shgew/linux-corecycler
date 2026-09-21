@@ -614,6 +614,101 @@ class TestInheritCurrentCO:
         assert eng._core_states[1].current_offset == -5
 
 
+class TestSeededStart:
+    def _engine(self, db, simple_topology, mock_smu, mock_backend, **kw):
+        cfg = TunerConfig(cores_to_test=[0, 1], search_duration_seconds=1, **kw)
+        return TunerEngine(
+            db=db,
+            topology=simple_topology,
+            smu=mock_smu,
+            backend=mock_backend,
+            config=cfg,
+        )
+
+    def test_a_seeded_core_is_retested_at_the_seed_before_going_deeper(
+        self, db, simple_topology, mock_smu, mock_backend
+    ):
+        """A prior is a hypothesis: the seed itself is the first slot, so a
+        value earned under a condition this engine rejects has to re-earn
+        itself on the live mask before the search steps past it."""
+        eng = self._engine(db, simple_topology, mock_smu, mock_backend, coarse_step=3)
+        with patch.object(eng, "_run_next"):
+            eng.start({0: -37, 1: -35})
+        assert [eng._core_states[c].current_offset for c in (0, 1)] == [-37, -35]
+        assert eng._core_states[0].phase == TunerPhase.COARSE_SEARCH
+        assert eng._core_states[0].best_offset is None
+
+        eng._advance_core(0, passed=True)
+        assert eng._core_states[0].best_offset == -37
+        assert eng._core_states[0].current_offset == -40
+
+    def test_a_seeded_core_keeps_stock_as_its_retreat(self, db, simple_topology, mock_smu, mock_backend):
+        """The seed is not a floor. A core whose seed fails must be able to
+        back off all the way to stock instead of pausing on a 'baseline
+        failure' at a number it was merely handed."""
+        eng = self._engine(db, simple_topology, mock_smu, mock_backend, fine_step=1)
+        with patch.object(eng, "_run_next"):
+            eng.start({0: -37})
+        assert eng._core_states[0].baseline_offset == 0
+
+        eng._advance_core(0, passed=False)
+        cs = eng._core_states[0]
+        assert cs.phase == TunerPhase.BACKOFF_PRECONFIRM
+        assert cs.backoff_fail_bound == -37
+        assert cs.current_offset == -36
+
+    def test_a_seed_failure_is_not_a_start_offset_failure(self, db, simple_topology, mock_smu, mock_backend):
+        """The instrument breaker counts failures at the first step from stock.
+        A deep seed failing is a silicon answer, not a broken apparatus."""
+        eng = self._engine(db, simple_topology, mock_smu, mock_backend, coarse_step=3)
+        with patch.object(eng, "_run_next"):
+            eng.start({0: -37})
+        eng._advance_core(0, passed=False)
+        assert eng._consecutive_start_failures == 0
+
+    def test_an_unseeded_core_in_a_seeded_session_starts_from_scratch(
+        self, db, simple_topology, mock_smu, mock_backend
+    ):
+        eng = self._engine(db, simple_topology, mock_smu, mock_backend, start_offset=-5)
+        with patch.object(eng, "_run_next"):
+            eng.start({0: -37})
+        cs = eng._core_states[1]
+        assert cs.phase == TunerPhase.NOT_STARTED
+        assert cs.current_offset == -5
+        assert cs.baseline_offset == -5
+
+    def test_a_seed_past_the_configured_cap_is_clamped_to_it(self, db, simple_topology, mock_smu, mock_backend):
+        eng = self._engine(db, simple_topology, mock_smu, mock_backend, max_offset=-30)
+        with patch.object(eng, "_run_next"):
+            eng.start({0: -37})
+        assert eng._core_states[0].current_offset == -30
+
+    def test_seeds_that_cannot_contribute_are_dropped(self, db, simple_topology, mock_smu, mock_backend):
+        """A seed at or short of the configured start has nothing to carry,
+        and a seed for a core outside this session is not its business."""
+        eng = self._engine(db, simple_topology, mock_smu, mock_backend, start_offset=-5)
+        with patch.object(eng, "_run_next"):
+            eng.start({0: -5, 1: -3, 7: -40})
+        assert [eng._core_states[c].phase for c in (0, 1)] == [
+            TunerPhase.NOT_STARTED,
+            TunerPhase.NOT_STARTED,
+        ]
+        assert 7 not in eng._core_states
+
+    def test_the_seeded_state_is_persisted_before_the_first_slot(
+        self, db, simple_topology, mock_smu, mock_backend
+    ):
+        """A crash during the first seeded slot must resume at the seed, not
+        at stock, so the seeded vector has to reach the database first."""
+        eng = self._engine(db, simple_topology, mock_smu, mock_backend)
+        with patch.object(eng, "_run_next"):
+            eng.start({0: -37})
+        saved = db.get_tuner_core_states(eng._session_id)
+        assert saved[0].current_offset == -37
+        assert saved[0].phase == TunerPhase.COARSE_SEARCH
+        assert saved[0].baseline_offset == 0
+
+
 class TestCCDAlternatingOrder:
     def test_alternates_between_ccds(self, db, topo_dual_ccd_x3d, mock_smu, mock_backend):
         """CCD-alternating should pick from CCD0, then CCD1, then CCD0, etc."""

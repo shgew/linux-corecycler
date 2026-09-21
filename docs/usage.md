@@ -270,11 +270,33 @@ transition contract; this table is what each phase means in practice.
 #### Entry points
 
 `corecycler` with no command opens the GUI; the Auto-Tuner tab drives the same engine
-the CLI does. `corecycler tune [--config F]` starts a new session headless and runs to
-the end. `corecycler resume [SESSION_ID]` continues one (newest eligible if omitted).
-`corecycler status` lists sessions, `corecycler report` prints the answer and its
-evidence, and `corecycler doctor` is the preflight for external tools. A `QLockFile`
-allows one instance, so GUI and CLI cannot fight over the SMU.
+the CLI does. `corecycler tune [--config F] [--seed-from SESSION_ID]` starts a new
+session headless and runs to the end. `corecycler resume [SESSION_ID]` continues one
+(newest eligible if omitted). `corecycler status` lists sessions, `corecycler report`
+prints the answer and its evidence, and `corecycler doctor` is the preflight for
+external tools. A `QLockFile` allows one instance, so GUI and CLI cannot fight over
+the SMU.
+
+#### Seeding a new session from an old one
+
+`--seed-from SESSION_ID` starts each core at the `best_offset` that session reached
+instead of at `start_offset`. Use it when the search rules changed underneath a
+result: the numbers are worth keeping as a starting point, the evidence behind them
+is not.
+
+A seed is a hypothesis, not a result, so it is treated as one:
+
+- The seeded core enters `coarse_search` **at the seeded value**, so the first slot
+  retests it under the live mask and the full regime battery. Nothing is inherited
+  as proven.
+- Its `baseline_offset` stays at `start_offset`. The seed is not a floor, so a core
+  whose seed fails can back off the whole way to stock instead of pausing on a
+  baseline failure at a number it was merely handed.
+- A seed that is not more aggressive than `start_offset` is dropped, a seed past
+  `max_offset` is clamped to it, and a seed for a core outside `cores_to_test` is
+  ignored.
+- No banked confidence comes across. Banks are keyed by `(context, core, regime,
+  offset)` and the new session re-earns every hour it claims.
 
 #### Session statuses
 

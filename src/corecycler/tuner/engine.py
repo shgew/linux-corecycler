@@ -569,8 +569,16 @@ class TunerEngine(QObject):
     # Public API
     # ------------------------------------------------------------------
 
-    def start(self) -> None:
-        """Start a new tuner session."""
+    def start(self, seed_offsets: dict[int, int] | None = None) -> None:
+        """Start a new tuner session.
+
+        ``seed_offsets`` carries what an earlier session learned into the new
+        search as a starting point. A seeded core enters ``COARSE_SEARCH`` at
+        its seeded value rather than stepping past it: a prior is a hypothesis,
+        and this engine exists because offsets proven under a condition the
+        machine never runs in were never proven at all. The seeded core's
+        baseline stays at stock so backoff keeps the full retreat.
+        """
         from corecycler.history.context import capture_system_context, find_or_create_context
 
         self._abort_requested = False
@@ -624,12 +632,25 @@ class TunerEngine(QObject):
                     current_offsets[core_id] = val
             self.log_message.emit(f"Inherited current CO offsets from SMU: {current_offsets}")
 
+        seeds = self._resolve_seeds(seed_offsets, cores)
         for core_id in cores:
-            start = current_offsets.get(core_id, self._config.start_offset)
-            cs = CoreState(core_id=core_id, current_offset=start, baseline_offset=start)
+            seed = seeds.get(core_id)
+            start = seed if seed is not None else current_offsets.get(core_id, self._config.start_offset)
+            cs = CoreState(
+                core_id=core_id,
+                current_offset=start,
+                baseline_offset=self._config.start_offset if seed is not None else start,
+                phase=TunerPhase.COARSE_SEARCH if seed is not None else TunerPhase.NOT_STARTED,
+            )
             self._core_states[core_id] = cs
             tp.save_core_state(self._db, self._session_id, cs)
             self._co_applied[core_id] = None  # unknown — SMU state not yet managed
+        if seeds:
+            self.log_message.emit(
+                "Seeded from an earlier session: "
+                + ", ".join(f"core {c} at {seeds[c]}" for c in sorted(seeds))
+                + " — every seed is retested on the live mask before the search goes deeper"
+            )
 
         self._set_status("running")
         self.log_message.emit(
@@ -1606,6 +1627,23 @@ class TunerEngine(QObject):
         if self._config.direction < 0:
             return offset < self._config.max_offset
         return offset > self._config.max_offset
+
+    def _resolve_seeds(self, seed_offsets: dict[int, int] | None, cores: list[int]) -> dict[int, int]:
+        """Keep the seeds this search can actually act on, clamped to its cap.
+
+        A seed that is not more aggressive than the configured start has
+        nothing to contribute, and a seed for a core outside this session is
+        not this session's business.
+        """
+        if not seed_offsets:
+            return {}
+        resolved: dict[int, int] = {}
+        for core_id in cores:
+            seed = seed_offsets.get(core_id)
+            if seed is None or not self._is_more_aggressive(seed, self._config.start_offset):
+                continue
+            resolved[core_id] = self._config.max_offset if self._exceeds_max(seed) else seed
+        return resolved
 
     def _at_or_past_baseline(self, offset: int, cs: CoreState) -> bool:
         """Check if offset is at or past the core's baseline in the configured direction."""

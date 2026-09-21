@@ -56,9 +56,11 @@ class FakeEngine(QObject):
         self.behavior = behavior
         self.status = "idle"
         self.resumed_with: int | None = None
+        self.seeded_with: dict[int, int] | None = None
         self.test_in_flight = False
 
-    def start(self) -> None:
+    def start(self, seed_offsets: dict[int, int] | None = None) -> None:
+        self.seeded_with = seed_offsets
         self._act()
 
     def resume(self, session_id: int) -> None:
@@ -277,6 +279,87 @@ class TestReport:
         report = json.loads(capsys.readouterr().out)
         assert report["session"] == sid
         assert [(core["core"], core["offset"]) for core in report["cores"]] == [(0, -30), (1, -22)]
+
+
+class TestSeedFrom:
+    def _prior(self, db, offsets: dict[int, int]) -> int:
+        sid = tp.create_session(db, TunerConfig(cores_to_test=sorted(offsets)), "Test BIOS", "Test CPU")
+        for core_id, offset in offsets.items():
+            tp.save_core_state(
+                db,
+                sid,
+                CoreState(
+                    core_id=core_id,
+                    phase=TunerPhase.CONFIRMED,
+                    current_offset=offset,
+                    best_offset=offset,
+                ),
+            )
+        return sid
+
+    def _run(self, db, seed_from):
+        made = []
+
+        def factory(_db, _config):
+            eng = FakeEngine("completes")
+            made.append(eng)
+            return eng
+
+        code = cli.cmd_run(None, None, False, seed_from=seed_from, engine_factory=factory, db=db)
+        return code, (made[0] if made else None)
+
+    def test_a_new_session_starts_from_what_the_named_session_learned(self, db):
+        sid = self._prior(db, {0: -37, 1: -35})
+        code, engine = self._run(db, sid)
+        assert code == cli.EXIT_COMPLETED
+        assert engine.seeded_with == {0: -37, 1: -35}
+
+    def test_an_unseeded_run_hands_the_engine_no_prior(self, db):
+        _, engine = self._run(db, None)
+        assert engine.seeded_with is None
+
+    def test_seeding_from_a_session_that_does_not_exist_refuses(self, db, capsys):
+        code, engine = self._run(db, 999)
+        assert code == cli.EXIT_REFUSED
+        assert engine is None
+        assert "no session 999" in capsys.readouterr().err
+
+    def test_seeding_from_a_session_that_learned_nothing_refuses(self, db, capsys):
+        """Silently starting from stock would look like a seeded run and quietly
+        throw away the hours the operator meant to carry forward."""
+        sid = tp.create_session(db, TunerConfig(), "Test BIOS", "Test CPU")
+        code, engine = self._run(db, sid)
+        assert code == cli.EXIT_REFUSED
+        assert engine is None
+        assert "learned no offsets" in capsys.readouterr().err
+
+    def test_the_flag_reaches_cmd_run(self, db, monkeypatch):
+        sid = self._prior(db, {0: -37})
+        seen = {}
+        monkeypatch.setattr(cli, "cmd_run", lambda **kw: seen.update(kw) or cli.EXIT_COMPLETED)
+        assert cli.cli_main(["tune", "--seed-from", str(sid)]) == cli.EXIT_COMPLETED
+        assert seen["seed_from"] == sid
+        assert seen["config_path"] is None
+
+    def test_config_and_seed_combine(self, monkeypatch):
+        seen = {}
+        monkeypatch.setattr(cli, "cmd_run", lambda **kw: seen.update(kw) or cli.EXIT_COMPLETED)
+        assert cli.cli_main(["tune", "--seed-from", "7", "--config", "safe.json"]) == cli.EXIT_COMPLETED
+        assert (seen["seed_from"], seen["config_path"]) == (7, "safe.json")
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            ["tune", "--seed-from"],
+            ["tune", "--seed-from", "--config"],
+            ["tune", "--seed-from", "7", "--seed-from", "8"],
+            ["tune", "--seed-from", "seven"],
+        ],
+    )
+    def test_an_unreadable_seed_argument_never_starts_tuning(self, args, monkeypatch):
+        monkeypatch.setattr(cli, "cmd_run", lambda **kw: pytest.fail("invalid arguments started tuning"))
+        assert cli.cli_main(args) == cli.EXIT_REFUSED
+
 
 class TestRunOutcomes:
     def _run(self, db, behavior, **kw):

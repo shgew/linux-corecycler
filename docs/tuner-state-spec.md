@@ -27,6 +27,11 @@ the configured offset limit.
 `CONFIRMED` is the single resting phase. There are no hardening phases or
 hardening tiers.
 
+A core created with a seed (`tune --seed-from`) starts in `COARSE_SEARCH` at the
+seeded offset rather than in `NOT_STARTED`, so its first slot tests the seed
+instead of stepping past it, and its `baseline_offset` stays at the configured
+`start_offset`. Once running it obeys the table above unchanged.
+
 ## Per-slot regime battery gate
 
 A state-machine PASS means that the current offset passed **every regime**
