@@ -3,21 +3,21 @@
 # CoreCycler
 
 <!-- BEGIN generated:badges -->
-[![CI](https://github.com/Daaboulex/linux-corecycler/actions/workflows/ci.yml/badge.svg)](https://github.com/Daaboulex/linux-corecycler/actions/workflows/ci.yml)
+[![CI](https://github.com/shgew/linux-corecycler/actions/workflows/ci.yml/badge.svg)](https://github.com/shgew/linux-corecycler/actions/workflows/ci.yml)
 [![NixOS unstable](https://img.shields.io/badge/NixOS-unstable-78C0E8?logo=nixos&logoColor=white)](https://nixos.org)
 [![License: GPL-3.0-or-later](https://img.shields.io/badge/License-GPLv3-blue.svg)](./LICENSE)
 <!-- END generated:badges -->
 
 Per-core CPU stability testing and AMD PBO Curve Optimizer tuning for Linux -- a graphical tool that stress-tests one core at a time at full single-threaded boost, optionally reads and writes per-core Curve Optimizer offsets via the AMD SMU, and includes an **automatic crash-safe tuner** that searches each core's most aggressive stable undervolt for you. A Linux counterpart to [CoreCycler](https://github.com/sp00n/corecycler) (Windows).
 
-> **Status:** actively developed and tested on an **AMD Ryzen 9 9950X3D** (Zen 5, dual-CCD X3D, AM5). Other AMD Ryzen processors (Zen 2-5) should work but are less thoroughly tested; Intel CPUs are supported for stress testing only (no Curve Optimizer). Found a problem on other hardware? [Open an issue](https://github.com/Daaboulex/linux-corecycler/issues) with your CPU model.
+> **Status:** actively developed and tested on an **AMD Ryzen 9 9950X3D** (Zen 5, dual-CCD X3D, AM5). Other AMD Ryzen processors (Zen 2-5) should work but are less thoroughly tested; Intel CPUs are supported for stress testing only (no Curve Optimizer). Found a problem on other hardware? [Open an issue](https://github.com/shgew/linux-corecycler/issues) with your CPU model.
 
 <!-- BEGIN generated:upstream -->
 ## Project
 
 | | |
 |---|---|
-| **Type** | Original project (no upstream) |
+| **Type** | Fork of [Daaboulex/linux-corecycler](https://github.com/Daaboulex/linux-corecycler) |
 | **License** | GPL-3.0-or-later |
 | **Platforms** | Linux (`x86_64`) |
 
@@ -54,7 +54,7 @@ Add the flake input and enable the NixOS module:
 
 ```nix
 {
-  inputs.corecycler.url = "github:Daaboulex/linux-corecycler";
+  inputs.corecycler.url = "github:shgew/linux-corecycler";
 }
 ```
 
@@ -73,8 +73,8 @@ The module handles the package, kernel modules (ryzen_smu and friends), udev rul
 permissions. Or run it directly:
 
 ```bash
-nix run github:Daaboulex/linux-corecycler        # FOSS-only
-nix run github:Daaboulex/linux-corecycler#full   # with mprime (unfree)
+nix run github:shgew/linux-corecycler        # FOSS-only
+nix run github:shgew/linux-corecycler#full   # with mprime (unfree)
 ```
 
 Other distros (Arch, Ubuntu, Fedora, from source), the full module options, and backend
@@ -103,10 +103,9 @@ full guide -- manual tuning workflow, the Auto-Tuner, and reading results -- is 
 ## Development
 
 ```bash
-nix develop                                   # ruff, nixfmt, pre-commit
+nix develop                                   # the package's Python env + ruff, nixfmt, pre-commit
 ruff check src                                # lint
-nix develop '.#packages.x86_64-linux.default' \
-  --command python -m pytest -m 'not slow'    # the suite, in the build's own env
+python -m pytest -m 'not slow'                # the suite, inside nix develop
 nix flake check                               # build + every check (what CI runs)
 corecycler doctor                             # every external tool and how it resolved
 ```

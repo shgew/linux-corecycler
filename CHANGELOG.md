@@ -6,8 +6,20 @@ following [Keep a Changelog](https://keepachangelog.com/) and
 
 ## [Unreleased]
 
-Current version: 0.0.1. A per-core CPU stability tester and AMD PBO Curve
-Optimizer tuner for Linux, packaged as a NixOS module with an overlay.
+A per-core CPU stability tester and AMD PBO Curve Optimizer tuner for Linux,
+packaged as a NixOS module with an overlay. Forked from
+[Daaboulex/linux-corecycler](https://github.com/Daaboulex/linux-corecycler).
+
+### Changed (2026-09-21 fork setup)
+
+- Derive the version from git through setuptools-scm instead of a literal pinned at
+  0.0.1. The Nix package appends the commit it was built from, so an installed build
+  names itself: `corecycler --version`, the startup log line, and the `doctor` header.
+- Stamp every tuner session with the build that created it (`tuner_sessions.app_version`,
+  schema v18). `corecycler status` shows it; resuming under a different build records
+  both versions in the session narrative.
+- The dev shell carries the package's own Python environment, so `nix develop --command
+  python -m pytest` runs the suite without entering the package derivation's shell.
 
 ### Fixed (2026-09-20 inconclusive crash hunts)
 
@@ -703,4 +715,4 @@ core 7 (the deepest, most-proven offset) on the next resume.
 - Malformed kernel, sysfs, or config input (a non-decimal L3 cache id, a wrong-typed
   `config_json` field) now fails closed instead of crashing.
 
-[Unreleased]: https://github.com/Daaboulex/linux-corecycler
+[Unreleased]: https://github.com/shgew/linux-corecycler
