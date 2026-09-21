@@ -5,8 +5,6 @@ from __future__ import annotations
 from itertools import product
 from unittest.mock import MagicMock
 
-import pytest
-
 from corecycler.history.db import HistoryDB
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine
