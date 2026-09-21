@@ -32,6 +32,10 @@ fallback_version = "0.1.0"
 pythonpath = ["src"]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+# Parallel by default: the hermetic suite is ~3200 short tests, so process
+# fan-out dominates every other tuning knob. `-n0` restores a single process
+# for debugging (pdb, -s) and for --testmon, which cannot run distributed.
+addopts = ["-n", "auto", "--dist", "worksteal"]
 markers = [
   "slow: tests that take >5s (deselect with -m 'not slow')",
   "hardware: tests that verify hardware-specific detection behavior",

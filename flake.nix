@@ -83,10 +83,14 @@
                 # ("slow") stay outside the sandbox: they exercise systemd-run
                 # scopes + wall-clock polling and belong to the dev loop, not
                 # the gate.
+                # pytest-xdist is not optional: pyproject's addopts are
+                # `-n auto`, so the sandboxed check needs the plugin to run at
+                # all. It is also what keeps that check near 15s.
                 nativeCheckInputs = [
                   pythonPkgs.pytestCheckHook
                   pythonPkgs.hypothesis
                   pythonPkgs.pytest-cov
+                  pythonPkgs.pytest-xdist
                 ];
                 doCheck = true;
                 preCheck = ''

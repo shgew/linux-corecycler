@@ -149,6 +149,10 @@ def _run(tests: list[str], timeout: int) -> bool:
             "--no-header",
             "-p",
             "no:cacheprovider",
+            # -n0 cancels the repo-wide `-n auto`: a mutant run is one narrow
+            # test list where worker startup costs more than it saves, and -x
+            # is only exact in a single process.
+            "-n0",
             "-m",
             "not slow",
             f"--timeout={timeout}",

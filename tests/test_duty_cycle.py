@@ -40,8 +40,10 @@ def busy_child() -> Iterator[subprocess.Popen[bytes]]:
         proc.wait(timeout=1)
 
 
+# 10s, not 1s: under `-n auto` the box runs ~16 workers plus this test's own
+# busy-loop children, so a driver thread can wait far longer than it does idle.
 def _wait_for_child_state(proc: subprocess.Popen[bytes], predicate: Callable[[int], bool]) -> int:
-    deadline = time.monotonic() + 1.0
+    deadline = time.monotonic() + 10.0
     while time.monotonic() < deadline:
         pid, status = os.waitpid(proc.pid, os.WNOHANG | os.WUNTRACED | os.WCONTINUED)
         if pid and predicate(status):
