@@ -51,7 +51,7 @@ class TestBackendParseRobust:
     @given(prefix=st.text(max_size=100), suffix=st.text(max_size=100), rc=st.sampled_from([-15, -9, 143, 137, 0]))
     def test_stressapptest_detects_midrun_memory_errors_even_when_killed(self, prefix, suffix, rc):
         """A killed stressapptest run that logged a memory error mid-run must fail,
-        not pass — the final 'Status:' line is never reached."""
+        not pass; the final 'Status:' line is never reached."""
         b = StressapptestBackend()
         out = f"{prefix}\nHardware Error: miscompare on CPU 3\n{suffix}"
         passed, _ = b.parse_output(out, "", rc)
@@ -69,7 +69,7 @@ class TestBackendParseRobust:
 
     @pytest.mark.parametrize("sig", sorted(CRASH_SIGNALS))
     def test_stressapptest_crash_overrides_status_pass(self, sig):
-        """A crash signal must override a printed 'Status: PASS' — a clean
+        """A crash signal must override a printed 'Status: PASS'. A clean
         stressapptest run exits 0 or is killed by us, never with a crash code, so a
         PASS line followed by a crash-on-teardown is still instability, not a pass."""
         b = StressapptestBackend()

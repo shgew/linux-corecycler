@@ -13,7 +13,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from corecycler.history.db import HistoryDB
-from corecycler.tuner import persistence as tp
 from corecycler.tuner.state import TunerPhase
 from tests.test_crash_attribution import (
     BASELINES,
@@ -54,7 +53,7 @@ class TestIncrementalValidation:
         assert eng._validation_core_index == 5  # same slot retries
         assert eng._validation_stage == 1
         assert eng._validation_dirty is True
-        sess = tp.get_session(db, eng._session_id)
+        sess = db.get_tuner_session(eng._session_id)
         assert sess.validation_stage == 1
         assert sess.validation_index == 5
         assert sess.validation_dirty is True
@@ -85,7 +84,7 @@ class TestIncrementalValidation:
 
         assert eng._validation_requeue == []
         assert eng._validation_stage == 2
-        sess = tp.get_session(db, eng._session_id)
+        sess = db.get_tuner_session(eng._session_id)
         assert sess.validation_requeue == "[]"
 
     def test_dirty_completion_runs_one_final_clean_pass(self, db, topo_dual_ccd_x3d, mock_backend):
@@ -113,8 +112,8 @@ class TestIncrementalValidation:
         eng._run_validation_next()
 
         assert eng.status == "idle"
-        assert tp.get_session(db, eng._session_id).status == "completed"
-        assert tp.get_session(db, eng._session_id).validation_stage == 0
+        assert db.get_tuner_session(eng._session_id).status == "completed"
+        assert db.get_tuner_session(eng._session_id).validation_stage == 0
 
 
 class TestValidationResumePosition:
@@ -124,8 +123,7 @@ class TestValidationResumePosition:
         sid = eng._session_id
         # Every core has a stage-1 pass at its current best...
         for core_id, offset in BEST.items():
-            tp.log_test_result(
-                db,
+            db.insert_tuner_test_log(
                 sid,
                 core_id,
                 offset,
@@ -137,7 +135,7 @@ class TestValidationResumePosition:
         eng._core_states[5].best_offset = BEST[5] + 1
         eng._core_states[5].current_offset = BEST[5] + 1
         db.set_validation_position(sid, 2, 0, 0, True, "[]")
-        session = tp.get_session(db, sid)
+        session = db.get_tuner_session(sid)
 
         profile = {c: cs.best_offset for c, cs in eng._core_states.items()}
         eng._enter_auto_validation(profile, resume_from=session)
@@ -152,8 +150,7 @@ class TestValidationResumePosition:
         _seed_validating(eng, db)
         sid = eng._session_id
         for core_id, offset in BEST.items():
-            tp.log_test_result(
-                db,
+            db.insert_tuner_test_log(
                 sid,
                 core_id,
                 offset,
@@ -162,7 +159,7 @@ class TestValidationResumePosition:
                 duration=300.0,
             )
         db.set_validation_position(sid, 3, 0, 1, False, "not json")
-        session = tp.get_session(db, sid)
+        session = db.get_tuner_session(sid)
 
         profile = {c: cs.best_offset for c, cs in eng._core_states.items()}
         eng._enter_auto_validation(profile, resume_from=session)
@@ -182,7 +179,7 @@ class TestValidationResumePosition:
         assert eng._validation_stage == 1
         assert eng._validation_core_index == 0
         assert eng._validation_dirty is False
-        sess = tp.get_session(db, eng._session_id)
+        sess = db.get_tuner_session(eng._session_id)
         assert (sess.validation_stage, sess.validation_index) == (1, 0)
 
 
@@ -209,7 +206,7 @@ class TestSpectrumAndSoak:
             eng._run_validation_next()
 
         assert eng.status == "idle"
-        assert tp.get_session(db, eng._session_id).status == "completed"
+        assert db.get_tuner_session(eng._session_id).status == "completed"
 
     def test_stage5_slot_uses_spectrum_profile(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
@@ -251,7 +248,7 @@ class TestSpectrumAndSoak:
         assert eng._validation_stage == 8
         eng._run_validation_next()
         assert eng.status == "idle"
-        assert tp.get_session(db, eng._session_id).status == "completed"
+        assert db.get_tuner_session(eng._session_id).status == "completed"
 
     def test_soak_unattributed_event_pauses_not_finalizes(self, db, topo_dual_ccd_x3d, mock_backend):
         import json as _json
@@ -280,9 +277,9 @@ class TestSpectrumAndSoak:
         )
 
         assert eng._validation_dirty is True
-        assert tp.get_unattributed_crashes(db, eng._session_id) == 1
+        assert db.get_unattributed_crashes(eng._session_id) == 1
         assert eng.status == "paused"
-        assert tp.get_session(db, eng._session_id).status != "completed"
+        assert db.get_tuner_session(eng._session_id).status != "completed"
 
     def test_soak_event_demotes_named_core_and_exits_validation(self, db, topo_dual_ccd_x3d, mock_backend):
         import json as _json
@@ -316,7 +313,7 @@ class TestSpectrumAndSoak:
         assert cs.backoff_fail_bound == BEST[5]
         assert eng._validation_dirty is True
         assert eng.status == "running"
-        assert tp.get_session(db, eng._session_id).validation_stage == 7
+        assert db.get_tuner_session(eng._session_id).validation_stage == 7
 
     def test_stage_count_reflects_flags(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
@@ -400,7 +397,7 @@ class TestMemoryValidationStage:
         eng._on_validation_test_finished(sorted(BEST)[0], passed=True)
 
         assert eng._validation_stage == 7  # soak is next
-        assert tp.get_session(db, eng._session_id).validation_stage == 7
+        assert db.get_tuner_session(eng._session_id).validation_stage == 7
 
     def test_memory_failure_backs_off_failing_core_and_requeues(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = self._seed(db, topo_dual_ccd_x3d, mock_backend)

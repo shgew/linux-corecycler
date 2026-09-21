@@ -9,14 +9,7 @@ from typing import TYPE_CHECKING
 
 from corecycler.engine.backends import register_backend
 
-from .base import (
-    CRASH_SIGNALS,
-    KILLED_BY_US_CODES,
-    FFTPreset,
-    StressBackend,
-    StressConfig,
-    StressMode,
-)
+from .base import FFTPreset, StressBackend, StressConfig, StressMode
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -68,9 +61,9 @@ MODE_TO_CPU_FLAGS: dict[StressMode, dict[str, int]] = {
     },
 }
 
-VERIFIED_MPRIME_VERSIONS: frozenset[str] = frozenset({"31.4"})
+VERIFIED_MPRIME_VERSIONS: frozenset[str] = frozenset({"31.4-build-2"})
 
-_VERSION_RE = re.compile(r"\bv(\d+\.\d+)")
+_VERSION_RE = re.compile(r"\bv(\d+\.\d+),\s*build\s+(\d+)", re.IGNORECASE)
 
 # Fatal error signatures, verified against the Prime95 30.19b20 source
 # (commonb.c SELFFAIL*/ERRMSG* constants; torture-test errors are written to
@@ -109,6 +102,12 @@ class MprimeBackend(StressBackend):
     def get_supported_modes(self) -> list[StressMode]:
         return [StressMode.SSE, StressMode.AVX, StressMode.AVX2, StressMode.AVX512]
 
+    def instruction_set(self, config: StressConfig) -> StressMode | None:
+        return config.mode if config.mode in MODE_TO_CPU_FLAGS else None
+
+    def workload(self, config: StressConfig) -> tuple[str, ...]:
+        return ("torture", config.fft_preset.value, f"{config.threads}T")
+
     def get_supported_fft_presets(self) -> list[FFTPreset]:
         return list(FFTPreset)
 
@@ -133,14 +132,9 @@ class MprimeBackend(StressBackend):
         cpu_flags = MODE_TO_CPU_FLAGS.get(config.mode, MODE_TO_CPU_FLAGS[StressMode.SSE])
         flags_block = "".join(f"{key}={value}\n" for key, value in cpu_flags.items())
 
-        # NumCPUs=1 + CoresPerTest=1 keep mprime to one worker instead of one
-        # per detected core; EnableSetAffinity=0 stops it re-pinning its
-        # threads to core 0's SMT pair, so the load stays where it was placed.
-        local_txt = work_dir / "local.txt"
-        local_txt.write_text(
-            textwrap.dedent(f"""\
-                ErrorCheck=1
-                SumInputsErrorCheck=1
+        common = (
+            textwrap.dedent(
+                f"""\
                 V30OptionsConverted=1
                 StressTester=1
                 UsePrimenet=0
@@ -150,26 +144,13 @@ class MprimeBackend(StressBackend):
                 MaxTortureFFT={fft_max}
                 TortureHyperthreading={1 if config.threads > 1 else 0}
                 TortureThreads={config.threads}
-            """)
+                """
+            )
             + flags_block
         )
-
-        prime_txt = work_dir / "prime.txt"
-        prime_txt.write_text(
-            textwrap.dedent(f"""\
-                V30OptionsConverted=1
-                StressTester=1
-                UsePrimenet=0
-                NumCPUs=1
-                CoresPerTest=1
-                MinTortureFFT={fft_min}
-                MaxTortureFFT={fft_max}
-                TortureHyperthreading={1 if config.threads > 1 else 0}
-                TortureThreads={config.threads}
-            """)
-            + flags_block
-            + "EnableSetAffinity=0\n"
-        )
+        error_checks = "ErrorCheck=1\nSumInputsErrorCheck=1\n"
+        (work_dir / "local.txt").write_text(error_checks + common)
+        (work_dir / "prime.txt").write_text(common + "EnableSetAffinity=0\n")
         # Output files stay at Prime95's defaults (results.txt / prime.log in
         # the work dir). The real override keys are literally "results.txt="
         # and "prime.log=" (commonc.c); ResultsFile=/LogFile= are never read
@@ -178,7 +159,7 @@ class MprimeBackend(StressBackend):
     @staticmethod
     def parse_version(text: str) -> str | None:
         match = _VERSION_RE.search(text)
-        return match.group(1) if match else None
+        return f"{match.group(1)}-build-{match.group(2)}" if match else None
 
     def installed_version(self) -> str | None:
         import subprocess
@@ -205,42 +186,18 @@ class MprimeBackend(StressBackend):
 
     def parse_output(self, stdout: str, stderr: str, returncode: int) -> tuple[bool, str | None]:
         combined = stdout + "\n" + stderr
-
         for pattern in FATAL_PATTERNS:
             match = re.search(pattern, combined, re.IGNORECASE)
             if match:
                 return False, f"mprime error: {match.group(0)}"
-
-        # A crash signal means the worker died from instability — this OVERRIDES any
-        # earlier "Self-test N passed" line in the output (the process passed some
-        # iterations and then crashed, which is still a failure). Checked before the
-        # success patterns so a crash is never masked by a prior pass.
-        if returncode in CRASH_SIGNALS:
-            return False, f"mprime crashed with {CRASH_SIGNALS[returncode]} (exit {returncode})"
-
-        # if process was killed (by us, timeout) with no errors, consider it passed
-        if returncode in KILLED_BY_US_CODES:
-            return True, None
-
-        # Successful iterations — the real line is "Self-test 4K passed!"
-        # (K-suffixed FFT size, optional "(thread N of M)"), commonb.c SELFPASS.
-        if re.search(r"Self-test \d+K?.* passed!", combined):
-            return True, None
-        if re.search(r"Torture Test completed \d+ tests", combined):
-            return True, None
-
-        # unknown state — check return code
-        if returncode != 0:
-            return False, f"mprime exited with code {returncode}"
-
-        return True, None
+        return self.indefinite_exit_verdict(returncode)
 
     def poll_errors(self, work_dir: Path) -> str | None:
         """Scan results.txt for fatal errors while the test is running.
 
         mprime torture tests keep running after a computation error (the error
         lands only in results.txt), so without live polling a soft failure is
-        detected only at the end-of-test parse — burning the full test duration.
+        detected only at the end-of-test parse, burning the full test duration.
         prepare() guarantees the file belongs to the current run.
         """
         results_file = work_dir / "results.txt"
@@ -248,7 +205,7 @@ class MprimeBackend(StressBackend):
             return None
         try:
             content = results_file.read_text()
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             return f"Failed to read results.txt ({exc}) - verdict unavailable"
         for pattern in FATAL_PATTERNS:
             match = re.search(pattern, content, re.IGNORECASE)
@@ -257,7 +214,7 @@ class MprimeBackend(StressBackend):
         return None
 
     def cleanup(self, work_dir: Path, *, preserve_on_error: bool = False) -> None:
-        # On failure, preserve results.txt/prime.log for post-mortem — but RENAMED,
+        # On failure, preserve results.txt/prime.log for post-mortem, but RENAMED,
         # so a later run in the same work dir can never re-parse the old error as
         # its own.
         if preserve_on_error:

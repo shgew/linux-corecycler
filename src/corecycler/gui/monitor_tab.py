@@ -1,11 +1,12 @@
-"""Live monitoring tab — package overview + per-core frequency/temp view."""
+"""Live monitoring tab with package and per-core telemetry."""
 
 from __future__ import annotations
 
-import contextlib
+import logging
 from collections import deque
+from dataclasses import dataclass
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QGridLayout,
@@ -20,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from corecycler.config.settings import load_settings
-from corecycler.gui.style import theme
+from corecycler.gui.style import format_mhz, format_temperature, format_volts, format_watts, theme
 from corecycler.gui.widgets.charts import LiveChart
 from corecycler.monitor.cpu_usage import CPUUsageReader
 from corecycler.monitor.frequency import (
@@ -35,6 +36,96 @@ from corecycler.smu.pmtable import PMTableReader
 
 MAX_FREQ_HISTORY = 60  # 1 minute at 1s
 
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class MonitorSnapshot:
+    frequencies: tuple[tuple[int, float, float], ...]
+    tctl_c: float | None
+    ccd_temperatures_c: tuple[tuple[int, float], ...]
+    vcore_v: float | None
+    package_watts: float | None
+    usage: tuple[tuple[int, float], ...]
+    stretch: tuple[tuple[int, float], ...]
+    core_watts: tuple[tuple[int, float], ...]
+    max_frequency_mhz: float | None
+    power_limits: tuple[tuple[str, float | None, float | None, str], ...]
+
+
+class _MonitorWorker(QThread):
+    snapshot_ready = Signal(object)
+
+    def __init__(self, topology, hwmon, power, msr, cpu_usage, pmtable, parent=None) -> None:
+        super().__init__(parent)
+        self.topology = topology
+        self.hwmon = hwmon
+        self.power = power
+        self.msr = msr
+        self.cpu_usage = cpu_usage
+        self.pmtable = pmtable
+
+    def _read(self, source: str, operation, default):
+        try:
+            return operation()
+        except (OSError, PermissionError, RuntimeError, TypeError, ValueError) as exc:
+            log.warning("%s telemetry read failed: %s", source, exc)
+            return default
+
+    def run(self) -> None:
+        dual = self._read("frequency", read_core_frequencies_dual, {})
+        if dual:
+            frequencies = tuple(
+                sorted((cpu_id, reading.actual_mhz, reading.effective_max_mhz) for cpu_id, reading in dual.items())
+            )
+        else:
+            simple = self._read("frequency fallback", read_core_frequencies, {})
+            frequencies = tuple(sorted((cpu_id, mhz, 0.0) for cpu_id, mhz in simple.items()))
+
+        hwmon_data = self._read("hwmon", self.hwmon.read, None)
+        tctl = hwmon_data.tctl_c if hwmon_data is not None else None
+        ccd_temperatures = tuple(sorted(hwmon_data.ccd_temperatures_c.items())) if hwmon_data is not None else ()
+        vcore = hwmon_data.vcore_v if hwmon_data is not None else None
+
+        package_watts = self._read("power", self.power.read_power_watts, None)
+        msr_available = self._read("MSR availability", self.msr.is_available, False)
+        if package_watts is None and msr_available:
+            package_watts = self._read("MSR package power", self.msr.read_package_power, None)
+
+        usage = tuple(sorted(self._read("CPU usage", self.cpu_usage.read, {}).items()))
+        stretch: tuple[tuple[int, float], ...] = ()
+        core_watts: tuple[tuple[int, float], ...] = ()
+        if msr_available and self.topology:
+            cpus = tuple(core.logical_cpus[0] for core in self.topology.cores.values() if core.logical_cpus)
+            stretch_readings = self._read("MSR clock stretch", lambda: self.msr.read_clock_stretch(list(cpus)), {})
+            power_readings = self._read("MSR core power", lambda: self.msr.read_core_power(list(cpus)), {})
+            stretch = tuple(sorted((cpu_id, reading.stretch_pct) for cpu_id, reading in stretch_readings.items()))
+            core_watts = tuple(sorted((cpu_id, reading.watts) for cpu_id, reading in power_readings.items()))
+
+        power_limits: tuple[tuple[str, float | None, float | None, str], ...] = ()
+        if self._read("PM table availability", self.pmtable.is_available, False):
+            pm = self._read("PM table", self.pmtable.read, None)
+            if pm is not None:
+                power_limits = (
+                    ("PPT", pm.ppt_value_w, pm.ppt_limit_w, "W"),
+                    ("TDC", pm.tdc_value_a, pm.tdc_limit_a, "A"),
+                    ("EDC", pm.edc_value_a, pm.edc_limit_a, "A"),
+                )
+
+        snapshot = MonitorSnapshot(
+            frequencies=frequencies,
+            tctl_c=tctl,
+            ccd_temperatures_c=ccd_temperatures,
+            vcore_v=vcore,
+            package_watts=package_watts,
+            usage=usage,
+            stretch=stretch,
+            core_watts=core_watts,
+            max_frequency_mhz=self._read("maximum frequency", read_max_frequency, None),
+            power_limits=power_limits,
+        )
+        self.snapshot_ready.emit(snapshot)
+
 
 class CoreFreqBar(QWidget):
     """Compact per-core frequency bar with sparkline history."""
@@ -46,7 +137,7 @@ class CoreFreqBar(QWidget):
         self._max_freq = max_freq
         self._freq: float = 0
         self._eff_max: float = 0  # per-core boost ceiling (scaling_max_freq)
-        self._temp: float = 0
+        self._temp: float | None = None
         self._usage_pct: float = 0
         self._stretch_pct: float | None = None
         self._core_watts: float | None = None
@@ -63,7 +154,7 @@ class CoreFreqBar(QWidget):
     def update_data(
         self,
         freq: float,
-        temp: float = 0,
+        temp: float | None = None,
         usage_pct: float = 0,
         stretch_pct: float | None = None,
         core_watts: float | None = None,
@@ -90,15 +181,15 @@ class CoreFreqBar(QWidget):
         if freq <= 0:
             return "  -- MHz"
         if eff_max > 0:
-            return f"{freq:.0f}/{eff_max:.0f}MHz"
-        return f"{freq:.0f}MHz"
+            return f"{format_mhz(freq).removesuffix(' MHz')}/{format_mhz(eff_max)}"
+        return format_mhz(freq)
 
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         w, h = self.width(), self.height()
 
-        # background — highlighted if this core is being tested
+        # Background is highlighted if this core is being tested.
         bg = QColor(theme.BG_ACTIVE_TINT) if self._is_active else QColor(theme.BG_PANEL_DARK)
         painter.fillRect(0, 0, w, h, bg)
 
@@ -131,7 +222,7 @@ class CoreFreqBar(QWidget):
             if fill_w > 0:
                 painter.fillRect(bar_x, 3, fill_w, h - 6, color)
 
-            # boost ceiling marker (per-core scaling_max_freq) — yellow dashed line
+            # Draw the per-core boost ceiling as a yellow dashed line.
             if self._eff_max > 0:
                 eff_ratio = min(self._eff_max / self._max_freq, 1.0)
                 marker_x = int(bar_x + bar_w * eff_ratio)
@@ -152,7 +243,7 @@ class CoreFreqBar(QWidget):
                     y1 = 3 + (1.0 - min(data[i] / self._max_freq, 1.0)) * (h - 6)
                     painter.drawLine(int(x0), int(y0), int(x1), int(y1))
 
-        # text values on the right — fixed-width columns for stable layout
+        # Keep fixed-width value columns aligned on the right.
         text_x = bar_x + bar_w + 4 if bar_w > 0 else label_w
         mono = QFont("monospace", 7)
         painter.setFont(mono)
@@ -164,12 +255,11 @@ class CoreFreqBar(QWidget):
         usage_str = f"{self._usage_pct:3.0f}%"
         usage_color = QColor(theme.COLOR_PASS) if self._usage_pct > 50 else QColor(theme.COLOR_MUTED)
 
-        # Frequency — always unit-labelled; the boost ceiling shows only for a
-        # live core (the dashed bar marker also shows it).
+        # The live boost ceiling also has a dashed bar marker.
         freq_str = self._freq_text(self._freq, self._eff_max)
         freq_color = QColor(theme.COLOR_ACTIVE)
 
-        # Stretch — fixed slot, blank when idle (keeps alignment stable)
+        # Reserve a fixed stretch slot to keep columns aligned while idle.
         if self._stretch_pct is not None and self._usage_pct > 5:
             stretch_str = f"N:{self._stretch_pct:4.1f}%"
             if self._stretch_pct > 3.0:
@@ -191,7 +281,7 @@ class CoreFreqBar(QWidget):
             watts_color = QColor(theme.COLOR_MUTED_DARK)
 
         # Temperature
-        if self._temp > 0:
+        if self._temp is not None:
             temp_str = f"{self._temp:3.0f}C"
             if self._temp >= 85:
                 temp_color = QColor(theme.CHART_TEMP)
@@ -218,7 +308,7 @@ class CoreFreqBar(QWidget):
             painter.drawText(cx, 0, tw + col_gap, h, Qt.AlignmentFlag.AlignVCenter, text)
             cx += tw + col_gap
 
-        # border — highlighted if active
+        # Highlight the border while this core is active.
         border_color = QColor(theme.COLOR_ACTIVE) if self._is_active else QColor(theme.BORDER_DARKER)
         border_width = 2 if self._is_active else 1
         painter.setPen(QPen(border_color, border_width))
@@ -230,13 +320,7 @@ class CoreFreqBar(QWidget):
 class MonitorTab(QWidget):
     """Live system monitoring with package charts + per-core view toggle."""
 
-    # Staleness tracking — grey out labels after consecutive sensor read failures
-    _STALE_THRESHOLD = 3
     _NORMAL_STYLE = "font: bold 11px monospace; padding: 2px;"
-
-    @staticmethod
-    def _stale_style() -> str:
-        return f"font: bold 11px monospace; padding: 2px; color: {theme.COLOR_MUTED_DARK};"
 
     def __init__(self, topology=None) -> None:
         super().__init__()
@@ -248,21 +332,18 @@ class MonitorTab(QWidget):
         self._pmtable = PMTableReader()
         self._per_core_bars: dict[int, CoreFreqBar] = {}
         self._per_core_visible = False
-        self._hwmon_fail_count: int = 0
-        self._power_fail_count: int = 0
-
+        self._max_core_freq = 6000.0
         self._setup_ui()
-
-        # Check data source availability and set initial labels
-        if not self._hwmon.is_available():
-            self._tctl_label.setText("Tctl: N/A")
-        has_voltage = self._hwmon.is_available() and self._hwmon.read().vcore_v is not None
-        if not has_voltage:
-            self._vcore_label.setText("Vcore: N/A (no voltage source)")
-        has_power = self._power.is_available() or self._msr.is_available()
-        if not has_power:
-            self._power_label.setText("Package: N/A (needs root)")
-
+        self._worker = _MonitorWorker(
+            topology,
+            self._hwmon,
+            self._power,
+            self._msr,
+            self._cpu_usage,
+            self._pmtable,
+            parent=self,
+        )
+        self._worker.snapshot_ready.connect(self._apply_snapshot)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._update)
         settings = load_settings()
@@ -355,15 +436,6 @@ class MonitorTab(QWidget):
         self._per_core_scroll.setVisible(False)
         layout.addWidget(self._per_core_scroll)
 
-        # populate max boost
-        max_freq = read_max_frequency()
-        if max_freq:
-            self._max_freq_label.setText(f"Max Boost: {max_freq:.0f}MHz")
-            self._freq_chart.max_val = max_freq * 1.1
-            self._max_core_freq = max_freq
-        else:
-            self._max_core_freq = 6000
-
     def _build_per_core_bars(self) -> None:
         """Create per-core frequency bars from topology or by scanning sysfs."""
         self._per_core_bars.clear()
@@ -407,179 +479,94 @@ class MonitorTab(QWidget):
         self._toggle_btn.setText("Package View" if checked else "Per-Core View")
 
     def _update(self) -> None:
-        # legitimate sysfs/procfs read failures are dropped
-        with contextlib.suppress(OSError, ValueError, PermissionError):
-            self._do_update()
+        if not self._worker.isRunning():
+            self._worker.start()
 
-    def _do_update(self) -> None:
-        # frequencies — read both actual and boost ceiling per-core
-        dual_freqs = read_core_frequencies_dual()
-        # Extract simple freq dict for chart + fallback
-        freqs: dict[int, float] = {cpu_id: r.actual_mhz for cpu_id, r in dual_freqs.items()}
-        # Also extract per-core boost ceilings
-        eff_max_freqs: dict[int, float] = {cpu_id: r.effective_max_mhz for cpu_id, r in dual_freqs.items()}
-        # Fallback to simple read if dual returned nothing
-        if not freqs:
-            freqs = read_core_frequencies()
+    def _ccd_label(self, ccd_id: int) -> QLabel:
+        label = self._ccd_temp_labels.get(ccd_id)
+        if label is not None:
+            return label
+        label = QLabel()
+        label.setStyleSheet(self._NORMAL_STYLE)
+        values_group = self._tctl_label.parent()
+        if values_group and values_group.layout():
+            values_group.layout().addWidget(label, 1, len(self._ccd_temp_labels))
+        self._ccd_temp_labels[ccd_id] = label
+        return label
 
-        if freqs:
-            max_freq = max(freqs.values())
-            # Dynamically update max if a core boosts above expected ceiling
-            current_max = getattr(self, "_max_core_freq", 6000)
-            if max_freq > current_max:
-                self._max_core_freq = max_freq
-                self._max_freq_label.setText(f"Max Boost: {max_freq:.0f}MHz")
-                self._freq_chart.max_val = max_freq * 1.1
-            self._freq_chart.add_value(max_freq)
+    @Slot(object)
+    def _apply_snapshot(self, snapshot: MonitorSnapshot) -> None:
+        freqs = {cpu_id: actual for cpu_id, actual, _ceiling in snapshot.frequencies}
+        eff_max = {cpu_id: ceiling for cpu_id, _actual, ceiling in snapshot.frequencies}
+        usage = dict(snapshot.usage)
+        stretch = dict(snapshot.stretch)
+        core_watts = dict(snapshot.core_watts)
+        ccd_temperatures = dict(snapshot.ccd_temperatures_c)
 
-        # hwmon
-        hwmon_data = self._hwmon.read()
-        tctl = hwmon_data.tctl_c
-        if tctl is not None:
-            self._hwmon_fail_count = 0
-            self._tctl_label.setStyleSheet(self._NORMAL_STYLE)
-            self._tctl_label.setText(f"Tctl: {tctl:.1f}°C")
-            self._temp_chart.add_value(tctl)
-        else:
-            self._hwmon_fail_count += 1
-            if self._hwmon_fail_count >= self._STALE_THRESHOLD:
-                self._tctl_label.setStyleSheet(self._stale_style())
-            # Keep last-known text — don't clear it
-        # Per-CCD temps — create labels dynamically on first appearance
-        for tccd_idx in sorted(hwmon_data.tccd_temps):
-            temp = hwmon_data.tccd_temps[tccd_idx]
-            ccd_idx = tccd_idx - 1  # Tccd1 → CCD 0
-            if ccd_idx not in self._ccd_temp_labels:
-                label = QLabel()
-                label.setStyleSheet("font: bold 11px monospace; padding: 2px;")
-                values_group = self._tctl_label.parent()
-                if values_group:
-                    gl = values_group.layout()
-                    if gl:
-                        gl.addWidget(label, 1, len(self._ccd_temp_labels))
-                self._ccd_temp_labels[ccd_idx] = label
-            vcache_tag = ""
-            if self._topology:
-                for core in self._topology.cores.values():
-                    if core.ccd == ccd_idx and core.has_vcache:
-                        vcache_tag = " VC"
-                        break
-            self._ccd_temp_labels[ccd_idx].setText(f"CCD{ccd_idx}{vcache_tag}: {temp:.1f}°C")
-        if hwmon_data.vcore_v is not None:
-            self._vcore_label.setStyleSheet(self._NORMAL_STYLE)
-            self._vcore_label.setText(f"Vcore: {hwmon_data.vcore_v:.4f}V")
-            self._voltage_chart.add_value(hwmon_data.vcore_v)
-        else:
-            if self._hwmon_fail_count >= self._STALE_THRESHOLD:
-                self._vcore_label.setStyleSheet(self._stale_style())
+        sample_max = max(freqs.values(), default=None)
+        advertised_max = snapshot.max_frequency_mhz
+        observed_max = max((value for value in (sample_max, advertised_max) if value is not None), default=None)
+        if observed_max is not None and observed_max > self._max_core_freq:
+            self._max_core_freq = observed_max
+            self._freq_chart.max_val = observed_max * 1.1
+        self._max_freq_label.setText(f"Max Boost: {format_mhz(observed_max)}")
+        if sample_max is not None:
+            self._freq_chart.add_value(sample_max)
 
-        # power — sysfs RAPL (user-accessible) or MSR RAPL (root-only)
-        watts = self._power.read_power_watts()
-        if watts is not None:
-            self._power_fail_count = 0
-            self._power_label.setStyleSheet(self._NORMAL_STYLE)
-            self._power_label.setText(f"Package: {watts:.1f}W")
-            self._power_chart.add_value(watts)
-        elif self._msr.is_available():
-            # Fallback: read package energy from MSR RAPL
-            pkg_power = self._msr.read_package_power()
-            if pkg_power is not None:
-                self._power_fail_count = 0
-                self._power_label.setStyleSheet(self._NORMAL_STYLE)
-                self._power_label.setText(f"Package: {pkg_power:.1f}W")
-                self._power_chart.add_value(pkg_power)
-            else:
-                self._power_fail_count += 1
-                if self._power_fail_count >= self._STALE_THRESHOLD:
-                    self._power_label.setStyleSheet(self._stale_style())
-        else:
-            self._power_fail_count += 1
-            if self._power_fail_count >= self._STALE_THRESHOLD:
-                self._power_label.setStyleSheet(self._stale_style())
+        self._tctl_label.setText(f"Tctl: {format_temperature(snapshot.tctl_c)}")
+        if snapshot.tctl_c is not None:
+            self._temp_chart.add_value(snapshot.tctl_c)
+        self._vcore_label.setText(f"Vcore: {format_volts(snapshot.vcore_v)}")
+        if snapshot.vcore_v is not None:
+            self._voltage_chart.add_value(snapshot.vcore_v)
+        self._power_label.setText(f"Package: {format_watts(snapshot.package_watts)}")
+        if snapshot.package_watts is not None:
+            self._power_chart.add_value(snapshot.package_watts)
 
-        # CPU usage from /proc/stat
-        usage_data = self._cpu_usage.read()  # logical cpu → usage %
+        expected_ccds = set(ccd_temperatures)
+        if self._topology:
+            expected_ccds.update(core.ccd for core in self._topology.cores.values() if core.ccd is not None)
+        for ccd_id in sorted(expected_ccds):
+            vcache = bool(
+                self._topology and any(core.ccd == ccd_id and core.has_vcache for core in self._topology.cores.values())
+            )
+            tag = " VC" if vcache else ""
+            self._ccd_label(ccd_id).setText(f"CCD{ccd_id}{tag}: {format_temperature(ccd_temperatures.get(ccd_id))}")
 
-        # MSR: clock stretch + per-core power (for per-core bars)
-        stretch_data: dict[int, float] = {}  # logical cpu → stretch %
-        power_data: dict[int, float] = {}  # logical cpu → watts
-        if self._msr.is_available() and self._topology:
-            all_cpus = []
-            for core_info in self._topology.cores.values():
-                if core_info.logical_cpus:
-                    all_cpus.append(core_info.logical_cpus[0])
-            if all_cpus:
-                stretch_readings = self._msr.read_clock_stretch(all_cpus)
-                for cpu_id, reading in stretch_readings.items():
-                    stretch_data[cpu_id] = reading.stretch_pct
-                power_readings = self._msr.read_core_power(all_cpus)
-                for cpu_id, reading in power_readings.items():
-                    power_data[cpu_id] = reading.watts
-
-        # Build CCD → temp mapping from hwmon tccd_temps
-        # k10temp: Tccd1 = CCD index 1, but topology CCD indices start at 0
-        ccd_temps: dict[int, float] = {}
-        for tccd_idx, temp in hwmon_data.tccd_temps.items():
-            ccd_temps[tccd_idx - 1] = temp  # Tccd1 → CCD 0, Tccd2 → CCD 1
-
-        # update per-core bars (even if hidden, so history accumulates)
-        if self._per_core_bars and freqs:
-            if self._topology:
-                for core_id, bar in self._per_core_bars.items():
-                    core_info = self._topology.cores.get(core_id)
-                    if core_info and core_info.logical_cpus:
-                        logical_cpu = core_info.logical_cpus[0]
-                        cpu_freq = freqs.get(logical_cpu, 0)
-                        eff_max = eff_max_freqs.get(logical_cpu, 0)
-                        # Use per-CCD temp if available, fall back to Tctl
-                        ccd = core_info.ccd if core_info.ccd is not None else 0
-                        core_temp = ccd_temps.get(ccd, tctl or 0)
-                        # Sum usage across SMT siblings for this physical core
-                        core_usage = sum(usage_data.get(lc, 0) for lc in core_info.logical_cpus)
-                        bar.update_data(
-                            cpu_freq,
-                            core_temp,
-                            usage_pct=min(core_usage, 100.0),
-                            stretch_pct=stretch_data.get(logical_cpu),
-                            core_watts=power_data.get(logical_cpu),
-                            eff_max_mhz=eff_max,
-                        )
-
-                    mcf = getattr(self, "_max_core_freq", 6000)
-                    if mcf:
-                        bar._max_freq = mcf * 1.05
-            else:
-                for cpu_id, bar in self._per_core_bars.items():
-                    bar.update_data(
-                        freqs.get(cpu_id, 0),
-                        tctl or 0,
-                        usage_pct=usage_data.get(cpu_id, 0),
-                    )
-
-        self._update_power_limits()
-
-    def _update_power_limits(self) -> None:
-        pm = self._pmtable.read() if self._pmtable.is_available() else None
-        if pm is None:
-            self._ppt_label.setText("PPT: N/A")
-            self._tdc_label.setText("TDC: N/A")
-            self._edc_label.setText("EDC: N/A")
-            return
-
-        def fmt(label, name, value, limit, unit):
-            if limit > 0:
-                pct = (value / limit) * 100 if value >= 0 else 0
-                label.setText(f"{name}: {value:.0f}/{limit:.0f}{unit} ({pct:.0f}%)")
-            else:
+        labels = {"PPT": self._ppt_label, "TDC": self._tdc_label, "EDC": self._edc_label}
+        values = {name: (value, limit, unit) for name, value, limit, unit in snapshot.power_limits}
+        for name, label in labels.items():
+            value, limit, unit = values.get(name, (None, None, ""))
+            if value is None or limit is None or limit <= 0:
                 label.setText(f"{name}: N/A")
+            else:
+                label.setText(f"{name}: {value:.0f}/{limit:.0f}{unit} ({value / limit * 100:.0f}%)")
 
-        fmt(self._ppt_label, "PPT", pm.ppt_value_w, pm.ppt_limit_w, "W")
-        fmt(self._tdc_label, "TDC", pm.tdc_value_a, pm.tdc_limit_a, "A")
-        fmt(self._edc_label, "EDC", pm.edc_value_a, pm.edc_limit_a, "A")
+        if self._topology:
+            for core_id, bar in self._per_core_bars.items():
+                core = self._topology.cores.get(core_id)
+                if core is None or not core.logical_cpus:
+                    continue
+                logical_cpu = core.logical_cpus[0]
+                ccd_id = core.ccd if core.ccd is not None else 0
+                core_temp = ccd_temperatures.get(ccd_id, snapshot.tctl_c)
+                bar.update_data(
+                    freqs.get(logical_cpu, 0.0),
+                    core_temp,
+                    usage_pct=min(sum(usage.get(cpu, 0.0) for cpu in core.logical_cpus), 100.0),
+                    stretch_pct=stretch.get(logical_cpu),
+                    core_watts=core_watts.get(logical_cpu),
+                    eff_max_mhz=eff_max.get(logical_cpu, 0.0),
+                )
+                bar._max_freq = self._max_core_freq * 1.05
+        else:
+            for cpu_id, bar in self._per_core_bars.items():
+                bar.update_data(freqs.get(cpu_id, 0.0), snapshot.tctl_c, usage_pct=usage.get(cpu_id, 0.0))
 
     def set_topology(self, topology) -> None:
         """Update topology and rebuild per-core bars."""
         self._topology = topology
+        self._worker.topology = topology
         # clear existing bars
         for bar in self._per_core_bars.values():
             bar.deleteLater()
@@ -599,4 +586,6 @@ class MonitorTab(QWidget):
 
     def stop_monitoring(self) -> None:
         self._timer.stop()
+        if self._worker.isRunning():
+            self._worker.wait()
         self._msr.close()

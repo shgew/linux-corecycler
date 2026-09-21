@@ -1,4 +1,4 @@
-"""stress-ng stress test backend — always available on NixOS."""
+"""stress-ng stress test backend, always available on NixOS."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 from corecycler.engine.backends import register_backend
 
-from .base import CRASH_SIGNALS, KILLED_BY_US_CODES, StressBackend, StressConfig, StressMode
+from .base import StressBackend, StressConfig, StressMode
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -36,7 +36,7 @@ class StressNgBackend(StressBackend):
         ]
 
         # Add matrix verification stressor alongside cpu for SSE mode.
-        # matrixprod has no built-in verification — adding matrix stressor
+        # matrixprod has no built-in verification, so adding matrix stressor
         # with --verify provides actual computation checking.
         if method == "matrixprod":
             cmd += ["--matrix", str(config.threads), "--matrix-method", "prod"]
@@ -45,6 +45,9 @@ class StressNgBackend(StressBackend):
 
     def get_supported_modes(self) -> list[StressMode]:
         return [StressMode.SSE, StressMode.AVX, StressMode.AVX2]
+
+    def workload(self, config: StressConfig) -> tuple[str, ...]:
+        return (_mode_to_method(config.mode),)
 
     def prepare(self, work_dir: Path, config: StressConfig) -> None:
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -68,15 +71,7 @@ class StressNgBackend(StressBackend):
             if match:
                 return False, f"stress-ng error: {match.group(0)}"
 
-        # killed by us (timeout) = passed, but only if no error patterns matched above
-        if returncode in KILLED_BY_US_CODES or returncode == 0:
-            return True, None
-
-        # SIGSEGV/SIGABRT/SIGBUS = likely CO instability crash
-        if returncode in CRASH_SIGNALS:
-            return False, f"stress-ng crashed with {CRASH_SIGNALS[returncode]} (exit {returncode})"
-
-        return False, f"stress-ng exited with code {returncode}"
+        return self.indefinite_exit_verdict(returncode)
 
     def cleanup(self, work_dir: Path, *, preserve_on_error: bool = False) -> None:
         pass

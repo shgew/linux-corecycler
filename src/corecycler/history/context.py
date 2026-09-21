@@ -1,145 +1,177 @@
-"""Tuning context utilities — BIOS version, CO snapshots, session grouping.
-
-A "tuning context" captures the system state that determines whether two
-test runs are comparable: BIOS version + CO offsets + PBO settings.  Runs
-under the same context form a tuning session.
-"""
+"""Capture and identify the complete CPU tuning context."""
 
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from corecycler.history.db import TuningContextRecord
-
 if TYPE_CHECKING:
-    from corecycler.history.db import HistoryDB
+    from corecycler.history.db import HistoryDB, TuningContextRecord
     from corecycler.smu.driver import RyzenSMU
 
 log = logging.getLogger(__name__)
 
 BIOS_VERSION_PATH = Path("/sys/class/dmi/id/bios_version")
+_CONTEXT_HASH_VERSION = 1
+
+
+@dataclass(frozen=True, slots=True)
+class SystemContext:
+    cpu_model: str
+    physical_cores: int
+    ccds: int
+    co: tuple[int | None, ...]
+    pbo_scalar: float | None
+    boost_limit_mhz: int | None
+    ppt_limit_w: float | None
+    tdc_limit_a: float | None
+    edc_limit_a: float | None
+    bios_version: str
+    context_hash: str
+    complete: bool
+    missing: tuple[str, ...]
+
+    def to_record(self) -> TuningContextRecord:
+        from corecycler.history.db import TuningContextRecord
+
+        return TuningContextRecord(
+            bios_version=self.bios_version,
+            cpu_model=self.cpu_model,
+            physical_cores=self.physical_cores,
+            ccds=self.ccds,
+            co_offsets_json=json.dumps(
+                {str(core_id): offset for core_id, offset in enumerate(self.co)},
+                separators=(",", ":"),
+            ),
+            context_hash=self.context_hash,
+            pbo_scalar=self.pbo_scalar,
+            boost_limit_mhz=self.boost_limit_mhz,
+            ppt_limit_w=self.ppt_limit_w,
+            tdc_limit_a=self.tdc_limit_a,
+            edc_limit_a=self.edc_limit_a,
+        )
 
 
 def read_bios_version(path: Path = BIOS_VERSION_PATH) -> str:
-    """Read BIOS version from DMI sysfs. Returns '' if unavailable."""
     try:
         if path.exists():
             return path.read_text().strip()
     except OSError:
-        log.debug("Could not read BIOS version from %s", path)
+        log.debug("Could not read BIOS version from %s", path, exc_info=True)
     return ""
 
 
-def compute_co_hash(
-    offsets: dict[int, int | None],
-    limits: tuple[float | None, float | None, float | None] | None = None,
+def compute_context_hash(
+    *,
+    cpu_model: str,
+    physical_cores: int,
+    ccds: int,
+    co: tuple[int | None, ...],
+    pbo_scalar: float | None,
+    boost_limit_mhz: int | None,
+    ppt_limit_w: float | None,
+    tdc_limit_a: float | None,
+    edc_limit_a: float | None,
+    bios_version: str,
 ) -> str:
-    """Deterministic SHA-256 identity of CO offsets plus PBO power limits.
-
-    None values are excluded (unknown cores don't affect identity).
-    Order-independent: {0: -30, 1: -20} == {1: -20, 0: -30}.
-    Power limits (PPT/TDC/EDC) are part of the stability environment, so they
-    are part of the identity; when none are available the payload stays
-    byte-identical to the pre-v13 CO-only form so existing contexts keep
-    their identity.
-    """
-    clean = {k: v for k, v in offsets.items() if v is not None}
-    have_limits = limits is not None and any(v is not None for v in limits)
-    if not clean and not have_limits:
-        return ""
-    payload_obj: object = sorted(clean.items())
-    if have_limits:
-        payload_obj = {
-            "co": sorted(clean.items()),
-            "limits": [None if v is None else round(v, 1) for v in limits],
-        }
-    payload = json.dumps(payload_obj, separators=(",", ":"))
-    return hashlib.sha256(payload.encode()).hexdigest()
+    payload = {
+        "version": _CONTEXT_HASH_VERSION,
+        "cpu_model": cpu_model,
+        "physical_cores": physical_cores,
+        "ccds": ccds,
+        "co": list(co),
+        "pbo_scalar": pbo_scalar,
+        "boost_limit_mhz": boost_limit_mhz,
+        "ppt_limit_w": ppt_limit_w,
+        "tdc_limit_a": tdc_limit_a,
+        "edc_limit_a": edc_limit_a,
+        "bios_version": bios_version,
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
 
 
 def capture_system_context(
     smu: RyzenSMU | None = None,
     num_cores: int = 0,
     bios_path: Path = BIOS_VERSION_PATH,
-) -> TuningContextRecord:
-    """Snapshot the current tuning state.
-
-    If SMU is unavailable, returns a context with BIOS version only.
-    """
-    bios = read_bios_version(bios_path)
-
-    co_offsets: dict[int, int | None] = {}
+    *,
+    cpu_model: str = "",
+    ccds: int = 0,
+) -> SystemContext:
+    bios_version = read_bios_version(bios_path)
+    offsets: dict[int, int | None] = {}
     pbo_scalar: float | None = None
-    boost_limit: int | None = None
-    ppt = tdc = edc = None
+    boost_limit_mhz: int | None = None
+    ppt_limit_w: float | None = None
+    tdc_limit_a: float | None = None
+    edc_limit_a: float | None = None
 
     if smu is not None and num_cores > 0:
         try:
-            co_offsets = smu.get_all_co_offsets(num_cores)
+            offsets = smu.get_all_co_offsets(num_cores)
         except Exception:
             log.warning("Failed to read CO offsets from SMU", exc_info=True)
-
         try:
             pbo_scalar = smu.get_pbo_scalar()
         except Exception:
             log.debug("Failed to read PBO scalar", exc_info=True)
-
         try:
-            boost_limit = smu.get_boost_limit()
+            boost_limit_mhz = smu.get_boost_limit()
         except Exception:
             log.debug("Failed to read boost limit", exc_info=True)
-
-        # PBO power limits are part of the stability environment: the same CO
-        # profile can be stable at PPT 200 W and unstable at 230 W.
         try:
             from corecycler.smu.pmtable import read_power_limits
 
-            ppt, tdc, edc = read_power_limits(num_cores)
+            ppt_limit_w, tdc_limit_a, edc_limit_a = read_power_limits()
         except Exception:
             log.debug("Failed to read PBO power limits", exc_info=True)
 
-    co_hash = compute_co_hash(co_offsets, (ppt, tdc, edc))
-    co_json = json.dumps(
-        {k: v for k, v in co_offsets.items() if v is not None},
-        separators=(",", ":"),
-    )
-
-    return TuningContextRecord(
-        bios_version=bios,
-        co_offsets_json=co_json,
-        co_hash=co_hash,
+    co = tuple(offsets.get(core_id) for core_id in range(num_cores))
+    missing = []
+    if not cpu_model:
+        missing.append("cpu_model")
+    missing.extend(f"co[{core_id}]" for core_id, offset in enumerate(co) if offset is None)
+    if num_cores <= 0:
+        missing.append("co")
+    missing_tuple = tuple(missing)
+    context_hash = compute_context_hash(
+        cpu_model=cpu_model,
+        physical_cores=num_cores,
+        ccds=ccds,
+        co=co,
         pbo_scalar=pbo_scalar,
-        boost_limit_mhz=boost_limit,
-        ppt_limit_w=ppt,
-        tdc_limit_a=tdc,
-        edc_limit_a=edc,
+        boost_limit_mhz=boost_limit_mhz,
+        ppt_limit_w=ppt_limit_w,
+        tdc_limit_a=tdc_limit_a,
+        edc_limit_a=edc_limit_a,
+        bios_version=bios_version,
     )
-
-
-def find_or_create_context(db: HistoryDB, ctx: TuningContextRecord) -> int:
-    """Find an existing context matching (co_hash, bios_version), or create one.
-
-    Returns the context id.
-    """
-    existing = db.get_context_by_hash(ctx.co_hash, ctx.bios_version)
-    if existing is not None:
-        return existing.id
-    return db.create_context(ctx)
+    return SystemContext(
+        cpu_model=cpu_model,
+        physical_cores=num_cores,
+        ccds=ccds,
+        co=co,
+        pbo_scalar=pbo_scalar,
+        boost_limit_mhz=boost_limit_mhz,
+        ppt_limit_w=ppt_limit_w,
+        tdc_limit_a=tdc_limit_a,
+        edc_limit_a=edc_limit_a,
+        bios_version=bios_version,
+        context_hash=context_hash,
+        complete=not missing_tuple,
+        missing=missing_tuple,
+    )
 
 
 def detect_bios_change(
     db: HistoryDB,
     bios_path: Path = BIOS_VERSION_PATH,
 ) -> tuple[bool, str, str]:
-    """Check if BIOS version changed since the most recent tuning context.
-
-    Returns (changed, old_version, current_version).
-    If no previous contexts exist, returns (False, '', current).
-    """
     current = read_bios_version(bios_path)
     contexts = db.list_contexts(limit=1)
     if not contexts:

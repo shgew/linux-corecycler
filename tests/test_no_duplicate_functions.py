@@ -68,11 +68,25 @@ def _normalize_bindings(body: list[ast.stmt], signature_args: set[str]) -> ast.M
     return module
 
 
+def _statement_count(body: list[ast.stmt]) -> int:
+    count = 0
+    stack: list[ast.AST] = list(body)
+    deferred = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.stmt):
+            count += 1
+        if isinstance(node, deferred):
+            continue
+        stack.extend(ast.iter_child_nodes(node))
+    return count
+
+
 def body_fingerprint(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str | None:
     body = list(fn.body)
     if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant):
         body = body[1:]
-    if len(body) < MIN_STATEMENTS:
+    if _statement_count(body) < MIN_STATEMENTS:
         return None
     module = _normalize_bindings(body, _signature_args(fn))
     return ast.dump(module, annotate_fields=True, include_attributes=False)
@@ -134,3 +148,13 @@ class TestGateCatchesRenamedCopies:
 
     def test_a_short_body_is_exempt(self):
         assert _fp_of("def a(x):\n    return x + 1\n") is None
+
+    def test_a_large_body_wrapped_in_one_statement_is_checked(self):
+        wrapped = (
+            "def a(value):\n"
+            "    if value:\n"
+            "        adjusted = value + 1\n"
+            "        result = adjusted * 2\n"
+            "        return result\n"
+        )
+        assert _fp_of(wrapped) is not None

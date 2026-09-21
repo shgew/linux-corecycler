@@ -1,4 +1,4 @@
-"""CoreCycler — Per-core CPU stability tester and PBO Curve Optimizer tuner."""
+"""CoreCycler - Per-core CPU stability tester and PBO Curve Optimizer tuner."""
 
 from __future__ import annotations
 
@@ -151,7 +151,7 @@ def _bootstrap_sudo_session() -> None:
     """Derive a usable session handshake for root under ``sudo``.
 
     sudo strips XAUTHORITY, DISPLAY and WAYLAND_DISPLAY, so Qt can neither
-    reach the user's Wayland socket nor authenticate to X11 — it then
+    reach the user's Wayland socket nor authenticate to X11 - it then
     qFatal-aborts (SIGABRT) at QApplication construction. It strips the desktop
     identity and config search path too, which is what the desktop's appearance
     is read from. Point all of it at the INVOKING user's session; root's uid
@@ -246,7 +246,7 @@ def _install_exception_hooks(window) -> None:
             hook_log.critical("Could not display the error dialog", exc_info=True)
 
     def _thread_handle(args) -> None:
-        # Non-GUI thread: no dialog (Qt forbids it off the main thread) — the
+        # Non-GUI thread: no dialog (Qt forbids it off the main thread) - the
         # traceback still lands in the log instead of dying silently.
         hook_log.critical(
             "UNCAUGHT EXCEPTION in thread %s",
@@ -284,15 +284,17 @@ def setup_logging() -> None:
     try:
         from logging.handlers import RotatingFileHandler
 
-        from corecycler.config.paths import fix_sudo_ownership, user_home
+        from corecycler.config.paths import atomic_write, ensure_directory, ensure_state_directory
 
-        log_dir = user_home() / ".local" / "share" / "corecycler" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        file_handler = RotatingFileHandler(log_dir / "corecycler.log", maxBytes=5_000_000, backupCount=3)
+        state_dir = ensure_state_directory().parent
+        log_dir = ensure_directory(state_dir / "logs")
+        log_file = log_dir / "corecycler.log"
+        if not log_file.exists():
+            atomic_write(log_file, "")
+        file_handler = RotatingFileHandler(log_file, maxBytes=5_000_000, backupCount=3)
         file_handler.setLevel(logging.DEBUG)
         file_handler.setFormatter(fmt)
         handlers.append(file_handler)
-        fix_sudo_ownership(log_dir, log_dir / "corecycler.log")
     except OSError as e:
         print(f"corecycler: debug log unavailable: {e}", file=sys.stderr)
     logging.basicConfig(level=logging.DEBUG, handlers=handlers)
@@ -306,23 +308,20 @@ def main() -> int:
     import os
 
     argv = sys.argv[1:]
-    if argv and argv[0] in ("-h", "--help", "-V", "--version"):
-        from corecycler.cli import cli_main
+    from corecycler import capabilities, cli
 
-        return cli_main(argv[:1])
+    if argv and argv[0] in ("-h", "--help", "-V", "--version"):
+        return cli.cli_main(argv[:1])
+    if cli.invocation_is_cli(argv):
+        setup_logging()
+        confinement = capabilities.confine()
+        if cli.command_requires_confinement(argv) and not confinement.safe:
+            print("corecycler: capability confinement could not be proven safe", file=sys.stderr)
+            return cli.EXIT_REFUSED
+        return cli.cli_main(argv)
 
     setup_logging()
-
-    # A setcap launcher may have handed this process CAP_SYS_RAWIO for MSR
-    # reads; no stress payload it spawns may inherit it.
-    from corecycler import capabilities
-
     capabilities.confine()
-
-    if argv and argv[0] in ("doctor", "status", "report", "tune", "resume"):
-        from corecycler.cli import cli_main
-
-        return cli_main(argv)
 
     # Silence the warning categories that fire for session services root cannot use
     os.environ.setdefault(
@@ -333,7 +332,7 @@ def main() -> int:
     _bootstrap_sudo_session()
 
     # Preflight: with no display reachable Qt aborts the whole process
-    # (SIGABRT) — fail closed with an actionable message instead. Skipped when
+    # (SIGABRT) - fail closed with an actionable message instead. Skipped when
     # the user explicitly chose a Qt platform (offscreen/vnc/linuxfb/eglfs
     # need no display server at all).
     if (
@@ -360,20 +359,18 @@ def main() -> int:
     app.setApplicationName("CoreCycler")
     app.setOrganizationName("corecycler")
 
-    # One instance only — two engines would fight over the SMU.
+    # One instance only - two engines would fight over the SMU.
     from PySide6.QtCore import QLockFile
 
-    from corecycler.config.paths import user_home
+    from corecycler.config.paths import ensure_state_directory
 
-    lock_dir = user_home() / ".local" / "share" / "corecycler"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    instance_lock = QLockFile(str(lock_dir / "corecycler.lock"))
+    instance_lock = QLockFile(str(ensure_state_directory()))
     if not instance_lock.tryLock(0):
         print("corecycler: another instance is already running.", file=sys.stderr)
         return 1
     app._corecycler_instance_lock = instance_lock
 
-    # Locate assets — dev mode (src/../assets) or installed ($out/share/...)
+    # Locate assets - dev mode (src/../assets) or installed ($out/share/...)
     assets_dir = _find_assets_dir()
 
     # app icon
@@ -404,7 +401,7 @@ def main() -> int:
 
     def _cleanup_on_exit():
         """Kill any running stress processes on forced exit."""
-        # Each subsystem wrapped independently — one failure must not block others
+        # Each subsystem wrapped independently - one failure must not block others
         try:
             if window._worker and window._worker.isRunning():
                 window._worker.scheduler.force_stop()
@@ -427,7 +424,7 @@ def main() -> int:
 
     atexit.register(_cleanup_on_exit)
 
-    # Handle SIGTERM/SIGINT/SIGHUP gracefully — save tuner state on exit
+    # Handle SIGTERM/SIGINT/SIGHUP gracefully - save tuner state on exit
     def _signal_handler(signum, frame):
         _cleanup_on_exit()
         app.quit()
@@ -445,7 +442,7 @@ def main() -> int:
 
 
 def _find_assets_dir() -> Path:
-    """Find assets directory — works in dev mode and Nix-installed."""
+    """Find assets directory - works in dev mode and Nix-installed."""
     # Dev mode: src/corecycler/../../assets
     dev_assets = Path(__file__).resolve().parents[2] / "assets"
     if dev_assets.is_dir():

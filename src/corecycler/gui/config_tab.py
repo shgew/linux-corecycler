@@ -1,7 +1,8 @@
-"""Test configuration tab — backend, mode, timing, core selection, test presets."""
+"""Test configuration tab for backend, mode, timing, core selection, and presets."""
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from PySide6.QtWidgets import (
@@ -21,22 +22,37 @@ from PySide6.QtWidgets import (
 )
 
 from corecycler.config.settings import TestProfile
-from corecycler.engine.backends.base import FFTPreset, StressMode
-from corecycler.gui.style import theme
+from corecycler.engine.backends import available_backends, get_backend
+from corecycler.gui.style import set_semantic_style, theme
 
 if TYPE_CHECKING:
     from corecycler.engine.topology import CPUTopology
 
 
-# Pre-configured test mode descriptions
-TEST_MODE_INFO: dict[str, str] = {
-    "CUSTOM": "Configure all settings manually",
-    "QUICK": "2 min/core, 1 cycle — fast screening, lower sensitivity",
-    "STANDARD": "10 min/core, 1 cycle — good starting point for CO tuning",
-    "THOROUGH": "30 min/core, 2 cycles — catches intermittent errors",
-    "FULL_SPECTRUM": (
-        "Stress + variable load + idle stability, 3 cycles — most comprehensive, tests all real-world scenarios"
-    ),
+@dataclass(frozen=True, slots=True)
+class TestPreset:
+    summary: str
+    seconds_per_core: int | None = None
+    cycle_count: int | None = None
+    variable_load: bool | None = None
+    idle_stability_test: int | None = None
+    idle_between_cores: int | None = None
+
+    @property
+    def description(self) -> str:
+        if self.seconds_per_core is None or self.cycle_count is None:
+            return self.summary
+        minutes = self.seconds_per_core // 60
+        cycles = "cycle" if self.cycle_count == 1 else "cycles"
+        return f"{minutes} min/core, {self.cycle_count} {cycles} - {self.summary}"
+
+
+TEST_PRESETS: dict[str, TestPreset] = {
+    "CUSTOM": TestPreset("Configure all settings manually"),
+    "QUICK": TestPreset("fast screening, lower sensitivity", 120, 1, False, 0, 0),
+    "STANDARD": TestPreset("good starting point for CO tuning", 600, 1, False, 0, 0),
+    "THOROUGH": TestPreset("catches intermittent errors", 1800, 2, False, 0, 5),
+    "FULL_SPECTRUM": TestPreset("most comprehensive, tests all real-world scenarios", 1200, 3, True, 120, 10),
 }
 
 
@@ -46,10 +62,10 @@ class ConfigTab(QWidget):
     def __init__(self, topology: CPUTopology | None = None) -> None:
         super().__init__()
         self._topology = topology
-        self._building = False  # prevent signal loops during build
+        self._building = True
+        self._defaults = TestProfile()
         self._setup_ui()
-        # apply STANDARD defaults to widgets
-        self._on_mode_change("STANDARD")
+        self.set_profile(self._defaults)
 
     def _setup_ui(self) -> None:
         scroll = QScrollArea()
@@ -64,17 +80,17 @@ class ConfigTab(QWidget):
 
         mode_row = QHBoxLayout()
         self._mode_combo = QComboBox()
-        for mode_name, _desc in TEST_MODE_INFO.items():
-            self._mode_combo.addItem(mode_name)
-        self._mode_combo.setCurrentText("STANDARD")
+        for preset_name in TEST_PRESETS:
+            self._mode_combo.addItem(preset_name)
+        self._mode_combo.setCurrentText(self._defaults.test_mode)
         self._mode_combo.currentTextChanged.connect(self._on_mode_change)
         mode_row.addWidget(QLabel("Preset:"))
-        mode_row.addWidget(self._mode_combo, stretch=1)
+        mode_row.addWidget(self._mode_combo, 1)
         mode_layout.addLayout(mode_row)
 
-        self._mode_desc = QLabel(TEST_MODE_INFO["STANDARD"])
+        self._mode_desc = QLabel(TEST_PRESETS[self._defaults.test_mode].description)
         self._mode_desc.setWordWrap(True)
-        self._mode_desc.setStyleSheet(f"color: {theme.COLOR_MUTED}; padding: 4px;")
+        set_semantic_style(self._mode_desc, lambda: f"color: {theme.COLOR_MUTED_DARKER}; padding: 4px")
         mode_layout.addWidget(self._mode_desc)
 
         layout.addWidget(mode_group)
@@ -83,22 +99,16 @@ class ConfigTab(QWidget):
         backend_group = QGroupBox("Stress Test Backend")
         backend_layout = QFormLayout(backend_group)
 
-        from corecycler.engine.backends import available_backends
-
         self._backend_combo = QComboBox()
         self._backend_combo.addItems(available_backends())
-        self._backend_combo.currentTextChanged.connect(self._on_change)
+        self._backend_combo.currentTextChanged.connect(self._on_backend_change)
         backend_layout.addRow("Backend:", self._backend_combo)
 
         self._stress_mode_combo = QComboBox()
-        for mode in StressMode:
-            self._stress_mode_combo.addItem(mode.name)
         self._stress_mode_combo.currentTextChanged.connect(self._on_change)
         backend_layout.addRow("Stress Mode:", self._stress_mode_combo)
 
         self._fft_combo = QComboBox()
-        for preset in FFTPreset:
-            self._fft_combo.addItem(preset.name, preset.value)
         self._fft_combo.currentTextChanged.connect(self._on_fft_change)
         backend_layout.addRow("FFT Preset:", self._fft_combo)
 
@@ -108,12 +118,12 @@ class ConfigTab(QWidget):
         fft_range_layout.setContentsMargins(0, 0, 0, 0)
         self._fft_min_spin = QSpinBox()
         self._fft_min_spin.setRange(4, 65536)
-        self._fft_min_spin.setValue(4)
+        self._fft_min_spin.setValue(self._defaults.fft_min or 4)
         self._fft_min_spin.setSuffix("K")
         self._fft_min_spin.valueChanged.connect(self._on_fft_range_change)
         self._fft_max_spin = QSpinBox()
         self._fft_max_spin.setRange(4, 65536)
-        self._fft_max_spin.setValue(8192)
+        self._fft_max_spin.setValue(self._defaults.fft_max or 8192)
         self._fft_max_spin.setSuffix("K")
         self._fft_max_spin.valueChanged.connect(self._on_fft_range_change)
         fft_range_layout.addWidget(QLabel("Min:"))
@@ -126,7 +136,7 @@ class ConfigTab(QWidget):
 
         self._threads_spin = QSpinBox()
         self._threads_spin.setRange(1, 2)
-        self._threads_spin.setValue(1)
+        self._threads_spin.setValue(self._defaults.threads)
         self._threads_spin.valueChanged.connect(self._on_change)
         backend_layout.addRow("Threads:", self._threads_spin)
 
@@ -138,14 +148,14 @@ class ConfigTab(QWidget):
 
         self._time_spin = QSpinBox()
         self._time_spin.setRange(10, 86400)
-        self._time_spin.setValue(360)
+        self._time_spin.setValue(self._defaults.seconds_per_core)
         self._time_spin.setSuffix(" seconds")
         self._time_spin.valueChanged.connect(self._on_change)
         timing_layout.addRow("Time per core:", self._time_spin)
 
         self._cycles_spin = QSpinBox()
         self._cycles_spin.setRange(1, 100)
-        self._cycles_spin.setValue(1)
+        self._cycles_spin.setValue(self._defaults.cycle_count)
         self._cycles_spin.valueChanged.connect(self._on_change)
         timing_layout.addRow("Cycles:", self._cycles_spin)
 
@@ -157,7 +167,7 @@ class ConfigTab(QWidget):
 
         self._max_temp_spin = QDoubleSpinBox()
         self._max_temp_spin.setRange(50.0, 115.0)
-        self._max_temp_spin.setValue(95.0)
+        self._max_temp_spin.setValue(self._defaults.max_temperature)
         self._max_temp_spin.setSuffix(" °C")
         self._max_temp_spin.setDecimals(1)
         self._max_temp_spin.valueChanged.connect(self._on_change)
@@ -183,7 +193,7 @@ class ConfigTab(QWidget):
         self._idle_stability_spin.setSuffix(" seconds")
         self._idle_stability_spin.setToolTip(
             "Time to monitor each core at idle after stress. Catches errors during "
-            "C-state transitions — the #1 cause of CO-related crashes in daily use."
+            "C-state transitions, the primary cause of CO-related crashes in daily use."
         )
         self._idle_stability_spin.valueChanged.connect(self._on_change)
         advanced_layout.addRow("Idle stability test:", self._idle_stability_spin)
@@ -222,13 +232,16 @@ class ConfigTab(QWidget):
         cores_layout.addWidget(self._cores_input)
 
         self._cores_error_label = QLabel("")
-        self._cores_error_label.setStyleSheet(f"color: {theme.COLOR_FAIL}; font-size: 10px; padding: 2px;")
+        set_semantic_style(
+            self._cores_error_label,
+            lambda: f"color: {theme.COLOR_FAIL}; font-size: 10px; padding: 2px",
+        )
         self._cores_error_label.setVisible(False)
         cores_layout.addWidget(self._cores_error_label)
 
         self._retest_failed_btn = QPushButton("Retest Failed Cores Only")
         self._retest_failed_btn.setToolTip(
-            "After a test run, populate the core selection with only the cores that failed — skip already-stable cores."
+            "After a test run, populate the core selection with only the cores that failed and skip stable cores."
         )
         self._retest_failed_btn.setEnabled(False)
         self._retest_failed_btn.clicked.connect(self._on_retest_failed)
@@ -243,40 +256,47 @@ class ConfigTab(QWidget):
         outer.addWidget(scroll)
 
     def _on_mode_change(self, mode_name: str) -> None:
-        """Apply a test mode preset."""
-        self._mode_desc.setText(TEST_MODE_INFO.get(mode_name, ""))
-
-        if mode_name == "CUSTOM":
+        preset = TEST_PRESETS[mode_name]
+        self._mode_desc.setText(preset.description)
+        if preset.seconds_per_core is None:
             self._on_change()
             return
 
         self._building = True
-        match mode_name:
-            case "QUICK":
-                self._time_spin.setValue(120)
-                self._cycles_spin.setValue(1)
-                self._variable_load.setChecked(False)
-                self._idle_stability_spin.setValue(0)
-                self._idle_between_spin.setValue(0)
-            case "STANDARD":
-                self._time_spin.setValue(600)
-                self._cycles_spin.setValue(1)
-                self._variable_load.setChecked(False)
-                self._idle_stability_spin.setValue(0)
-                self._idle_between_spin.setValue(0)
-            case "THOROUGH":
-                self._time_spin.setValue(1800)
-                self._cycles_spin.setValue(2)
-                self._variable_load.setChecked(False)
-                self._idle_stability_spin.setValue(0)
-                self._idle_between_spin.setValue(5)
-            case "FULL_SPECTRUM":
-                self._time_spin.setValue(1200)
-                self._cycles_spin.setValue(3)
-                self._variable_load.setChecked(True)
-                self._idle_stability_spin.setValue(60)
-                self._idle_between_spin.setValue(10)
+        self._time_spin.setValue(preset.seconds_per_core)
+        self._cycles_spin.setValue(preset.cycle_count)
+        self._variable_load.setChecked(preset.variable_load)
+        self._idle_stability_spin.setValue(preset.idle_stability_test)
+        self._idle_between_spin.setValue(preset.idle_between_cores)
         self._building = False
+        self._on_change()
+
+    def _on_backend_change(self, backend_name: str) -> None:
+        try:
+            backend = get_backend(backend_name)
+        except KeyError:
+            return
+        selected_mode = self._stress_mode_combo.currentText()
+        selected_fft = self._fft_combo.currentText()
+        modes = [mode.name for mode in backend.get_supported_modes()]
+        presets = [preset.name for preset in backend.get_supported_fft_presets()]
+        self._stress_mode_combo.blockSignals(True)
+        self._stress_mode_combo.clear()
+        self._stress_mode_combo.addItems(modes)
+        self._stress_mode_combo.setCurrentText(selected_mode if selected_mode in modes else modes[0])
+        self._stress_mode_combo.blockSignals(False)
+        self._fft_combo.blockSignals(True)
+        self._fft_combo.clear()
+        self._fft_combo.addItems(presets)
+        if selected_fft in presets:
+            self._fft_combo.setCurrentText(selected_fft)
+        self._fft_combo.blockSignals(False)
+        fft_available = bool(presets)
+        self._fft_combo.setVisible(fft_available)
+        label = self._fft_combo.parentWidget().layout().labelForField(self._fft_combo)
+        if label is not None:
+            label.setVisible(fft_available)
+        self._on_fft_change()
 
     def _on_fft_change(self) -> None:
         is_custom = self._fft_combo.currentText() == "CUSTOM"
@@ -292,36 +312,35 @@ class ConfigTab(QWidget):
         self._on_change()
 
     def _on_cores_changed(self) -> None:
-        """Validate core IDs against topology and forward to _on_change."""
         cores_text = self._cores_input.text().strip()
-        if not cores_text:
+        if not cores_text or not cores_text.rstrip(",").strip():
             self._cores_error_label.setVisible(False)
             self._on_change()
             return
 
-        # Strip trailing commas gracefully
-        cores_text = cores_text.rstrip(",").strip()
-
+        values = [part.strip() for part in cores_text.rstrip(",").split(",") if part.strip()]
         try:
-            cores = [int(c.strip()) for c in cores_text.split(",") if c.strip()]
+            cores = [int(value) for value in values]
         except ValueError:
-            self._cores_error_label.setText("Invalid input — use comma-separated integers")
+            self._cores_error_label.setText("Invalid core list: use comma-separated integers")
             self._cores_error_label.setVisible(True)
             self._on_change()
             return
-
-        if self._topology:
-            valid_ids = set(self._topology.cores.keys())
-            invalid = [c for c in cores if c not in valid_ids]
-            if invalid:
-                max_id = max(valid_ids) if valid_ids else 0
-                self._cores_error_label.setText(
-                    f"Core(s) {', '.join(str(c) for c in invalid)} out of range (valid: 0-{max_id})"
-                )
-                self._cores_error_label.setVisible(True)
-                self._on_change()
-                return
-
+        if len(cores) != len(set(cores)):
+            self._cores_error_label.setText("Duplicate core IDs are not allowed")
+            self._cores_error_label.setVisible(True)
+            self._on_change()
+            return
+        valid_ids = set(self._topology.cores) if self._topology else set(cores)
+        invalid = [core for core in cores if core not in valid_ids]
+        if invalid:
+            max_id = max(valid_ids) if valid_ids else 0
+            self._cores_error_label.setText(
+                f"Core(s) {', '.join(str(core) for core in invalid)} out of range (valid: 0-{max_id})"
+            )
+            self._cores_error_label.setVisible(True)
+            self._on_change()
+            return
         self._cores_error_label.setVisible(False)
         self._on_change()
 
@@ -332,34 +351,62 @@ class ConfigTab(QWidget):
         if self._mode_combo.currentText() != "CUSTOM":
             self._building = True
             self._mode_combo.setCurrentText("CUSTOM")
-            self._mode_desc.setText(TEST_MODE_INFO["CUSTOM"])
+            self._mode_desc.setText(TEST_PRESETS["CUSTOM"].description)
             self._building = False
 
-    def get_profile(self) -> TestProfile:
-        cores_text = self._cores_input.text().strip().rstrip(",").strip()
-        cores = None
-        if cores_text:
-            try:
-                parsed = [int(c.strip()) for c in cores_text.split(",") if c.strip()]
-                # Validate against topology — exclude out-of-range IDs
-                if self._topology:
-                    valid_ids = set(self._topology.cores.keys())
-                    parsed = [c for c in parsed if c in valid_ids]
-                cores = parsed if parsed else None
-            except ValueError:
-                cores = None
+    def _validation_errors(self, profile: TestProfile) -> list[str]:
+        try:
+            backend = get_backend(profile.backend)
+        except KeyError:
+            return [f"Unknown backend: {profile.backend}"]
+        errors: list[str] = []
+        modes = {mode.name for mode in backend.get_supported_modes()}
+        presets = {preset.name for preset in backend.get_supported_fft_presets()}
+        if profile.stress_mode not in modes:
+            errors.append(f"Unsupported stress mode {profile.stress_mode} for backend {profile.backend}")
+        if presets and profile.fft_preset not in presets:
+            errors.append(f"Unsupported FFT preset {profile.fft_preset} for backend {profile.backend}")
+        bounds = {
+            "threads": (profile.threads, 1, 2),
+            "seconds_per_core": (profile.seconds_per_core, 10, 86400),
+            "cycle_count": (profile.cycle_count, 1, 100),
+            "max_temperature": (profile.max_temperature, 50.0, 115.0),
+            "idle_stability_test": (profile.idle_stability_test, 0.0, 300.0),
+            "idle_between_cores": (profile.idle_between_cores, 0.0, 60.0),
+        }
+        for name, (value, minimum, maximum) in bounds.items():
+            if isinstance(value, bool) or not isinstance(value, (int, float)) or not minimum <= value <= maximum:
+                errors.append(f"{name} must be between {minimum} and {maximum}")
+        if profile.test_mode not in TEST_PRESETS:
+            errors.append(f"Unknown test preset: {profile.test_mode}")
+        if profile.cores_to_test is not None:
+            if any(isinstance(core, bool) or not isinstance(core, int) for core in profile.cores_to_test):
+                errors.append("Core IDs must be integers")
+            elif len(profile.cores_to_test) != len(set(profile.cores_to_test)):
+                errors.append("Duplicate core IDs are not allowed")
+            elif self._topology and any(core not in self._topology.cores for core in profile.cores_to_test):
+                errors.append("Core IDs must exist in the detected topology")
+        if profile.fft_preset == "CUSTOM" and (
+            profile.fft_min is None or profile.fft_max is None or not 4 <= profile.fft_min <= profile.fft_max <= 65536
+        ):
+            errors.append("Custom FFT range must be ordered between 4K and 65536K")
+        return errors
 
-        return TestProfile(
+    def get_profile(self) -> TestProfile:
+        if not self._cores_error_label.isHidden():
+            raise ValueError(self._cores_error_label.text())
+        cores_text = self._cores_input.text().strip().rstrip(",").strip()
+        cores = [int(part.strip()) for part in cores_text.split(",") if part.strip()] if cores_text else None
+        profile = TestProfile(
             backend=self._backend_combo.currentText(),
             stress_mode=self._stress_mode_combo.currentText(),
-            fft_preset=self._fft_combo.currentText(),
-            fft_min=(self._fft_min_spin.value() if self._fft_combo.currentText() == "CUSTOM" else None),
-            fft_max=(self._fft_max_spin.value() if self._fft_combo.currentText() == "CUSTOM" else None),
+            fft_preset=self._fft_combo.currentText() or self._defaults.fft_preset,
+            fft_min=self._fft_min_spin.value() if self._fft_combo.currentText() == "CUSTOM" else None,
+            fft_max=self._fft_max_spin.value() if self._fft_combo.currentText() == "CUSTOM" else None,
             threads=self._threads_spin.value(),
             seconds_per_core=self._time_spin.value(),
             cycle_count=self._cycles_spin.value(),
             stop_on_error=self._stop_on_error.isChecked(),
-            test_smt=False,
             cores_to_test=cores,
             max_temperature=self._max_temp_spin.value(),
             test_mode=self._mode_combo.currentText(),
@@ -367,34 +414,37 @@ class ConfigTab(QWidget):
             idle_stability_test=self._idle_stability_spin.value(),
             idle_between_cores=self._idle_between_spin.value(),
         )
+        errors = self._validation_errors(profile)
+        if errors:
+            raise ValueError("; ".join(errors))
+        return profile
 
     def set_profile(self, profile: TestProfile) -> None:
+        errors = self._validation_errors(profile)
+        if errors:
+            raise ValueError("; ".join(errors))
         self._building = True
         self._backend_combo.setCurrentText(profile.backend)
+        self._on_backend_change(profile.backend)
         self._stress_mode_combo.setCurrentText(profile.stress_mode)
-        self._fft_combo.setCurrentText(profile.fft_preset)
-        if profile.fft_min:
+        if self._fft_combo.count():
+            self._fft_combo.setCurrentText(profile.fft_preset)
+        if profile.fft_min is not None:
             self._fft_min_spin.setValue(profile.fft_min)
-        if profile.fft_max:
+        if profile.fft_max is not None:
             self._fft_max_spin.setValue(profile.fft_max)
         self._threads_spin.setValue(profile.threads)
         self._time_spin.setValue(profile.seconds_per_core)
         self._cycles_spin.setValue(profile.cycle_count)
         self._stop_on_error.setChecked(profile.stop_on_error)
-        if profile.cores_to_test:
-            self._cores_input.setText(",".join(str(c) for c in profile.cores_to_test))
-        else:
-            self._cores_input.clear()
-        if hasattr(profile, "max_temperature"):
-            self._max_temp_spin.setValue(profile.max_temperature)
-        if hasattr(profile, "test_mode"):
-            self._mode_combo.setCurrentText(profile.test_mode)
-        if hasattr(profile, "variable_load"):
-            self._variable_load.setChecked(profile.variable_load)
-        if hasattr(profile, "idle_stability_test"):
-            self._idle_stability_spin.setValue(int(profile.idle_stability_test))
-        if hasattr(profile, "idle_between_cores"):
-            self._idle_between_spin.setValue(int(profile.idle_between_cores))
+        self._cores_input.setText(",".join(str(core) for core in profile.cores_to_test or []))
+        self._max_temp_spin.setValue(profile.max_temperature)
+        self._mode_combo.setCurrentText(profile.test_mode)
+        self._mode_desc.setText(TEST_PRESETS[profile.test_mode].description)
+        self._variable_load.setChecked(profile.variable_load)
+        self._idle_stability_spin.setValue(int(profile.idle_stability_test))
+        self._idle_between_spin.setValue(int(profile.idle_between_cores))
+        self._on_fft_change()
         self._building = False
 
     def set_failed_cores(self, failed_cores: list[int]) -> None:

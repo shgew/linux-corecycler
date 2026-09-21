@@ -15,8 +15,8 @@ import time
 from dataclasses import dataclass
 
 # AMD MSR addresses (read-only)
-MSR_APERF = 0xE8  # Actual Performance — counts at actual core frequency
-MSR_MPERF = 0xE7  # Maximum Performance — counts at TSC/reference frequency
+MSR_APERF = 0xE8  # Actual Performance, counts at actual core frequency
+MSR_MPERF = 0xE7  # Maximum Performance, counts at TSC/reference frequency
 MSR_PWR_UNIT = 0xC0010299  # RAPL power unit (energy scale factor)
 MSR_CORE_ENERGY = 0xC001029A  # Per-core cumulative energy counter
 MSR_PKG_ENERGY = 0xC001029B  # Package cumulative energy counter
@@ -107,7 +107,7 @@ class MSRReader:
 
             prev = self._perf_prev.get(cpu_id)
             if prev is None or prev.mperf == 0:
-                # First reading — store baseline
+                # Store the first reading as a baseline.
                 self._perf_prev[cpu_id] = _PerfSnapshot(aperf=aperf, mperf=mperf)
                 continue
 

@@ -10,7 +10,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from corecycler.tuner.config import TunerConfig
+from corecycler.tuner.config import FIELD_BOUNDS, TunerConfig
 
 
 def _errors(**kw) -> list[str]:
@@ -69,10 +69,55 @@ class TestTunerConfigValidation:
     @staticmethod
     def test_regime_floor_pct_range():
         for value in (0, 101):
-            assert _errors(regime_floor_pct=value) == ["regime_floor_pct must be 0-25"]
+            assert any("regime_floor_pct" in error for error in _errors(regime_floor_pct=value))
 
     def test_over_temp_grace_negative(self):
         assert any("over_temp_grace_seconds" in e for e in _errors(over_temp_grace_seconds=-1.0))
 
     def test_over_temp_hard_margin_negative(self):
         assert any("over_temp_hard_margin_c" in e for e in _errors(over_temp_hard_margin_c=-1.0))
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("coarse_step", 16),
+            ("fine_step", 6),
+            ("search_duration_seconds", 601),
+            ("confirm_duration_seconds", 1801),
+            ("validate_duration_seconds", 3601),
+            ("max_confirm_retries", 6),
+        ],
+    )
+    def test_documented_upper_bounds_are_enforced(self, field, value):
+        assert any(field in error for error in _errors(**{field: value}))
+
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("test_order", "typo"), ("stress_mode", "typo"), ("fft_preset", "typo")],
+    )
+    def test_unknown_workload_selectors_are_rejected(self, field, value):
+        assert any(field in error for error in _errors(**{field: value}))
+
+    def test_duplicate_coarse_regimes_are_rejected(self):
+        assert any("duplicate" in error for error in _errors(coarse_regimes=["current", "current"]))
+
+    @pytest.mark.parametrize(
+        "config, co_range",
+        [
+            (TunerConfig(start_offset=-51), (-50, 10)),
+            (TunerConfig(max_offset=11), (-50, 10)),
+            (TunerConfig(start_offset=-10, max_offset=0, direction=-1), (-50, 10)),
+            (TunerConfig(start_offset=0, max_offset=-10, direction=1), (-50, 10)),
+        ],
+    )
+    def test_offsets_respect_hardware_range_and_direction(self, config, co_range):
+        assert config.validate(co_range)
+
+    def test_field_bounds_cover_every_validated_numeric_field(self):
+        numeric = {
+            field.name
+            for field in __import__("dataclasses").fields(TunerConfig)
+            if isinstance(getattr(TunerConfig(), field.name), (int, float))
+            and not isinstance(getattr(TunerConfig(), field.name), bool)
+        }
+        assert set(FIELD_BOUNDS) == numeric

@@ -40,7 +40,6 @@ def _topo() -> CPUTopology:
         topo.cores[cid] = PhysicalCore(
             core_id=cid,
             ccd=0 if cid < 4 else 1,
-            ccx=None,
             logical_cpus=(cid, cid + 8),
         )
     return topo
@@ -48,10 +47,11 @@ def _topo() -> CPUTopology:
 
 def _available_smu() -> MagicMock:
     smu = MagicMock()
+    smu.dry_run = False
     smu.get_co_offset.return_value = 0
     smu.reset_all_co.return_value = True
     smu.set_co_offset.return_value = True
-    smu.backup_co_offsets.return_value = {0: 0}
+    smu.backup_co_offsets.return_value = dict.fromkeys(range(8), 0)
     smu.has_backup.return_value = True
     smu.restore_co_offsets.return_value = (True, [])
     smu.is_available.return_value = True
@@ -74,7 +74,10 @@ class TestSMUColdTab:
 
         tab = SMUTab(_topo())
         tab._smu = _available_smu()
-        with patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.Yes):
+        with (
+            patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.Yes),
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.Yes),
+        ):
             tab._reset_all_co()
             tab._apply_all_co()
             tab._apply_single(next(iter(tab._spinboxes)))
@@ -90,6 +93,7 @@ class TestSMUColdTab:
         tab._smu = _available_smu()
         with (
             patch.object(QMessageBox, "warning", return_value=QMessageBox.StandardButton.No),
+            patch.object(QMessageBox, "question", return_value=QMessageBox.StandardButton.No),
             patch.object(QMessageBox, "information", return_value=None),
             patch.object(QFileDialog, "getSaveFileName", return_value=("", "")),
             patch.object(QFileDialog, "getOpenFileName", return_value=("", "")),

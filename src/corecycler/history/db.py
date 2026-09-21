@@ -1,7 +1,7 @@
 """Crash-safe test history database using SQLite WAL mode.
 
 Every write is an auto-commit transaction.  WAL + synchronous=NORMAL gives
-process-crash safety with good performance — data survives kill -9 and OOM.
+process-crash safety with good performance - data survives kill -9 and OOM.
 """
 
 from __future__ import annotations
@@ -9,8 +9,9 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -18,7 +19,12 @@ from corecycler import __version__
 from corecycler.config.paths import fix_sudo_ownership, user_home
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import Any
+
+    from corecycler.history.context import SystemContext
     from corecycler.tuner.state import CoreState, TunerSession
+
 
 DATA_DIR = user_home() / ".local" / "share" / "corecycler" / "history"
 DEFAULT_DB_PATH = DATA_DIR / "history.db"
@@ -28,8 +34,16 @@ LEGACY_ROOT_DB = Path("/root/.local/share/corecycler/history/history.db")
 
 log = logging.getLogger(__name__)
 
-RESUMABLE_STATUSES = ("running", "paused", "validating")
-RECOVERABLE_STATUSES = (*RESUMABLE_STATUSES, "quarantined", "aborted")
+RESUMABLE_STATUSES = ("running", "paused", "validating", "hunting")
+RECOVERABLE_STATUSES = (*RESUMABLE_STATUSES, "profile_quarantined", "aborted")
+
+
+class InFlightRecord(ValueError):
+    pass
+
+
+class LegacySession(ValueError):
+    pass
 
 
 def adopt_legacy_root_db(db: HistoryDB, root_db: Path = LEGACY_ROOT_DB) -> dict[str, int] | None:
@@ -38,7 +52,7 @@ def adopt_legacy_root_db(db: HistoryDB, root_db: Path = LEGACY_ROOT_DB) -> dict[
     Sudo runs may have left history under /root; this merges that data into
     the user's (single) database and renames the source ``*.adopted`` so it
     can never be merged twice or silently diverge again. Only possible when
-    running as root — the file is unreadable otherwise. Returns the merge
+    running as root - the file is unreadable otherwise. Returns the merge
     counts, or None when there was nothing to adopt.
     """
     if os.geteuid() != 0:
@@ -47,7 +61,7 @@ def adopt_legacy_root_db(db: HistoryDB, root_db: Path = LEGACY_ROOT_DB) -> dict[
         if not root_db.exists():
             return None
         if root_db.resolve() == db._db_path.resolve():
-            return None  # HOME really is /root (no SUDO_USER) — same file
+            return None  # HOME really is /root (no SUDO_USER) - same file
     except OSError:
         return None
     counts = db.merge_from(root_db)
@@ -133,8 +147,11 @@ class TuningContextRecord:
     id: int | None = None
     created_at: str = ""
     bios_version: str = ""
+    cpu_model: str = ""
+    physical_cores: int = 0
+    ccds: int = 0
     co_offsets_json: str = "{}"
-    co_hash: str = ""  # identity hash of CO offsets + power limits (v13+)
+    context_hash: str = ""
     pbo_scalar: float | None = None
     boost_limit_mhz: int | None = None
     notes: str = ""
@@ -150,11 +167,139 @@ class TelemetrySample:
     core_id: int = 0
     timestamp: str = ""
     freq_mhz: float | None = None
-    effective_max_mhz: float | None = None  # scaling_max_freq — boost ceiling for clock stretch detection
+    effective_max_mhz: float | None = None  # scaling_max_freq - boost ceiling for clock stretch detection
     temp_c: float | None = None
     vcore_v: float | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class TableSpec:
+    name: str
+    columns: tuple[str, ...]
+    record_type: type | None = None
+    bool_columns: frozenset[str] = frozenset()
+    decoders: tuple[tuple[str, Callable[[Any], Any]], ...] = ()
+
+    @classmethod
+    def for_record(
+        cls,
+        name: str,
+        record_type: type,
+        *,
+        database_only: tuple[str, ...] = (),
+        bool_columns: tuple[str, ...] = (),
+        decoders: tuple[tuple[str, Callable[[Any], Any]], ...] = (),
+    ) -> TableSpec:
+        return cls(
+            name,
+            tuple(field.name for field in fields(record_type)) + database_only,
+            record_type,
+            frozenset(bool_columns),
+            decoders,
+        )
+
+    @property
+    def record_columns(self) -> tuple[str, ...]:
+        if self.record_type is None:
+            return ()
+        return tuple(field.name for field in fields(self.record_type))
+
+    @property
+    def insert_columns(self) -> tuple[str, ...]:
+        return tuple(column for column in self.columns if column != "id")
+
+    @property
+    def projection(self) -> str:
+        return ", ".join(self.columns)
+
+    def encode(self, record: object, columns: tuple[str, ...] | None = None) -> tuple[Any, ...]:
+        selected = self.insert_columns if columns is None else columns
+        values = []
+        for column in selected:
+            value = getattr(record, column)
+            values.append(int(value) if column in self.bool_columns and value is not None else value)
+        return tuple(values)
+
+    def decode(self, row: sqlite3.Row) -> Any:
+        if self.record_type is None:
+            raise TypeError(f"{self.name} has no record type")
+        decoder_map = dict(self.decoders)
+        values = {}
+        record_columns = {field.name for field in fields(self.record_type)}
+        row_columns = set(row.keys())
+        for column in self.columns:
+            if column not in record_columns or column not in row_columns:
+                continue
+            value = row[column]
+            if column in self.bool_columns and value is not None:
+                value = bool(value)
+            elif column in decoder_map:
+                value = decoder_map[column](value)
+            values[column] = value
+        return self.record_type(**values)
+
+
+RUNS = TableSpec.for_record("runs", RunRecord, bool_columns=("is_x3d", "stop_on_error", "variable_load"))
+CORE_RESULTS = TableSpec.for_record("core_results", CoreResultRecord, bool_columns=("passed",))
+EVENTS = TableSpec.for_record("events", EventRecord)
+TUNING_CONTEXTS = TableSpec.for_record("tuning_contexts", TuningContextRecord)
+TELEMETRY_SAMPLES = TableSpec.for_record("telemetry_samples", TelemetrySample)
+
+
+@cache
+def _tuner_core_states_spec() -> TableSpec:
+    from corecycler.tuner.state import CoreState, TunerPhase
+
+    return TableSpec.for_record(
+        "tuner_core_states",
+        CoreState,
+        database_only=("id", "session_id", "updated_at"),
+        bool_columns=("backoff_mode", "in_test"),
+        decoders=(("phase", TunerPhase),),
+    )
+
+
+@cache
+def _tuner_sessions_spec() -> TableSpec:
+    from corecycler.tuner.state import TunerSession
+
+    return TableSpec.for_record(
+        "tuner_sessions",
+        TunerSession,
+        database_only=("contract_version",),
+        bool_columns=("validation_dirty",),
+    )
+
+
+TUNER_EVENTS = TableSpec("tuner_events", ("id", "session_id", "timestamp", "boot_id", "severity", "message"))
+TUNER_TEST_LOG = TableSpec(
+    "tuner_test_log",
+    (
+        "id",
+        "session_id",
+        "core_id",
+        "offset_tested",
+        "phase",
+        "passed",
+        "error_message",
+        "error_type",
+        "duration_seconds",
+        "run_id",
+        "backend",
+        "stress_mode",
+        "fft_preset",
+        "tested_at",
+        "peak_stretch_pct",
+        "threads",
+        "profile",
+        "regime",
+    ),
+)
+TUNER_CO_JOURNAL = TableSpec("tuner_co_journal", ("session_id", "core_id", "value", "survived", "updated_at"))
+TUNER_REGIME_BANKS = TableSpec(
+    "tuner_regime_banks",
+    ("context_id", "core_id", "regime", "offset_value", "clean_seconds", "updated_at"),
+)
 # ---------------------------------------------------------------------------
 # HistoryDB
 # ---------------------------------------------------------------------------
@@ -163,7 +308,8 @@ class TelemetrySample:
 class HistoryDB:
     """Crash-safe SQLite database for test run history."""
 
-    SCHEMA_VERSION = 20
+    SCHEMA_VERSION = 21
+    TUNER_CONTRACT_VERSION = 16
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
@@ -204,48 +350,81 @@ class HistoryDB:
     # Schema
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _execute_script(conn: sqlite3.Connection, script: str) -> None:
+        statement = ""
+        for line in script.splitlines():
+            statement += line + chr(10)
+            if sqlite3.complete_statement(statement):
+                conn.execute(statement)
+                statement = ""
+        if statement.strip():
+            raise RuntimeError("Incomplete SQL migration statement")
+
     def _create_schema(self) -> None:
-        cur = self.__conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='schema_version'")
-        if cur.fetchone() is None:
-            # Fresh database — create everything at current version
-            self.__conn.executescript(self._DDL_FRESH)
+        marker_exists = self.__conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_version'"
+        ).fetchone()
+        if marker_exists is None:
+            self.__conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._execute_script(self.__conn, self._DDL_FRESH)
+                self.__conn.execute("INSERT INTO schema_version(version) VALUES (?)", (self.SCHEMA_VERSION,))
+                self.__conn.execute("COMMIT")
+            except Exception:
+                self.__conn.execute("ROLLBACK")
+                raise
             return
 
-        # Existing database — check version and migrate
-        version = self.__conn.execute("SELECT version FROM schema_version").fetchone()[0]
+        markers = self.__conn.execute("SELECT version FROM schema_version").fetchall()
+        if len(markers) != 1:
+            raise RuntimeError(f"History database must contain exactly one schema version marker; found {len(markers)}")
+        version = markers[0][0]
+        if version > self.SCHEMA_VERSION:
+            raise RuntimeError(
+                f"History database schema version {version} is newer than this application "
+                f"supports {self.SCHEMA_VERSION}"
+            )
         for target_version in range(version + 1, self.SCHEMA_VERSION + 1):
             migration = self._MIGRATIONS.get(target_version)
             if migration is None:
                 raise RuntimeError(f"Missing migration for version {target_version}")
-            if callable(migration):
-                migration(self.__conn)
-            else:
-                self.__conn.executescript(migration)
-            self.__conn.execute("UPDATE schema_version SET version=?", (target_version,))
+            self.__conn.execute("BEGIN IMMEDIATE")
+            try:
+                if callable(migration):
+                    migration(self.__conn)
+                else:
+                    self._execute_script(self.__conn, migration)
+                self.__conn.execute("UPDATE schema_version SET version=?", (target_version,))
+                self.__conn.execute("COMMIT")
+            except Exception:
+                self.__conn.execute("ROLLBACK")
+                raise
 
     # Full schema for fresh databases (current version)
-    _DDL_FRESH = (
-        """\
+    _DDL_FRESH = """\
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
 );
-INSERT OR IGNORE INTO schema_version (version) VALUES (__SCHEMA_VERSION__);
 
 CREATE TABLE IF NOT EXISTS tuning_contexts (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     created_at      TEXT    NOT NULL,
     bios_version    TEXT    NOT NULL DEFAULT '',
+    cpu_model       TEXT    NOT NULL DEFAULT '',
+    physical_cores  INTEGER NOT NULL DEFAULT 0,
+    ccds            INTEGER NOT NULL DEFAULT 0,
     co_offsets_json TEXT    NOT NULL DEFAULT '{}',
-    co_hash         TEXT    NOT NULL DEFAULT '',
+    context_hash    TEXT    NOT NULL DEFAULT '',
     pbo_scalar      REAL,
     boost_limit_mhz INTEGER,
     notes           TEXT    NOT NULL DEFAULT '',
     ppt_limit_w     REAL,
     tdc_limit_a     REAL,
-    edc_limit_a     REAL,
-    UNIQUE(co_hash, bios_version)
+    edc_limit_a     REAL
 );
-CREATE INDEX IF NOT EXISTS idx_context_hash ON tuning_contexts(co_hash, bios_version);
+CREATE INDEX IF NOT EXISTS idx_context_hash ON tuning_contexts(context_hash, bios_version);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_context_unique_hash ON tuning_contexts(context_hash, bios_version);
 
 CREATE TABLE IF NOT EXISTS runs (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -332,7 +511,7 @@ CREATE TABLE IF NOT EXISTS tuner_sessions (
     resume_crash_streak INTEGER NOT NULL DEFAULT 0,
     notes               TEXT    NOT NULL DEFAULT '',
     unattributed_crashes INTEGER NOT NULL DEFAULT 0,
-    hunting_core        INTEGER,
+    contract_version    INTEGER NOT NULL DEFAULT 16,
     validation_stage    INTEGER NOT NULL DEFAULT 0,
     validation_index    INTEGER NOT NULL DEFAULT 0,
     validation_half     INTEGER NOT NULL DEFAULT 0,
@@ -353,6 +532,7 @@ CREATE TABLE IF NOT EXISTS tuner_core_states (
     phase               TEXT    NOT NULL DEFAULT 'not_started',
     current_offset      INTEGER NOT NULL DEFAULT 0,
     best_offset         INTEGER,
+    proven_offset       INTEGER,
     coarse_fail_offset  INTEGER,
     confirm_attempts    INTEGER NOT NULL DEFAULT 0,
     baseline_offset     INTEGER NOT NULL DEFAULT 0,
@@ -425,7 +605,6 @@ CREATE TABLE IF NOT EXISTS tuner_regime_banks (
 );
 CREATE INDEX IF NOT EXISTS idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
 """
-    ).replace("__SCHEMA_VERSION__", str(SCHEMA_VERSION))
 
     # Migration from v1 to v2
     _DDL_MIGRATE_V2_TABLES = """\
@@ -440,11 +619,14 @@ CREATE TABLE IF NOT EXISTS tuning_contexts (
     notes           TEXT    NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_context_hash ON tuning_contexts(co_hash, bios_version);
+CREATE INDEX IF NOT EXISTS idx_core_results_run ON core_results(run_id);
+CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id);
+CREATE INDEX IF NOT EXISTS idx_telemetry_run_core ON telemetry_samples(run_id, core_id);
 """
 
     @staticmethod
     def _migrate_v2(conn: sqlite3.Connection) -> None:
-        conn.executescript(HistoryDB._DDL_MIGRATE_V2_TABLES)
+        HistoryDB._execute_script(conn, HistoryDB._DDL_MIGRATE_V2_TABLES)
         HistoryDB._add_columns(
             conn,
             "runs",
@@ -454,7 +636,7 @@ CREATE INDEX IF NOT EXISTS idx_context_hash ON tuning_contexts(co_hash, bios_ver
             ],
         )
 
-    # Migration from v2 to v3 — add tuner tables
+    # Migration from v2 to v3 - add tuner tables
     _DDL_MIGRATE_V3 = """\
 CREATE TABLE IF NOT EXISTS tuner_sessions (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -500,28 +682,42 @@ CREATE INDEX IF NOT EXISTS idx_tuner_log_session ON tuner_test_log(session_id, c
 CREATE INDEX IF NOT EXISTS idx_runs_started_at ON runs(started_at DESC);
 """
 
-    # Migration from v3 to v4 — add effective_max_mhz for clock stretch detection
+    # Migration from v3 to v4 - add effective_max_mhz for clock stretch detection
     @staticmethod
     def _migrate_v4(conn: sqlite3.Connection) -> None:
         HistoryDB._add_columns(conn, "telemetry_samples", [("effective_max_mhz", "REAL")])
 
-    # Migration from v4 to v5 — deduplicate tuning contexts, add UNIQUE constraint
+    # Migration from v4 to v5 - deduplicate tuning contexts, add UNIQUE constraint
     _DDL_MIGRATE_V5 = """\
--- Deduplicate existing rows: keep the oldest (smallest id) for each (co_hash, bios_version)
+UPDATE runs
+SET context_id = (
+    SELECT MIN(survivor.id)
+    FROM tuning_contexts survivor
+    JOIN tuning_contexts duplicate
+      ON survivor.co_hash = duplicate.co_hash AND survivor.bios_version = duplicate.bios_version
+    WHERE duplicate.id = runs.context_id
+)
+WHERE context_id IS NOT NULL;
+UPDATE tuner_sessions
+SET context_id = (
+    SELECT MIN(survivor.id)
+    FROM tuning_contexts survivor
+    JOIN tuning_contexts duplicate
+      ON survivor.co_hash = duplicate.co_hash AND survivor.bios_version = duplicate.bios_version
+    WHERE duplicate.id = tuner_sessions.context_id
+)
+WHERE context_id IS NOT NULL;
 DELETE FROM tuning_contexts
-WHERE id NOT IN (
-    SELECT MIN(id) FROM tuning_contexts GROUP BY co_hash, bios_version
-);
--- Add UNIQUE constraint via index (SQLite cannot ALTER TABLE ADD CONSTRAINT)
+WHERE id NOT IN (SELECT MIN(id) FROM tuning_contexts GROUP BY co_hash, bios_version);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_context_unique_hash ON tuning_contexts(co_hash, bios_version);
 """
 
-    # Migration from v5 to v6 — add baseline_offset for CO isolation during tuning
+    # Migration from v5 to v6 - add baseline_offset for CO isolation during tuning
     @staticmethod
     def _migrate_v6(conn: sqlite3.Connection) -> None:
         HistoryDB._add_columns(conn, "tuner_core_states", [("baseline_offset", "INTEGER NOT NULL DEFAULT 0")])
 
-    # Migration from v6 to v7 — add backoff algorithm columns
+    # Migration from v6 to v7 - add backoff algorithm columns
     _DDL_MIGRATE_V7_COLUMNS = [
         ("backoff_mode", "INTEGER NOT NULL DEFAULT 0"),
         ("consecutive_backoff_fails", "INTEGER NOT NULL DEFAULT 0"),
@@ -581,7 +777,8 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_context_unique_hash ON tuning_contexts(co_
     def _migrate_v11(conn: sqlite3.Connection) -> None:
         if not HistoryDB._column_exists(conn, "tuner_sessions", "resume_crash_streak"):
             conn.execute("ALTER TABLE tuner_sessions ADD COLUMN resume_crash_streak INTEGER NOT NULL DEFAULT 0")
-        conn.executescript(
+        HistoryDB._execute_script(
+            conn,
             """\
 CREATE TABLE IF NOT EXISTS tuner_co_journal (
     session_id  INTEGER NOT NULL REFERENCES tuner_sessions(id) ON DELETE CASCADE,
@@ -591,7 +788,7 @@ CREATE TABLE IF NOT EXISTS tuner_co_journal (
     updated_at  TEXT    NOT NULL,
     UNIQUE(session_id, core_id)
 );
-"""
+""",
         )
 
     # v11 -> v12: rebuild tuner_core_states into the canonical (fresh-DDL)
@@ -601,7 +798,6 @@ CREATE TABLE IF NOT EXISTS tuner_co_journal (
     # NULLs the code papers over with `or 0`). One canonical schema everywhere;
     # tests/test_history_db.py::TestFreshEqualsMigrated enforces it stays that way.
     _DDL_MIGRATE_V12 = """\
-BEGIN IMMEDIATE;
 CREATE TABLE tuner_core_states_v12 (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id          INTEGER NOT NULL REFERENCES tuner_sessions(id) ON DELETE CASCADE,
@@ -643,7 +839,6 @@ SELECT
 FROM tuner_core_states;
 DROP TABLE tuner_core_states;
 ALTER TABLE tuner_core_states_v12 RENAME TO tuner_core_states;
-COMMIT;
 """
 
     # v12 -> v13: power-limit capture on tuning contexts (PPT/TDC/EDC are part
@@ -683,7 +878,7 @@ COMMIT;
             ],
         )
 
-    # v14 -> v15: the tuner narrative becomes durable — every log line the
+    # v14 -> v15: the tuner narrative becomes durable - every log line the
     # engine emits lands in tuner_events, so a session's story survives the
     # terminal and can be replayed on resume.
     _DDL_MIGRATE_V15 = """\
@@ -711,8 +906,10 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                 ("endurance_round", "INTEGER NOT NULL DEFAULT 0"),
                 ("endurance_workload", "INTEGER NOT NULL DEFAULT 0"),
                 ("endurance_index", "INTEGER NOT NULL DEFAULT 0"),
+                ("contract_version", "INTEGER NOT NULL DEFAULT 16"),
             ],
         )
+        conn.execute("UPDATE tuner_sessions SET contract_version=0")
         HistoryDB._add_columns(conn, "tuner_test_log", [("threads", "INTEGER"), ("profile", "TEXT")])
 
     @staticmethod
@@ -738,10 +935,9 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
     def _migrate_v19(conn: sqlite3.Connection) -> None:
         HistoryDB._add_columns(conn, "tuner_sessions", [("hunt_state", "TEXT NOT NULL DEFAULT ''")])
         HistoryDB._add_columns(conn, "tuner_test_log", [("regime", "TEXT")])
-        conn.executescript(HistoryDB._DDL_MIGRATE_V19)
+        HistoryDB._execute_script(conn, HistoryDB._DDL_MIGRATE_V19)
 
     _DDL_MIGRATE_V19 = """\
-BEGIN IMMEDIATE;
 CREATE TABLE tuner_core_states_v19 (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id          INTEGER NOT NULL REFERENCES tuner_sessions(id) ON DELETE CASCADE,
@@ -799,7 +995,6 @@ CREATE TABLE IF NOT EXISTS tuner_regime_banks (
     UNIQUE(context_hash, core_id, regime, offset_value)
 );
 CREATE INDEX IF NOT EXISTS idx_regime_bank_core ON tuner_regime_banks(context_hash, core_id);
-COMMIT;
 """
 
     @staticmethod
@@ -839,14 +1034,12 @@ COMMIT;
                     break
             if not context_fk or not unique_key:
                 raise RuntimeError("Invalid tuner_regime_banks schema: unsafe context identity")
-            conn.execute("UPDATE schema_version SET version=20")
             return
         if "context_hash" not in columns or "context_id" in columns:
             raise RuntimeError("Invalid tuner_regime_banks schema: unsafe context key")
-        conn.executescript(HistoryDB._DDL_MIGRATE_V20)
+        HistoryDB._execute_script(conn, HistoryDB._DDL_MIGRATE_V20)
 
     _DDL_MIGRATE_V20 = """\
-BEGIN IMMEDIATE;
 CREATE TABLE tuner_regime_banks_v20 (
     context_id   INTEGER NOT NULL REFERENCES tuning_contexts(id) ON DELETE CASCADE,
     core_id      INTEGER NOT NULL,
@@ -871,9 +1064,27 @@ JOIN (
 DROP TABLE tuner_regime_banks;
 ALTER TABLE tuner_regime_banks_v20 RENAME TO tuner_regime_banks;
 CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
-UPDATE schema_version SET version=20;
-COMMIT;
 """
+
+    @staticmethod
+    def _migrate_v21(conn: sqlite3.Connection) -> None:
+        HistoryDB._add_columns(
+            conn,
+            "tuning_contexts",
+            [
+                ("cpu_model", "TEXT NOT NULL DEFAULT ''"),
+                ("physical_cores", "INTEGER NOT NULL DEFAULT 0"),
+                ("ccds", "INTEGER NOT NULL DEFAULT 0"),
+            ],
+        )
+        if HistoryDB._column_exists(conn, "tuning_contexts", "co_hash"):
+            conn.execute("ALTER TABLE tuning_contexts RENAME COLUMN co_hash TO context_hash")
+        if not HistoryDB._column_exists(conn, "tuner_sessions", "contract_version"):
+            conn.execute("ALTER TABLE tuner_sessions ADD COLUMN contract_version INTEGER NOT NULL DEFAULT 16")
+            conn.execute("UPDATE tuner_sessions SET contract_version=0")
+        if HistoryDB._column_exists(conn, "tuner_sessions", "hunting_core"):
+            conn.execute("ALTER TABLE tuner_sessions DROP COLUMN hunting_core")
+        HistoryDB._add_columns(conn, "tuner_core_states", [("proven_offset", "INTEGER")])
 
     _MIGRATIONS: dict[int, str | callable] = {
         2: _migrate_v2,
@@ -895,6 +1106,7 @@ COMMIT;
         18: _migrate_v18,
         19: _migrate_v19,
         20: _migrate_v20,
+        21: _migrate_v21,
     }
 
     # ------------------------------------------------------------------
@@ -913,45 +1125,14 @@ COMMIT;
         """Insert a new run record. Returns the run id."""
         if not run.started_at:
             run.started_at = self._now_iso()
+        columns = RUNS.insert_columns
+        placeholders = ",".join("?" * len(columns))
         cur = self.__conn.execute(
-            """\
-            INSERT INTO runs (
-                started_at, status, cpu_model, physical_cores, logical_cpus,
-                ccds, is_x3d, backend, stress_mode, fft_preset,
-                seconds_per_core, cycle_count, stop_on_error, variable_load,
-                idle_stability_test, max_temperature, settings_json,
-                context_id, bios_version,
-                total_cores, cores_passed, cores_failed, total_seconds
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                run.started_at,
-                run.status,
-                run.cpu_model,
-                run.physical_cores,
-                run.logical_cpus,
-                run.ccds,
-                int(run.is_x3d),
-                run.backend,
-                run.stress_mode,
-                run.fft_preset,
-                run.seconds_per_core,
-                run.cycle_count,
-                int(run.stop_on_error),
-                int(run.variable_load),
-                run.idle_stability_test,
-                run.max_temperature,
-                run.settings_json,
-                run.context_id,
-                run.bios_version,
-                run.total_cores,
-                run.cores_passed,
-                run.cores_failed,
-                run.total_seconds,
-            ),
+            f"INSERT INTO {RUNS.name} ({', '.join(columns)}) VALUES ({placeholders})",
+            RUNS.encode(run),
         )
         run.id = cur.lastrowid
-        return run.id
+        return cur.lastrowid
 
     def finish_run(
         self,
@@ -962,12 +1143,12 @@ COMMIT;
         cores_passed: int = 0,
         cores_failed: int = 0,
         total_seconds: float = 0.0,
-    ) -> None:
-        self.__conn.execute(
+    ) -> bool:
+        cursor = self.__conn.execute(
             """\
             UPDATE runs SET finished_at=?, status=?,
                 total_cores=?, cores_passed=?, cores_failed=?, total_seconds=?
-            WHERE id=?
+            WHERE id=? AND status='running'
             """,
             (
                 self._now_iso(),
@@ -979,61 +1160,50 @@ COMMIT;
                 run_id,
             ),
         )
+        return cursor.rowcount == 1
 
     def get_run(self, run_id: int) -> RunRecord | None:
-        row = self.__conn.execute("SELECT * FROM runs WHERE id=?", (run_id,)).fetchone()
+        row = self.__conn.execute(f"SELECT {RUNS.projection} FROM runs WHERE id=?", (run_id,)).fetchone()
         if row is None:
             return None
         return self._row_to_run(row)
 
     def list_runs(self, *, limit: int = 100, offset: int = 0) -> list[RunRecord]:
         rows = self.__conn.execute(
-            "SELECT * FROM runs ORDER BY id DESC LIMIT ? OFFSET ?",
+            f"SELECT {RUNS.projection} FROM runs ORDER BY id DESC LIMIT ? OFFSET ?",
             (limit, offset),
         ).fetchall()
         return [self._row_to_run(r) for r in rows]
 
     def delete_run(self, run_id: int) -> None:
-        """Delete a run and all related records (CASCADE)."""
-        self.__conn.execute("DELETE FROM runs WHERE id=?", (run_id,))
+        self.__conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.__conn.execute("SELECT status FROM runs WHERE id=?", (run_id,)).fetchone()
+            if row is not None and row["status"] == "running":
+                raise InFlightRecord(f"Cannot delete run {run_id} with status running")
+            self.__conn.execute("DELETE FROM runs WHERE id=?", (run_id,))
+            self.__conn.execute("COMMIT")
+        except Exception:
+            self.__conn.execute("ROLLBACK")
+            raise
 
     def list_runs_for_context(self, context_id: int) -> list[RunRecord]:
         """Return all runs belonging to a specific tuning context."""
         rows = self.__conn.execute(
-            "SELECT * FROM runs WHERE context_id=? ORDER BY id DESC",
+            f"SELECT {RUNS.projection} FROM runs WHERE context_id=? ORDER BY id DESC",
             (context_id,),
         ).fetchall()
         return [self._row_to_run(r) for r in rows]
 
+    def count_runs(self) -> int:
+        return self.__conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+
+    def count_runs_for_context(self, context_id: int) -> int:
+        return self.__conn.execute("SELECT COUNT(*) FROM runs WHERE context_id=?", (context_id,)).fetchone()[0]
+
     @staticmethod
     def _row_to_run(row: sqlite3.Row) -> RunRecord:
-        return RunRecord(
-            id=row["id"],
-            started_at=row["started_at"],
-            finished_at=row["finished_at"],
-            status=row["status"],
-            cpu_model=row["cpu_model"],
-            physical_cores=row["physical_cores"],
-            logical_cpus=row["logical_cpus"],
-            ccds=row["ccds"],
-            is_x3d=bool(row["is_x3d"]),
-            backend=row["backend"],
-            stress_mode=row["stress_mode"],
-            fft_preset=row["fft_preset"],
-            seconds_per_core=row["seconds_per_core"],
-            cycle_count=row["cycle_count"],
-            stop_on_error=bool(row["stop_on_error"]),
-            variable_load=bool(row["variable_load"]),
-            idle_stability_test=row["idle_stability_test"],
-            max_temperature=row["max_temperature"],
-            settings_json=row["settings_json"],
-            context_id=row["context_id"],
-            bios_version=row["bios_version"],
-            total_cores=row["total_cores"],
-            cores_passed=row["cores_passed"],
-            cores_failed=row["cores_failed"],
-            total_seconds=row["total_seconds"],
-        )
+        return RUNS.decode(row)
 
     # ------------------------------------------------------------------
     # Core results
@@ -1042,35 +1212,14 @@ COMMIT;
     def insert_core_result(self, rec: CoreResultRecord) -> int:
         if not rec.started_at:
             rec.started_at = self._now_iso()
+        columns = CORE_RESULTS.insert_columns
+        placeholders = ",".join("?" * len(columns))
         cur = self.__conn.execute(
-            """\
-            INSERT INTO core_results (
-                run_id, core_id, ccd, cycle, started_at, finished_at,
-                passed, error_message, error_type, elapsed_seconds,
-                iterations_completed, peak_freq_mhz, max_temp_c,
-                min_vcore_v, max_vcore_v
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                rec.run_id,
-                rec.core_id,
-                rec.ccd,
-                rec.cycle,
-                rec.started_at,
-                rec.finished_at,
-                None if rec.passed is None else int(rec.passed),
-                rec.error_message,
-                rec.error_type,
-                rec.elapsed_seconds,
-                rec.iterations_completed,
-                rec.peak_freq_mhz,
-                rec.max_temp_c,
-                rec.min_vcore_v,
-                rec.max_vcore_v,
-            ),
+            f"INSERT INTO {CORE_RESULTS.name} ({', '.join(columns)}) VALUES ({placeholders})",
+            CORE_RESULTS.encode(rec),
         )
         rec.id = cur.lastrowid
-        return rec.id
+        return cur.lastrowid
 
     def update_core_result(
         self,
@@ -1129,31 +1278,14 @@ COMMIT;
 
     def get_core_results(self, run_id: int) -> list[CoreResultRecord]:
         rows = self.__conn.execute(
-            "SELECT * FROM core_results WHERE run_id=? ORDER BY cycle, core_id",
+            f"SELECT {CORE_RESULTS.projection} FROM core_results WHERE run_id=? ORDER BY cycle, core_id",
             (run_id,),
         ).fetchall()
         return [self._row_to_core_result(r) for r in rows]
 
     @staticmethod
     def _row_to_core_result(row: sqlite3.Row) -> CoreResultRecord:
-        return CoreResultRecord(
-            id=row["id"],
-            run_id=row["run_id"],
-            core_id=row["core_id"],
-            ccd=row["ccd"],
-            cycle=row["cycle"],
-            started_at=row["started_at"],
-            finished_at=row["finished_at"],
-            passed=None if row["passed"] is None else bool(row["passed"]),
-            error_message=row["error_message"],
-            error_type=row["error_type"],
-            elapsed_seconds=row["elapsed_seconds"],
-            iterations_completed=row["iterations_completed"],
-            peak_freq_mhz=row["peak_freq_mhz"],
-            max_temp_c=row["max_temp_c"],
-            min_vcore_v=row["min_vcore_v"],
-            max_vcore_v=row["max_vcore_v"],
-        )
+        return CORE_RESULTS.decode(row)
 
     # ------------------------------------------------------------------
     # Events
@@ -1162,47 +1294,31 @@ COMMIT;
     def insert_event(self, event: EventRecord) -> int:
         if not event.timestamp:
             event.timestamp = self._now_iso()
+        columns = EVENTS.insert_columns
+        placeholders = ",".join("?" * len(columns))
         cur = self.__conn.execute(
-            """\
-            INSERT INTO events (run_id, timestamp, event_type, core_id, message, details_json)
-            VALUES (?,?,?,?,?,?)
-            """,
-            (
-                event.run_id,
-                event.timestamp,
-                event.event_type,
-                event.core_id,
-                event.message,
-                event.details_json,
-            ),
+            f"INSERT INTO {EVENTS.name} ({', '.join(columns)}) VALUES ({placeholders})",
+            EVENTS.encode(event),
         )
         event.id = cur.lastrowid
-        return event.id
+        return cur.lastrowid
 
     def get_events(self, run_id: int, *, event_type: str | None = None) -> list[EventRecord]:
         if event_type:
             rows = self.__conn.execute(
-                "SELECT * FROM events WHERE run_id=? AND event_type=? ORDER BY id",
+                f"SELECT {EVENTS.projection} FROM events WHERE run_id=? AND event_type=? ORDER BY id",
                 (run_id, event_type),
             ).fetchall()
         else:
             rows = self.__conn.execute(
-                "SELECT * FROM events WHERE run_id=? ORDER BY id",
+                f"SELECT {EVENTS.projection} FROM events WHERE run_id=? ORDER BY id",
                 (run_id,),
             ).fetchall()
         return [self._row_to_event(r) for r in rows]
 
     @staticmethod
     def _row_to_event(row: sqlite3.Row) -> EventRecord:
-        return EventRecord(
-            id=row["id"],
-            run_id=row["run_id"],
-            timestamp=row["timestamp"],
-            event_type=row["event_type"],
-            core_id=row["core_id"],
-            message=row["message"],
-            details_json=row["details_json"],
-        )
+        return EVENTS.decode(row)
 
     # ------------------------------------------------------------------
     # Telemetry
@@ -1211,115 +1327,80 @@ COMMIT;
     def insert_telemetry_batch(self, samples: list[TelemetrySample]) -> None:
         if not samples:
             return
+        columns = TELEMETRY_SAMPLES.insert_columns
+        placeholders = ",".join("?" * len(columns))
+        for sample in samples:
+            if not sample.timestamp:
+                sample.timestamp = self._now_iso()
         self.__conn.executemany(
-            """\
-            INSERT INTO telemetry_samples (run_id, core_id, timestamp, freq_mhz, effective_max_mhz, temp_c, vcore_v)
-            VALUES (?,?,?,?,?,?,?)
-            """,
-            [
-                (
-                    s.run_id,
-                    s.core_id,
-                    s.timestamp or self._now_iso(),
-                    s.freq_mhz,
-                    s.effective_max_mhz,
-                    s.temp_c,
-                    s.vcore_v,
-                )
-                for s in samples
-            ],
+            f"INSERT INTO {TELEMETRY_SAMPLES.name} ({', '.join(columns)}) VALUES ({placeholders})",
+            [TELEMETRY_SAMPLES.encode(sample) for sample in samples],
         )
 
     def get_telemetry(self, run_id: int, *, core_id: int | None = None) -> list[TelemetrySample]:
         if core_id is not None:
             rows = self.__conn.execute(
-                "SELECT * FROM telemetry_samples WHERE run_id=? AND core_id=? ORDER BY id",
+                f"SELECT {TELEMETRY_SAMPLES.projection} FROM telemetry_samples "
+                "WHERE run_id=? AND core_id=? ORDER BY id",
                 (run_id, core_id),
             ).fetchall()
         else:
             rows = self.__conn.execute(
-                "SELECT * FROM telemetry_samples WHERE run_id=? ORDER BY id",
+                f"SELECT {TELEMETRY_SAMPLES.projection} FROM telemetry_samples WHERE run_id=? ORDER BY id",
                 (run_id,),
             ).fetchall()
-        return [
-            TelemetrySample(
-                id=r["id"],
-                run_id=r["run_id"],
-                core_id=r["core_id"],
-                timestamp=r["timestamp"],
-                freq_mhz=r["freq_mhz"],
-                effective_max_mhz=r["effective_max_mhz"],
-                temp_c=r["temp_c"],
-                vcore_v=r["vcore_v"],
-            )
-            for r in rows
-        ]
+        return [TELEMETRY_SAMPLES.decode(row) for row in rows]
 
     # ------------------------------------------------------------------
     # Tuning contexts
     # ------------------------------------------------------------------
 
-    def create_context(self, ctx: TuningContextRecord) -> int:
-        """Insert a new tuning context. Returns the context id.
-
-        Uses INSERT OR IGNORE to handle races with concurrent instances
-        that may create the same (co_hash, bios_version) pair.
-        """
+    def get_or_create_context(self, ctx: TuningContextRecord | SystemContext) -> int:
+        """Return the matching context id, inserting the context when absent."""
+        if not isinstance(ctx, TuningContextRecord):
+            ctx = ctx.to_record()
         if not ctx.created_at:
             ctx.created_at = self._now_iso()
+        columns = TUNING_CONTEXTS.insert_columns
+        placeholders = ",".join("?" * len(columns))
         cur = self.__conn.execute(
-            """\
-            INSERT OR IGNORE INTO tuning_contexts (
-                created_at, bios_version, co_offsets_json, co_hash,
-                pbo_scalar, boost_limit_mhz, notes,
-                ppt_limit_w, tdc_limit_a, edc_limit_a
-            ) VALUES (?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                ctx.created_at,
-                ctx.bios_version,
-                ctx.co_offsets_json,
-                ctx.co_hash,
-                ctx.pbo_scalar,
-                ctx.boost_limit_mhz,
-                ctx.notes,
-                ctx.ppt_limit_w,
-                ctx.tdc_limit_a,
-                ctx.edc_limit_a,
-            ),
+            f"INSERT OR IGNORE INTO {TUNING_CONTEXTS.name} ({', '.join(columns)}) VALUES ({placeholders})",
+            TUNING_CONTEXTS.encode(ctx),
         )
         if cur.lastrowid and cur.rowcount > 0:
             ctx.id = cur.lastrowid
             return ctx.id
-        # Row already existed (concurrent insert) — fetch it
-        existing = self.get_context_by_hash(ctx.co_hash, ctx.bios_version)
+        existing = self.get_context_by_hash(ctx.context_hash, ctx.bios_version)
         if existing:
             ctx.id = existing.id
             return existing.id
         raise RuntimeError(
-            f"tuning_contexts insert was ignored but no row matches "
-            f"(co_hash={ctx.co_hash!r}, bios={ctx.bios_version!r}) — database inconsistent"
+            "tuning_contexts insert was ignored but no row matches "
+            f"(context_hash={ctx.context_hash!r}, bios={ctx.bios_version!r}) - database inconsistent"
         )
 
     def get_context(self, context_id: int) -> TuningContextRecord | None:
-        row = self.__conn.execute("SELECT * FROM tuning_contexts WHERE id=?", (context_id,)).fetchone()
-        if row is None:
-            return None
-        return self._row_to_context(row)
-
-    def get_context_by_hash(self, co_hash: str, bios_version: str) -> TuningContextRecord | None:
-        """Find an existing context matching the given CO hash and BIOS version."""
         row = self.__conn.execute(
-            "SELECT * FROM tuning_contexts WHERE co_hash=? AND bios_version=? LIMIT 1",
-            (co_hash, bios_version),
+            f"SELECT {TUNING_CONTEXTS.projection} FROM tuning_contexts WHERE id=?", (context_id,)
         ).fetchone()
         if row is None:
             return None
         return self._row_to_context(row)
 
-    def list_contexts(self, *, limit: int = 100) -> list[TuningContextRecord]:
-        """List tuning contexts, newest first."""
-        rows = self.__conn.execute("SELECT * FROM tuning_contexts ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    def get_context_by_hash(self, context_hash: str, bios_version: str) -> TuningContextRecord | None:
+        row = self.__conn.execute(
+            f"SELECT {TUNING_CONTEXTS.projection} FROM tuning_contexts WHERE context_hash=? AND bios_version=? LIMIT 1",
+            (context_hash, bios_version),
+        ).fetchone()
+        if row is None:
+            return None
+        return self._row_to_context(row)
+
+    def list_contexts(self, *, limit: int = 100, offset: int = 0) -> list[TuningContextRecord]:
+        rows = self.__conn.execute(
+            f"SELECT {TUNING_CONTEXTS.projection} FROM tuning_contexts ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
         return [self._row_to_context(r) for r in rows]
 
     def update_context_notes(self, context_id: int, notes: str) -> None:
@@ -1327,19 +1408,7 @@ COMMIT;
 
     @staticmethod
     def _row_to_context(row: sqlite3.Row) -> TuningContextRecord:
-        return TuningContextRecord(
-            id=row["id"],
-            created_at=row["created_at"],
-            bios_version=row["bios_version"],
-            co_offsets_json=row["co_offsets_json"],
-            co_hash=row["co_hash"],
-            pbo_scalar=row["pbo_scalar"],
-            boost_limit_mhz=row["boost_limit_mhz"],
-            notes=row["notes"],
-            ppt_limit_w=row["ppt_limit_w"],
-            tdc_limit_a=row["tdc_limit_a"],
-            edc_limit_a=row["edc_limit_a"],
-        )
+        return TUNING_CONTEXTS.decode(row)
 
     # ------------------------------------------------------------------
     # Tuner sessions
@@ -1358,10 +1427,21 @@ COMMIT;
             """\
             INSERT INTO tuner_sessions
                 (created_at, updated_at, status, bios_version, cpu_model,
-                 config_json, context_id, notes, app_version)
-            VALUES (?,?,?,?,?,?,?,?,?)
+                 config_json, context_id, notes, app_version, contract_version)
+            VALUES (?,?,?,?,?,?,?,?,?,?)
             """,
-            (now, now, "running", bios_version, cpu_model, config_json, context_id, "", __version__),
+            (
+                now,
+                now,
+                "running",
+                bios_version,
+                cpu_model,
+                config_json,
+                context_id,
+                "",
+                __version__,
+                self.TUNER_CONTRACT_VERSION,
+            ),
         )
         return cur.lastrowid
 
@@ -1371,50 +1451,58 @@ COMMIT;
             (status, self._now_iso(), session_id),
         )
 
-    def get_tuner_session(self, session_id: int) -> TunerSession | None:
-        row = self.__conn.execute("SELECT * FROM tuner_sessions WHERE id=?", (session_id,)).fetchone()
+    def get_tuner_session(self, session_id: int, *, resumable: bool = False) -> TunerSession | None:
+        row = self.__conn.execute(
+            f"SELECT {_tuner_sessions_spec().projection} FROM tuner_sessions WHERE id=?", (session_id,)
+        ).fetchone()
         if row is None:
             return None
+        if resumable and row["contract_version"] < self.TUNER_CONTRACT_VERSION:
+            raise LegacySession(
+                f"Session {session_id} predates tuner contract v16; "
+                f"start a new search with corecycler tune --seed-from {session_id}"
+            )
         return self._row_to_tuner_session(row)
 
     def get_latest_tuner_session(self) -> TunerSession | None:
-        row = self.__conn.execute("SELECT * FROM tuner_sessions ORDER BY id DESC LIMIT 1").fetchone()
+        row = self.__conn.execute(
+            f"SELECT {_tuner_sessions_spec().projection} FROM tuner_sessions ORDER BY id DESC LIMIT 1"
+        ).fetchone()
         if row is None:
             return None
         return self._row_to_tuner_session(row)
 
     def get_active_tuner_session(self) -> TunerSession | None:
         row = self.__conn.execute(
-            "SELECT * FROM tuner_sessions WHERE status IN ('running','paused','validating') ORDER BY id DESC LIMIT 1"
+            f"SELECT {_tuner_sessions_spec().projection} FROM tuner_sessions "
+            "WHERE status IN ('running','paused','validating','hunting') AND contract_version>=? "
+            "ORDER BY id DESC LIMIT 1",
+            (self.TUNER_CONTRACT_VERSION,),
         ).fetchone()
         if row is None:
             return None
         return self._row_to_tuner_session(row)
 
     def list_resumable_tuner_sessions(self, *, limit: int = 50) -> list[TunerSession]:
-        """Sessions safe to resume without being asked: the ones still in flight."""
         return self._sessions_with_status(RESUMABLE_STATUSES, limit)
 
     def list_recoverable_tuner_sessions(self, *, limit: int = 50) -> list[TunerSession]:
-        """Sessions a user can still pick up by hand, newest first.
-
-        Wider than the resumable set on purpose: a quarantined or aborted
-        session keeps every core's phase, baseline and proven offsets, so
-        hiding it is what turns a stopped run into hours of lost work. It is
-        never resumed automatically -- only when the user names it.
-        """
         return self._sessions_with_status(RECOVERABLE_STATUSES, limit)
 
     def _sessions_with_status(self, statuses: tuple[str, ...], limit: int) -> list[TunerSession]:
         placeholders = ",".join("?" * len(statuses))
         rows = self.__conn.execute(
-            f"SELECT * FROM tuner_sessions WHERE status IN ({placeholders}) ORDER BY id DESC LIMIT ?",
-            (*statuses, limit),
+            f"SELECT {_tuner_sessions_spec().projection} FROM tuner_sessions WHERE status IN ({placeholders}) "
+            "AND contract_version>=? ORDER BY id DESC LIMIT ?",
+            (*statuses, self.TUNER_CONTRACT_VERSION, limit),
         ).fetchall()
         return [self._row_to_tuner_session(r) for r in rows]
 
-    def list_tuner_sessions(self, *, limit: int = 100) -> list[TunerSession]:
-        rows = self.__conn.execute("SELECT * FROM tuner_sessions ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+    def list_tuner_sessions(self, *, limit: int = 100, offset: int = 0) -> list[TunerSession]:
+        rows = self.__conn.execute(
+            f"SELECT {_tuner_sessions_spec().projection} FROM tuner_sessions ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ).fetchall()
         return [self._row_to_tuner_session(r) for r in rows]
 
     # ------------------------------------------------------------------
@@ -1462,7 +1550,7 @@ COMMIT;
         Called after a test completes without a hard crash: the machine
         demonstrably ran with the whole resident offset vector and lived.
         ``exclude_cores`` keeps cores with fresh contrary evidence (a corrected
-        MCE named them during this very test) un-survived — surviving the test
+        MCE named them during this very test) un-survived - surviving the test
         does not clear an error the hardware just reported.
         """
         if exclude_cores:
@@ -1479,7 +1567,7 @@ COMMIT;
 
     def journal_suspects(self, session_id: int) -> list[tuple[int, int]]:
         """Return ``[(core_id, value)]`` for non-zero offsets that were resident
-        but never proven survivable — i.e. live when the machine died."""
+        but never proven survivable - i.e. live when the machine died."""
         rows = self.__conn.execute(
             "SELECT core_id, value FROM tuner_co_journal "
             "WHERE session_id=? AND survived=0 AND value<>0 ORDER BY core_id",
@@ -1496,7 +1584,7 @@ COMMIT;
         return {r["core_id"]: r["value"] for r in rows}
 
     def journal_values(self, session_id: int) -> dict[int, int]:
-        """Return ``{core_id: value}`` — the last CO value the tuner wrote per
+        """Return {core_id: value} - the last CO value the tuner wrote per
         core, survived or not. This is what the SMU is EXPECTED to hold; drift
         detection compares live hardware against it (not against baselines,
         which validation deliberately leaves behind)."""
@@ -1591,16 +1679,6 @@ COMMIT;
         """Persist bisection progress before the probe that may end the process."""
         self.__conn.execute("UPDATE tuner_sessions SET hunt_state=? WHERE id=?", (blob, session_id))
 
-    def set_hunting_core(self, session_id: int, core_id: int | None) -> None:
-        """Persist which core an isolated hunt slot is stressing BEFORE the
-        slot starts: a hard crash mid-slot then names its proven culprit on
-        resume (every other core was at stock during the slot)."""
-        self.__conn.execute(
-            "UPDATE tuner_sessions SET hunting_core=?, updated_at=? WHERE id=?",
-            (core_id, self._now_iso(), session_id),
-        )
-        self.__conn.execute("PRAGMA wal_checkpoint(FULL)")
-
     def get_resume_crash_streak(self, session_id: int) -> int:
         row = self.__conn.execute("SELECT resume_crash_streak FROM tuner_sessions WHERE id=?", (session_id,)).fetchone()
         if row is None:
@@ -1622,7 +1700,7 @@ COMMIT;
         """Guard condition on the persistence boundary, both directions.
 
         Insane values (bit corruption, a hand-edited row, an arithmetic bug
-        upstream) must RAISE at the boundary — once written they become
+        upstream) must RAISE at the boundary - once written they become
         indistinguishable from truth and every later decision trusts them.
         """
         lo, hi = cls._CO_SANE_RANGE
@@ -1638,7 +1716,7 @@ COMMIT;
             if v is not None and not lo <= v <= hi:
                 raise ValueError(
                     f"core {cs.core_id}: {name}={v} outside sane CO range "
-                    f"[{lo}, {hi}] — refusing to persist/load corrupted state"
+                    f"[{lo}, {hi}] - refusing to persist/load corrupted state"
                 )
         for name in (
             "confirm_attempts",
@@ -1651,108 +1729,36 @@ COMMIT;
         ):
             v = getattr(cs, name)
             if v < 0:
-                raise ValueError(f"core {cs.core_id}: {name}={v} negative — refusing to persist/load corrupted state")
+                raise ValueError(f"core {cs.core_id}: {name}={v} negative - refusing to persist/load corrupted state")
         if cs.cumulative_test_time < 0:
             raise ValueError(
                 f"core {cs.core_id}: cumulative_test_time={cs.cumulative_test_time} "
-                f"negative — refusing to persist/load corrupted state"
+                f"negative - refusing to persist/load corrupted state"
             )
 
     def upsert_tuner_core_state(self, session_id: int, cs: CoreState) -> None:
         self._check_core_state_sane(cs)
         now = self._now_iso()
+        columns = ("session_id", *_tuner_core_states_spec().record_columns, "updated_at")
+        placeholders = ",".join("?" * len(columns))
+        updates = ",".join(
+            f"{column}=excluded.{column}" for column in columns if column not in {"session_id", "core_id"}
+        )
         self.__conn.execute(
-            """\
-            INSERT INTO tuner_core_states
-                (session_id, core_id, phase, current_offset, best_offset,
-                 coarse_fail_offset, confirm_attempts, baseline_offset,
-                 backoff_mode, consecutive_backoff_fails,
-                 backoff_fail_bound, backoff_pass_bound, in_test,
-                 crash_count, crash_cooldown, thermal_aborts,
-                 cumulative_test_time, battery_index, anneal_strikes,
-                 anneal_bar_hours, suspicion, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            ON CONFLICT(session_id, core_id) DO UPDATE SET
-                phase=excluded.phase,
-                current_offset=excluded.current_offset,
-                best_offset=excluded.best_offset,
-                coarse_fail_offset=excluded.coarse_fail_offset,
-                confirm_attempts=excluded.confirm_attempts,
-                baseline_offset=excluded.baseline_offset,
-                backoff_mode=excluded.backoff_mode,
-                consecutive_backoff_fails=excluded.consecutive_backoff_fails,
-                backoff_fail_bound=excluded.backoff_fail_bound,
-                backoff_pass_bound=excluded.backoff_pass_bound,
-                in_test=excluded.in_test,
-                crash_count=excluded.crash_count,
-                crash_cooldown=excluded.crash_cooldown,
-                thermal_aborts=excluded.thermal_aborts,
-                cumulative_test_time=excluded.cumulative_test_time,
-                battery_index=excluded.battery_index,
-                anneal_strikes=excluded.anneal_strikes,
-                anneal_bar_hours=excluded.anneal_bar_hours,
-                suspicion=excluded.suspicion,
-                updated_at=excluded.updated_at
-            """,
-            (
-                session_id,
-                cs.core_id,
-                cs.phase,
-                cs.current_offset,
-                cs.best_offset,
-                cs.coarse_fail_offset,
-                cs.confirm_attempts,
-                cs.baseline_offset,
-                int(cs.backoff_mode),
-                cs.consecutive_backoff_fails,
-                cs.backoff_fail_bound,
-                cs.backoff_pass_bound,
-                int(cs.in_test),
-                cs.crash_count,
-                cs.crash_cooldown,
-                cs.thermal_aborts,
-                cs.cumulative_test_time,
-                cs.battery_index,
-                cs.anneal_strikes,
-                cs.anneal_bar_hours,
-                cs.suspicion,
-                now,
-            ),
+            f"INSERT INTO tuner_core_states ({', '.join(columns)}) VALUES ({placeholders}) "
+            f"ON CONFLICT(session_id, core_id) DO UPDATE SET {updates}",
+            (session_id, *_tuner_core_states_spec().encode(cs, _tuner_core_states_spec().record_columns), now),
         )
 
     def get_tuner_core_states(self, session_id: int) -> dict[int, CoreState]:
-        from corecycler.tuner.state import CoreState as _CoreState
-        from corecycler.tuner.state import TunerPhase as _TunerPhase
-
         rows = self.__conn.execute(
-            "SELECT * FROM tuner_core_states WHERE session_id=? ORDER BY core_id",
+            f"SELECT {_tuner_core_states_spec().projection} FROM tuner_core_states WHERE session_id=? ORDER BY core_id",
             (session_id,),
         ).fetchall()
-        result: dict[int, _CoreState] = {}
-        for r in rows:
-            loaded = _CoreState(
-                core_id=r["core_id"],
-                phase=_TunerPhase(r["phase"]),
-                current_offset=r["current_offset"],
-                best_offset=r["best_offset"],
-                coarse_fail_offset=r["coarse_fail_offset"],
-                confirm_attempts=r["confirm_attempts"],
-                baseline_offset=r["baseline_offset"],
-                backoff_mode=bool(r["backoff_mode"]),
-                consecutive_backoff_fails=r["consecutive_backoff_fails"],
-                backoff_fail_bound=r["backoff_fail_bound"],
-                backoff_pass_bound=r["backoff_pass_bound"],
-                in_test=bool(r["in_test"]),
-                crash_count=r["crash_count"] or 0,
-                crash_cooldown=r["crash_cooldown"] or 0,
-                thermal_aborts=r["thermal_aborts"],
-                cumulative_test_time=r["cumulative_test_time"] or 0.0,
-                battery_index=r["battery_index"] or 0,
-                anneal_strikes=r["anneal_strikes"] or 0,
-                anneal_bar_hours=r["anneal_bar_hours"] or 0.0,
-                suspicion=r["suspicion"] or 0.0,
-            )
-            self._check_core_state_sane(loaded)  # fail closed on a corrupted row
+        result = {}
+        for row in rows:
+            loaded = _tuner_core_states_spec().decode(row)
+            self._check_core_state_sane(loaded)
             result[loaded.core_id] = loaded
         return result
 
@@ -1873,17 +1879,20 @@ COMMIT;
         )
         return cur.lastrowid
 
-    def get_tuner_test_log(self, session_id: int, core_id: int | None = None) -> list[dict]:
+    def get_tuner_test_log(self, session_id: int, core_id: int | None = None, limit: int | None = None) -> list[dict]:
+        clauses = ["session_id=?"]
+        params: list[int] = [session_id]
         if core_id is not None:
-            rows = self.__conn.execute(
-                "SELECT * FROM tuner_test_log WHERE session_id=? AND core_id=? ORDER BY id",
-                (session_id, core_id),
-            ).fetchall()
+            clauses.append("core_id=?")
+            params.append(core_id)
+        where = " AND ".join(clauses)
+        if limit is None:
+            rows = self.__conn.execute(f"SELECT * FROM tuner_test_log WHERE {where} ORDER BY id", params).fetchall()
         else:
             rows = self.__conn.execute(
-                "SELECT * FROM tuner_test_log WHERE session_id=? ORDER BY id",
-                (session_id,),
+                f"SELECT * FROM tuner_test_log WHERE {where} ORDER BY id DESC LIMIT ?", (*params, limit)
             ).fetchall()
+            rows.reverse()
         return [dict(r) for r in rows]
 
     def get_tuner_session_offsets(self, session_id: int) -> dict[int, int]:
@@ -1903,10 +1912,36 @@ COMMIT;
         return {r["core_id"]: r["best_offset"] for r in rows}
 
     def delete_context_cascade(self, context_id: int) -> None:
-        """Delete a tuning context and all associated runs and tuner sessions."""
-        self.__conn.execute("DELETE FROM runs WHERE context_id=?", (context_id,))
-        self.__conn.execute("DELETE FROM tuner_sessions WHERE context_id=?", (context_id,))
-        self.__conn.execute("DELETE FROM tuning_contexts WHERE id=?", (context_id,))
+        self.__conn.execute("BEGIN IMMEDIATE")
+        try:
+            run = self.__conn.execute(
+                "SELECT id, status FROM runs WHERE context_id=? AND status='running' ORDER BY id LIMIT 1",
+                (context_id,),
+            ).fetchone()
+            if run is not None:
+                raise InFlightRecord(f"Cannot delete run {run['id']} with status {run['status']}")
+            session = self.__conn.execute(
+                "SELECT id, status FROM tuner_sessions WHERE context_id=? "
+                "AND status IN ('running','paused','validating','hunting') ORDER BY id LIMIT 1",
+                (context_id,),
+            ).fetchone()
+            if session is not None:
+                raise InFlightRecord(f"Cannot delete tuner session {session['id']} with status {session['status']}")
+            self.__conn.execute("DELETE FROM runs WHERE context_id=?", (context_id,))
+            self.__conn.execute("DELETE FROM tuner_sessions WHERE context_id=?", (context_id,))
+            self.__conn.execute("DELETE FROM tuning_contexts WHERE id=?", (context_id,))
+            self.__conn.execute("COMMIT")
+        except Exception:
+            self.__conn.execute("ROLLBACK")
+            raise
+
+    def count_contexts(self) -> int:
+        return self.__conn.execute("SELECT COUNT(*) FROM tuning_contexts").fetchone()[0]
+
+    def count_tuner_sessions_for_context(self, context_id: int) -> int:
+        return self.__conn.execute("SELECT COUNT(*) FROM tuner_sessions WHERE context_id=?", (context_id,)).fetchone()[
+            0
+        ]
 
     def get_status_counts(self) -> dict[str, int]:
         rows = self.__conn.execute("SELECT status, COUNT(*) as cnt FROM runs GROUP BY status").fetchall()
@@ -1914,33 +1949,7 @@ COMMIT;
 
     @staticmethod
     def _row_to_tuner_session(row: sqlite3.Row) -> TunerSession:
-        from corecycler.tuner.state import TunerSession as _TunerSession
-
-        return _TunerSession(
-            id=row["id"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            status=row["status"],
-            bios_version=row["bios_version"],
-            cpu_model=row["cpu_model"],
-            config_json=row["config_json"],
-            context_id=row["context_id"],
-            resume_crash_streak=row["resume_crash_streak"],
-            notes=row["notes"],
-            unattributed_crashes=row["unattributed_crashes"] or 0,
-            hunting_core=row["hunting_core"],
-            validation_stage=row["validation_stage"] or 0,
-            validation_index=row["validation_index"] or 0,
-            validation_half=row["validation_half"] or 0,
-            validation_dirty=bool(row["validation_dirty"]),
-            validation_requeue=row["validation_requeue"] or "[]",
-            endurance_round=row["endurance_round"] or 0,
-            endurance_workload=row["endurance_workload"] or 0,
-            endurance_index=row["endurance_index"] or 0,
-            boot_id=row["boot_id"],
-            app_version=row["app_version"],
-            hunt_state=row["hunt_state"],
-        )
+        return _tuner_sessions_spec().decode(row)
 
     def _execute_raw(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         """Internal: raw SQL access for testing. Not for application code."""
@@ -1954,92 +1963,21 @@ COMMIT;
     # Merging another history database (one-database guarantee)
     # ------------------------------------------------------------------
 
-    # Per-table copy columns (id excluded) and which columns remap to new ids.
-    _MERGE_TABLES: tuple[tuple[str, tuple[str, ...], dict[str, str]], ...] = (
-        (
-            "core_results",
+    @staticmethod
+    def _merge_tables() -> tuple[tuple[str, tuple[str, ...], dict[str, str]], ...]:
+        core_states = _tuner_core_states_spec()
+        return (
+            (CORE_RESULTS.name, CORE_RESULTS.insert_columns, {"run_id": "runs"}),
+            (EVENTS.name, EVENTS.insert_columns, {"run_id": "runs"}),
+            (TELEMETRY_SAMPLES.name, TELEMETRY_SAMPLES.insert_columns, {"run_id": "runs"}),
+            (core_states.name, core_states.insert_columns, {"session_id": "tuner_sessions"}),
+            (TUNER_EVENTS.name, TUNER_EVENTS.insert_columns, {"session_id": "tuner_sessions"}),
             (
-                "run_id",
-                "core_id",
-                "ccd",
-                "cycle",
-                "started_at",
-                "finished_at",
-                "passed",
-                "error_message",
-                "error_type",
-                "elapsed_seconds",
-                "iterations_completed",
-                "peak_freq_mhz",
-                "max_temp_c",
-                "min_vcore_v",
-                "max_vcore_v",
+                TUNER_TEST_LOG.name,
+                TUNER_TEST_LOG.insert_columns,
+                {"session_id": "tuner_sessions", "run_id": "runs"},
             ),
-            {"run_id": "runs"},
-        ),
-        ("events", ("run_id", "timestamp", "event_type", "core_id", "message", "details_json"), {"run_id": "runs"}),
-        (
-            "telemetry_samples",
-            ("run_id", "core_id", "timestamp", "freq_mhz", "effective_max_mhz", "temp_c", "vcore_v"),
-            {"run_id": "runs"},
-        ),
-        (
-            "tuner_core_states",
-            (
-                "session_id",
-                "core_id",
-                "phase",
-                "current_offset",
-                "best_offset",
-                "coarse_fail_offset",
-                "confirm_attempts",
-                "baseline_offset",
-                "backoff_mode",
-                "consecutive_backoff_fails",
-                "backoff_fail_bound",
-                "backoff_pass_bound",
-                "in_test",
-                "crash_count",
-                "crash_cooldown",
-                "thermal_aborts",
-                "cumulative_test_time",
-                "battery_index",
-                "anneal_strikes",
-                "anneal_bar_hours",
-                "suspicion",
-                "updated_at",
-            ),
-            {"session_id": "tuner_sessions"},
-        ),
-        (
-            "tuner_events",
-            ("session_id", "timestamp", "boot_id", "severity", "message"),
-            {"session_id": "tuner_sessions"},
-        ),
-        (
-            "tuner_test_log",
-            (
-                "session_id",
-                "core_id",
-                "offset_tested",
-                "phase",
-                "passed",
-                "error_message",
-                "error_type",
-                "duration_seconds",
-                "run_id",
-                "backend",
-                "stress_mode",
-                "fft_preset",
-                "tested_at",
-                "peak_stretch_pct",
-                "threads",
-                "profile",
-                "regime",
-            ),
-            {"session_id": "tuner_sessions", "run_id": "runs"},
-        ),
-    )
+        )
 
     def merge_from(self, other_path: str | Path) -> dict[str, int]:
         """Adopt every record from another corecycler history database.
@@ -2048,7 +1986,7 @@ COMMIT;
         the source is first opened through HistoryDB (migrating it to the
         current schema, however old it is), then every run, tuning context and
         tuner session is copied in with fresh ids and remapped references.
-        Tuning contexts deduplicate by (co_hash, bios_version). The source
+        Tuning contexts deduplicate by (context_hash, bios_version). The source
         file is not modified beyond its schema migration. All-or-nothing:
         one transaction, rolled back on any error.
         """
@@ -2063,34 +2001,19 @@ COMMIT;
 
             ctx_map: dict[int, int] = {}
             for row in conn.execute("SELECT * FROM src.tuning_contexts ORDER BY id").fetchall():
+                columns = TUNING_CONTEXTS.insert_columns
+                placeholders = ",".join("?" * len(columns))
                 cur = conn.execute(
-                    """\
-                    INSERT OR IGNORE INTO tuning_contexts
-                        (created_at, bios_version, co_offsets_json, co_hash,
-                         pbo_scalar, boost_limit_mhz, notes,
-                         ppt_limit_w, tdc_limit_a, edc_limit_a)
-                    VALUES (?,?,?,?,?,?,?,?,?,?)
-                    """,
-                    (
-                        row["created_at"],
-                        row["bios_version"],
-                        row["co_offsets_json"],
-                        row["co_hash"],
-                        row["pbo_scalar"],
-                        row["boost_limit_mhz"],
-                        row["notes"],
-                        row["ppt_limit_w"],
-                        row["tdc_limit_a"],
-                        row["edc_limit_a"],
-                    ),
+                    f"INSERT OR IGNORE INTO {TUNING_CONTEXTS.name} ({','.join(columns)}) VALUES ({placeholders})",
+                    tuple(row[column] for column in columns),
                 )
                 if cur.rowcount > 0:
                     ctx_map[row["id"]] = cur.lastrowid
                     counts["contexts"] += 1
-                else:  # already present — dedup to the existing context
+                else:  # already present - dedup to the existing context
                     existing = conn.execute(
-                        "SELECT id FROM tuning_contexts WHERE co_hash=? AND bios_version=?",
-                        (row["co_hash"], row["bios_version"]),
+                        "SELECT id FROM tuning_contexts WHERE context_hash=? AND bios_version=?",
+                        (row["context_hash"], row["bios_version"]),
                     ).fetchone()
                     ctx_map[row["id"]] = existing["id"]
             maps["tuning_contexts"] = ctx_map
@@ -2112,67 +2035,13 @@ COMMIT;
                     id_map[row["id"]] = cur.lastrowid
                 return id_map
 
-            maps["runs"] = copy_parent(
-                "runs",
-                (
-                    "started_at",
-                    "finished_at",
-                    "status",
-                    "cpu_model",
-                    "physical_cores",
-                    "logical_cpus",
-                    "ccds",
-                    "is_x3d",
-                    "backend",
-                    "stress_mode",
-                    "fft_preset",
-                    "seconds_per_core",
-                    "cycle_count",
-                    "stop_on_error",
-                    "variable_load",
-                    "idle_stability_test",
-                    "max_temperature",
-                    "settings_json",
-                    "context_id",
-                    "bios_version",
-                    "total_cores",
-                    "cores_passed",
-                    "cores_failed",
-                    "total_seconds",
-                ),
-            )
+            maps["runs"] = copy_parent(RUNS.name, RUNS.insert_columns)
             counts["runs"] = len(maps["runs"])
 
-            maps["tuner_sessions"] = copy_parent(
-                "tuner_sessions",
-                (
-                    "created_at",
-                    "updated_at",
-                    "status",
-                    "bios_version",
-                    "cpu_model",
-                    "config_json",
-                    "context_id",
-                    "resume_crash_streak",
-                    "notes",
-                    "unattributed_crashes",
-                    "hunting_core",
-                    "validation_stage",
-                    "validation_index",
-                    "validation_half",
-                    "validation_dirty",
-                    "validation_requeue",
-                    "endurance_round",
-                    "endurance_workload",
-                    "endurance_index",
-                    "boot_id",
-                    "app_version",
-                    "hunt_state",
-                ),
-            )
+            maps["tuner_sessions"] = copy_parent(_tuner_sessions_spec().name, _tuner_sessions_spec().insert_columns)
             counts["tuner_sessions"] = len(maps["tuner_sessions"])
 
-            for table, cols, remaps in self._MERGE_TABLES:
+            for table, cols, remaps in self._merge_tables():
                 for row in conn.execute(f"SELECT * FROM src.{table} ORDER BY id").fetchall():
                     vals = []
                     skip = False
@@ -2192,15 +2061,16 @@ COMMIT;
                         vals,
                     )
 
-            # journal has no id column — copy keyed rows directly
+            # journal has no id column - copy keyed rows directly
             for row in conn.execute("SELECT * FROM src.tuner_co_journal ORDER BY session_id, core_id").fetchall():
                 new_sid = maps["tuner_sessions"].get(row["session_id"])
                 if new_sid is None:
                     continue
+                columns = TUNER_CO_JOURNAL.columns
                 conn.execute(
-                    "INSERT INTO tuner_co_journal (session_id, core_id, value, survived, updated_at) "
-                    "VALUES (?,?,?,?,?)",
-                    (new_sid, row["core_id"], row["value"], row["survived"], row["updated_at"]),
+                    f"INSERT INTO {TUNER_CO_JOURNAL.name} ({','.join(columns)}) "
+                    f"VALUES ({','.join('?' * len(columns))})",
+                    tuple(new_sid if column == "session_id" else row[column] for column in columns),
                 )
 
             for row in conn.execute(
@@ -2209,27 +2079,14 @@ COMMIT;
                 context_id = ctx_map.get(row["context_id"])
                 if context_id is None:
                     continue
+                columns = TUNER_REGIME_BANKS.columns
                 conn.execute(
-                    """\
-                    INSERT INTO tuner_regime_banks
-                        (context_id, core_id, regime, offset_value, clean_seconds, updated_at)
-                    VALUES (?,?,?,?,?,?)
-                    ON CONFLICT(context_id, core_id, regime, offset_value) DO UPDATE SET
-                        clean_seconds = (
-                            tuner_regime_banks.clean_seconds + excluded.clean_seconds
-                        ),
-                        updated_at = MAX(
-                            tuner_regime_banks.updated_at, excluded.updated_at
-                        )
-                    """,
-                    (
-                        context_id,
-                        row["core_id"],
-                        row["regime"],
-                        row["offset_value"],
-                        row["clean_seconds"],
-                        row["updated_at"],
-                    ),
+                    f"INSERT INTO {TUNER_REGIME_BANKS.name} ({','.join(columns)}) "
+                    f"VALUES ({','.join('?' * len(columns))}) "
+                    "ON CONFLICT(context_id, core_id, regime, offset_value) DO UPDATE SET "
+                    "clean_seconds = tuner_regime_banks.clean_seconds + excluded.clean_seconds, "
+                    "updated_at = MAX(tuner_regime_banks.updated_at, excluded.updated_at)",
+                    tuple(context_id if column == "context_id" else row[column] for column in columns),
                 )
 
             conn.execute("COMMIT")
@@ -2251,8 +2108,19 @@ COMMIT;
         return cursor.rowcount
 
     def delete_tuner_session(self, session_id: int) -> None:
-        """Delete a tuner session and all related records (CASCADE)."""
-        self.__conn.execute("DELETE FROM tuner_sessions WHERE id=?", (session_id,))
+        self.__conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.__conn.execute("SELECT status FROM tuner_sessions WHERE id=?", (session_id,)).fetchone()
+            if row is not None and row["status"] in {"running", "paused", "validating", "hunting"}:
+                raise InFlightRecord(f"Cannot delete tuner session {session_id} with status {row['status']}")
+            self.__conn.execute("DELETE FROM tuner_sessions WHERE id=?", (session_id,))
+            self.__conn.execute("COMMIT")
+        except Exception:
+            self.__conn.execute("ROLLBACK")
+            raise
+
+    def count_tuner_sessions(self) -> int:
+        return self.__conn.execute("SELECT COUNT(*) FROM tuner_sessions").fetchone()[0]
 
     def recover_incomplete_runs(self) -> list[tuple[int, str]]:
         """Mark any 'running' runs as 'crashed'. Returns list of (id, started_at) recovered."""

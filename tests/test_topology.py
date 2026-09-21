@@ -17,7 +17,9 @@ from corecycler.engine.topology import (
     PhysicalCore,
     _detect_ccd_layout,
     _detect_x3d,
+    _l3_cache_dir,
     _l3_id_sort_key,
+    _l3_size_kib,
     _parse_cpuinfo,
     _parse_sysfs,
     detect_topology,
@@ -154,13 +156,13 @@ class TestParseCpuinfo:
 
 
 class TestParseSysfs:
-    def test_missing_sysfs(self):
+    def test_missing_sysfs_leaves_online_proof_unknown(self):
         topo = CPUTopology()
         mock_path = MagicMock()
         mock_path.exists.return_value = False
         with patch("corecycler.engine.topology.SYSFS_CPU", mock_path):
             _parse_sysfs(topo)
-        # should not crash
+        assert topo.cpus_all_online is None
 
     def test_online_range_simple(self, tmp_path):
         cpu_dir = tmp_path / "cpu"
@@ -170,6 +172,7 @@ class TestParseSysfs:
         with patch("corecycler.engine.topology.SYSFS_CPU", cpu_dir):
             _parse_sysfs(topo)
         assert topo.logical_cpus_count == 8
+        assert topo.cpus_all_online is None
 
     def test_online_range_multi(self, tmp_path):
         cpu_dir = tmp_path / "cpu"
@@ -193,12 +196,31 @@ class TestParseSysfs:
         cpu_dir = tmp_path / "cpu"
         cpu_dir.mkdir()
         (cpu_dir / "online").write_text("0-3\n")
-        topo = CPUTopology()
-        topo.logical_cpus_count = 99
+        topo = CPUTopology(logical_cpus_count=99)
         with patch("corecycler.engine.topology.SYSFS_CPU", cpu_dir):
             _parse_sysfs(topo)
-        # should keep existing count (99), not overwrite
         assert topo.logical_cpus_count == 99
+
+    def test_matching_nonempty_online_and_present_proves_all_online(self, tmp_path):
+        cpu_dir = tmp_path / "cpu"
+        cpu_dir.mkdir()
+        (cpu_dir / "online").write_text("0-7\n")
+        (cpu_dir / "present").write_text("0-7\n")
+        topo = CPUTopology()
+        with patch("corecycler.engine.topology.SYSFS_CPU", cpu_dir):
+            _parse_sysfs(topo)
+        assert topo.cpus_all_online is True
+
+    @pytest.mark.parametrize(("online", "present"), [("0-3", "0-7"), ("", "0-7"), ("0-7", "")])
+    def test_online_proof_distinguishes_mismatch_from_unknown(self, tmp_path, online, present):
+        cpu_dir = tmp_path / "cpu"
+        cpu_dir.mkdir()
+        (cpu_dir / "online").write_text(online)
+        (cpu_dir / "present").write_text(present)
+        topo = CPUTopology()
+        with patch("corecycler.engine.topology.SYSFS_CPU", cpu_dir):
+            _parse_sysfs(topo)
+        assert topo.cpus_all_online is (False if online and present else None)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +229,21 @@ class TestParseSysfs:
 
 
 class TestDetectCCDLayout:
+    def test_l3_cache_lookup_without_a_level_three_entry_returns_none(self, tmp_path):
+        cache_dir = tmp_path / "cpu0" / "cache"
+        cache_dir.mkdir(parents=True)
+
+        with patch("corecycler.engine.topology.SYSFS_CPU", tmp_path):
+            assert _l3_cache_dir(0) is None
+
+    def test_l3_size_without_a_size_file_returns_none(self, tmp_path):
+        assert _l3_size_kib(tmp_path) is None
+
+    def test_l3_size_with_an_unparseable_value_returns_none(self, tmp_path):
+        (tmp_path / "size").write_text("unknown")
+
+        assert _l3_size_kib(tmp_path) is None
+
     def test_single_l3_group(self, tmp_path):
         """All cores sharing one L3 = 1 CCD."""
         topo = parse_cpuinfo_from_text(CPUINFO_SINGLE_CCD_NO_SMT)
@@ -222,6 +259,7 @@ class TestDetectCCDLayout:
             _detect_ccd_layout(topo)
 
         assert topo.ccds == 1
+        assert topo.ccd_layout_known is True
         assert len(topo.cores) == 4
         for pc in topo.cores.values():
             assert pc.ccd == 0
@@ -244,6 +282,7 @@ class TestDetectCCDLayout:
             _detect_ccd_layout(topo)
 
         assert topo.ccds == 2
+        assert topo.ccd_layout_known is True
         for pc in topo.cores.values():
             expected_ccd = 0 if pc.core_id < 4 else 1
             assert pc.ccd == expected_ccd
@@ -256,6 +295,18 @@ class TestDetectCCDLayout:
         with patch("corecycler.engine.topology.SYSFS_CPU", cpu_dir):
             _detect_ccd_layout(topo)
         assert topo.ccds == 1
+        assert topo.ccd_layout_known is False
+
+    def test_cache_without_id_leaves_layout_unknown(self, tmp_path):
+        topo = parse_cpuinfo_from_text(CPUINFO_SINGLE_CCD_NO_SMT)
+        cpu_dir = tmp_path / "cpu"
+        for i in range(4):
+            cache_dir = cpu_dir / f"cpu{i}" / "cache" / "index3"
+            cache_dir.mkdir(parents=True)
+            (cache_dir / "level").write_text("3")
+        with patch("corecycler.engine.topology.SYSFS_CPU", cpu_dir):
+            _detect_ccd_layout(topo)
+        assert topo.ccd_layout_known is False
 
     @pytest.mark.parametrize("bad_id", ["0x0", "", "  ", "abc"])
     def test_malformed_l3_id_does_not_crash(self, tmp_path, bad_id):
@@ -270,7 +321,8 @@ class TestDetectCCDLayout:
             (cache_dir / "id").write_text(bad_id)
         with patch("corecycler.engine.topology.SYSFS_CPU", cpu_dir):
             _detect_ccd_layout(topo)  # must not raise
-        assert topo.ccds >= 1
+        assert topo.ccd_layout_known is False
+        assert all(core.ccd is None for core in topo.cores.values())
 
     def test_l3_id_sort_key_orders_numeric_then_malformed(self):
         """Numeric ids sort by value; malformed ids sort last, deterministically."""
@@ -298,7 +350,7 @@ def _x3d_topology(
     for lcpu in topo.logical_map.values():
         pc = lcpu.physical_core
         if pc not in topo.cores:
-            topo.cores[pc] = PhysicalCore(core_id=pc, ccd=ccd_of(pc), ccx=None, logical_cpus=lcpu.core_cpus)
+            topo.cores[pc] = PhysicalCore(core_id=pc, ccd=ccd_of(pc), logical_cpus=lcpu.core_cpus)
     sysfs = tmp_path / "cpu"
     if l3_of_ccd is not None:
         for core in topo.cores.values():
@@ -470,12 +522,12 @@ class TestDataclasses:
             lcpu.logical_id = 1  # type: ignore[misc]
 
     def test_physical_core_frozen(self):
-        pc = PhysicalCore(core_id=0, ccd=0, ccx=None, logical_cpus=(0, 8))
+        pc = PhysicalCore(core_id=0, ccd=0, logical_cpus=(0, 8))
         with pytest.raises(AttributeError):
             pc.core_id = 1  # type: ignore[misc]
 
     def test_physical_core_vcache_default(self):
-        pc = PhysicalCore(core_id=0, ccd=0, ccx=None, logical_cpus=(0,))
+        pc = PhysicalCore(core_id=0, ccd=0, logical_cpus=(0,))
         assert pc.has_vcache is False
 
     def test_cpu_topology_defaults(self):
@@ -489,7 +541,7 @@ class TestDataclasses:
 
 
 # ---------------------------------------------------------------------------
-# Edge case tests — hardware variations and fallback scenarios
+# Edge case tests for hardware variations and fallback scenarios
 # ---------------------------------------------------------------------------
 
 
@@ -557,9 +609,9 @@ class TestTopologyDriftEdges:
         are skipped; the CCD whose L3 proves V-Cache is still marked."""
         topo = CPUTopology(model_name="AMD Ryzen 9 7950X3D 16-Core Processor", ccds=2)
         topo.cores = {
-            0: PhysicalCore(core_id=0, ccd=0, ccx=None, logical_cpus=(0,)),
-            1: PhysicalCore(core_id=1, ccd=None, ccx=None, logical_cpus=(1,)),
-            8: PhysicalCore(core_id=8, ccd=1, ccx=None, logical_cpus=(8,)),
+            0: PhysicalCore(core_id=0, ccd=0, logical_cpus=(0,)),
+            1: PhysicalCore(core_id=1, ccd=None, logical_cpus=(1,)),
+            8: PhysicalCore(core_id=8, ccd=1, logical_cpus=(8,)),
         }
         cpu_dir = tmp_path / "cpu"
         cache_dir = cpu_dir / "cpu0" / "cache" / "index3"
@@ -596,6 +648,20 @@ class TestCpusAllOnline:
         topo = self._run(tmp_path, "0,2,4,6\n", "0-7\n")
         assert topo.cpus_all_online is False
 
-    def test_missing_present_file_stays_trusting(self, tmp_path):
+    def test_missing_present_file_leaves_proof_unknown(self, tmp_path):
         topo = self._run(tmp_path, "0-7\n", None)
-        assert topo.cpus_all_online is True
+        assert topo.cpus_all_online is None
+
+    @pytest.mark.parametrize("reads", [(OSError(),), ("0-7", OSError())])
+    def test_unreadable_online_or_present_file_leaves_proof_unknown(self, tmp_path, reads):
+        cpu_dir = tmp_path / "cpu"
+        cpu_dir.mkdir()
+        (cpu_dir / "online").touch()
+        (cpu_dir / "present").touch()
+        topo = CPUTopology()
+        with (
+            patch("corecycler.engine.topology.SYSFS_CPU", cpu_dir),
+            patch.object(Path, "read_text", side_effect=reads),
+        ):
+            _parse_sysfs(topo)
+        assert topo.cpus_all_online is None

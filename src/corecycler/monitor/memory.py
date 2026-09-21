@@ -1,9 +1,10 @@
-"""DIMM and memory monitoring — dmidecode + SPD5118 hwmon."""
+"""DIMM and memory monitoring using dmidecode and SPD5118 hwmon."""
 
 from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import re
 import struct
 import subprocess
@@ -32,9 +33,9 @@ class DIMMInfo:
     serial_number: str = ""
     rank: int = 0
     form_factor: str = ""
-    configured_voltage: float = 0.0
-    min_voltage: float = 0.0
-    max_voltage: float = 0.0
+    configured_voltage: float | None = None
+    min_voltage: float | None = None
+    max_voltage: float | None = None
     data_width: int = 0
     total_width: int = 0
 
@@ -153,9 +154,12 @@ def parse_dmidecode_output(text: str) -> list[DIMMInfo]:
         if rank_str.isdigit():
             rank = int(rank_str)
 
-        def _parse_voltage(s: str) -> float:
-            m = re.match(r"([\d.]+)", s)
-            return float(m.group(1)) if m else 0.0
+        def _parse_voltage(value: str) -> float | None:
+            match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*(?:V)?\s*", value)
+            if match is None:
+                return None
+            voltage = float(match.group(1))
+            return voltage if math.isfinite(voltage) else None
 
         dimms.append(
             DIMMInfo(
@@ -192,7 +196,7 @@ def read_dimm_info() -> list[DIMMInfo]:
         )
         if result.returncode != 0:
             log.warning("dmidecode exited with code %d: %s", result.returncode, result.stderr.strip())
-        # Parse even on non-zero exit — some systems return 1 but still output data
+        # Parse on nonzero exit because some systems still output data.
         dimms = parse_dmidecode_output(result.stdout)
         if not dimms and result.stdout:
             log.debug("dmidecode produced output but no DIMMs parsed (stdout length: %d)", len(result.stdout))

@@ -7,9 +7,8 @@ import json
 import pytest
 
 from corecycler.history.db import HistoryDB, TuningContextRecord
-from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
-from corecycler.tuner.report import build, render, to_json
+from corecycler.tuner.report import bios_offset, build, core_row, render, to_json
 from corecycler.tuner.state import CoreState, TunerPhase
 
 
@@ -25,8 +24,20 @@ def test_missing_session_is_reported_by_id(db):
         build(db, 404)
 
 
+def test_core_row_reports_missing_session_by_id(db):
+    with pytest.raises(ValueError, match="no tuner session 404"):
+        core_row(db, 404, 0)
+
+
+def test_core_row_reports_missing_core_by_id(db):
+    session_id = db.create_tuner_session(TunerConfig().to_json(), "", "")
+
+    with pytest.raises(ValueError, match=f"no core 7 in tuner session {session_id}"):
+        core_row(db, session_id, 7)
+
+
 def test_empty_session_reports_zero_evidence_without_inventing_limits(db):
-    session_id = tp.create_session(db, TunerConfig(), "Empty BIOS", "Empty CPU")
+    session_id = db.create_tuner_session(TunerConfig().to_json(), "Empty BIOS", "Empty CPU")
 
     report = build(db, session_id)
 
@@ -44,44 +55,39 @@ def test_empty_session_reports_zero_evidence_without_inventing_limits(db):
 
 def _seed_evidence_report(db: HistoryDB) -> int:
     context_hash = "0123456789abcdef"
-    context_id = db.create_context(
+    context_id = db.get_or_create_context(
         TuningContextRecord(
             bios_version="Test BIOS",
             co_offsets_json='{"0": -32, "1": -20}',
-            co_hash=context_hash,
+            context_hash=context_hash,
             pbo_scalar=2.0,
             ppt_limit_w=120.0,
             tdc_limit_a=75.0,
             edc_limit_a=110.0,
         )
     )
-    session_id = tp.create_session(
-        db,
-        TunerConfig(cores_to_test=[0, 1]),
-        "Test BIOS",
-        "Ryzen Test",
-        context_id=context_id,
+    session_id = db.create_tuner_session(
+        TunerConfig(cores_to_test=[0, 1]).to_json(), "Test BIOS", "Ryzen Test", context_id=context_id
     )
-    tp.update_session_status(db, session_id, "completed")
+    db.update_tuner_session_status(session_id, "completed")
     db.set_unattributed_crashes(session_id, 4)
     db.set_endurance_position(session_id, 7, 1, 2)
 
-    tp.save_core_state(
-        db,
+    db.upsert_tuner_core_state(
         session_id,
         CoreState(
             core_id=0,
             phase=TunerPhase.ANNEALING,
             current_offset=-30,
             best_offset=-32,
+            proven_offset=-32,
             crash_count=3,
             cumulative_test_time=9000.0,
             anneal_strikes=2,
             suspicion=1.75,
         ),
     )
-    tp.save_core_state(
-        db,
+    db.upsert_tuner_core_state(
         session_id,
         CoreState(
             core_id=1,
@@ -99,8 +105,7 @@ def _seed_evidence_report(db: HistoryDB) -> int:
     }.items():
         db.bank_regime_time(context_id, 0, regime, -32, seconds)
 
-    tp.log_test_result(
-        db,
+    db.insert_tuner_test_log(
         session_id,
         0,
         -32,
@@ -109,8 +114,7 @@ def _seed_evidence_report(db: HistoryDB) -> int:
         duration=3600.0,
         regime="boost",
     )
-    tp.log_test_result(
-        db,
+    db.insert_tuner_test_log(
         session_id,
         0,
         -33,
@@ -120,8 +124,7 @@ def _seed_evidence_report(db: HistoryDB) -> int:
         duration=1800.0,
         regime="boost",
     )
-    tp.log_test_result(
-        db,
+    db.insert_tuner_test_log(
         session_id,
         0,
         -33,
@@ -131,8 +134,7 @@ def _seed_evidence_report(db: HistoryDB) -> int:
         duration=900.0,
         regime="boost",
     )
-    tp.log_test_result(
-        db,
+    db.insert_tuner_test_log(
         session_id,
         0,
         -32,
@@ -142,8 +144,7 @@ def _seed_evidence_report(db: HistoryDB) -> int:
         duration=3600.0,
         regime="current",
     )
-    tp.log_test_result(
-        db,
+    db.insert_tuner_test_log(
         session_id,
         0,
         -32,
@@ -152,8 +153,7 @@ def _seed_evidence_report(db: HistoryDB) -> int:
         duration=1800.0,
         regime="transient",
     )
-    tp.log_test_result(
-        db,
+    db.insert_tuner_test_log(
         session_id,
         1,
         -20,
@@ -162,8 +162,7 @@ def _seed_evidence_report(db: HistoryDB) -> int:
         duration=1800.0,
         regime="current",
     )
-    tp.log_test_result(
-        db,
+    db.insert_tuner_test_log(
         session_id,
         1,
         -20,
@@ -198,6 +197,8 @@ def test_report_exposes_banked_confidence_failures_and_session_counters(db):
         {
             "core": 0,
             "accepted_offset": -32,
+            "proven_offset": -32,
+            "bios_offset": -31,
             "candidate_offset": -30,
             "phase": "annealing",
             "hours": {"boost": 2.0, "current": 1.0, "transient": 0.5, "coupled": 3.0},
@@ -212,6 +213,8 @@ def test_report_exposes_banked_confidence_failures_and_session_counters(db):
             "core": 1,
             "accepted_offset": None,
             "candidate_offset": -20,
+            "proven_offset": None,
+            "bios_offset": None,
             "phase": "confirmed",
             "hours": {"boost": 0.0, "current": 0.0, "transient": 0.0, "coupled": 0.0},
             "confidence_hours": 0.0,
@@ -230,23 +233,30 @@ def test_report_exposes_banked_confidence_failures_and_session_counters(db):
     }
 
 
-def test_accepted_offsets_are_recommended_for_bios_application(db):
-    session_id = tp.create_session(db, TunerConfig(cores_to_test=[0]), "Test BIOS", "Test CPU")
-    tp.save_core_state(
-        db,
+def test_proven_offsets_receive_an_explicit_bios_guard_band(db):
+    session_id = db.create_tuner_session(TunerConfig(cores_to_test=[0]).to_json(), "Test BIOS", "Test CPU")
+    db.upsert_tuner_core_state(
         session_id,
         CoreState(
             core_id=0,
             phase=TunerPhase.CONFIRMED,
             current_offset=-30,
             best_offset=-30,
+            proven_offset=-30,
         ),
     )
-    tp.update_session_status(db, session_id, "completed")
+    db.update_tuner_session_status(session_id, "completed")
 
-    assert "Accepted offsets are volatile SMU overlays; enter them in BIOS to keep them across a reboot." in render(
-        build(db, session_id)
-    )
+    report = build(db, session_id)
+    row = report["cores"][0]
+    assert row["proven_offset"] == row["accepted_offset"] == -30
+    assert row["bios_offset"] == -29
+    assert any("guard" in line.lower() for line in render(report))
+
+
+def test_bios_guard_band_clamps_at_the_stock_baseline():
+    assert bios_offset(-1, baseline_offset=0, direction=-1, fine_step=1, guard_band_steps=2) == 0
+    assert bios_offset(1, baseline_offset=0, direction=1, fine_step=1, guard_band_steps=2) == 0
 
 
 def test_unproven_candidate_is_not_recommended_for_bios_application(db):
@@ -257,15 +267,17 @@ def test_unproven_candidate_is_not_recommended_for_bios_application(db):
     assert not any("enter" in line.lower() and "bios" in line.lower() for line in render(report))
 
 
-def test_quarantine_marks_every_historical_offset_unsafe(db):
+@pytest.mark.parametrize("status", ["profile_quarantined", "platform_fault"])
+def test_terminal_safety_failure_marks_every_historical_offset_unsafe(db, status):
     session_id = _seed_evidence_report(db)
-    tp.update_session_status(db, session_id, "quarantined")
+    db.update_tuner_session_status(session_id, status)
 
     report = build(db, session_id)
     lines = render(report)
 
     assert [row["candidate_offset"] for row in report["cores"]] == [-30, -20]
     assert all(row["accepted_offset"] is None for row in report["cores"])
+    assert all(row["bios_offset"] is None for row in report["cores"])
     assert any("unsafe" in line.lower() for line in lines)
     assert not any("enter" in line.lower() and "bios" in line.lower() for line in lines)
 
@@ -293,11 +305,14 @@ def test_json_report_keeps_the_public_nested_shape(db):
         "cores",
         "regime_yield",
         "total_stress_hours",
+        "bios_guard_band",
     }
     assert set(decoded["cores"][0]) == {
         "core",
         "accepted_offset",
         "candidate_offset",
+        "proven_offset",
+        "bios_offset",
         "phase",
         "hours",
         "confidence_hours",

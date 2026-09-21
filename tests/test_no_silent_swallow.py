@@ -41,9 +41,20 @@ def _is_blind(handler: ast.ExceptHandler) -> bool:
     return any(n in ("Exception", "BaseException") for n in names)
 
 
+def _executed_nodes(handler: ast.ExceptHandler):
+    stack: list[ast.AST] = list(reversed(handler.body))
+    deferred = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
+    while stack:
+        node = stack.pop()
+        yield node
+        if isinstance(node, deferred):
+            continue
+        stack.extend(reversed(list(ast.iter_child_nodes(node))))
+
+
 def _surfaces(handler: ast.ExceptHandler) -> bool:
     bound = handler.name
-    for node in ast.walk(handler):
+    for node in _executed_nodes(handler):
         if isinstance(node, ast.Raise):
             return True
         if isinstance(node, ast.Call):
@@ -100,3 +111,17 @@ def test_no_typed_pass_swallow():
         "catches the wrong exception type. Write a deliberate suppression as "
         "contextlib.suppress(...), or surface the failure:\n  " + "\n  ".join(offenders)
     )
+
+
+def test_deferred_nested_scopes_do_not_surface_an_outer_exception():
+    sources = (
+        "try:\n    work()\nexcept Exception:\n    def later():\n        print('hidden')\n",
+        "try:\n    work()\nexcept Exception:\n    callback = lambda: logger.exception('hidden')\n",
+        (
+            "try:\n    work()\nexcept Exception:\n    class Later:\n"
+            "        def run(self):\n            raise RuntimeError\n"
+        ),
+    )
+    for source in sources:
+        handler = next(node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.ExceptHandler))
+        assert not _surfaces(handler)

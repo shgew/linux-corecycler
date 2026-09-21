@@ -3,8 +3,8 @@
 A cgroup cpuset (AllowedCPUs on a transient systemd scope) is a boundary the
 contained process cannot widen with sched_setaffinity, unlike a taskset mask.
 setpriv --pdeathsig closes the orphan chain: a scope outlives systemd-run, so
-the payload must bind its lifetime to systemd-run itself, which our preexec
-binds to the app.
+the prefix binds systemd-run to the app and the payload to systemd-run. Both
+links live here so a launch that fakes containment carries neither.
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ def _next_unit() -> str:
 def payload_cgroup(pid: int, unit: str, *, proc_base: Path | None = None) -> str | None:
     """The payload's cgroup-v2 path once it has been placed into our scope.
 
-    None until the 0:: line ends with the named scope — before placement it
+    None until the 0:: line ends with the named scope. Before placement it
     still shows the launcher's cgroup, which must never be judged."""
     base = proc_base or Path("/proc")
     try:
@@ -137,8 +137,12 @@ def contain(cpus: set[int] | tuple[int, ...] | list[int]) -> Containment:
     systemd_run = _systemd_run_path()
     if systemd_run is None:
         raise ContainmentUnavailable("systemd-run disappeared after probe")
+    setpriv = tools.resolve("setpriv")
+    if setpriv.path is None:
+        raise ContainmentUnavailable("setpriv is required and was not found (util-linux)")
+    bind = [str(setpriv.path), "--pdeathsig", "SIGKILL", "--"]
     unit = _next_unit()
-    prefix = [systemd_run]
+    prefix = bind + [systemd_run]
     if mechanism == MECHANISM_USER:
         prefix.append("--user")
     prefix += [
@@ -149,12 +153,9 @@ def contain(cpus: set[int] | tuple[int, ...] | list[int]) -> Containment:
         unit,
         "-p",
         f"AllowedCPUs={cpu_list(cpuset)}",
+        "--",
     ]
-    setpriv = tools.resolve("setpriv")
-    if setpriv.path is None:
-        raise ContainmentUnavailable("setpriv is required and was not found (util-linux)")
-    prefix += ["--", str(setpriv.path), "--pdeathsig", "SIGKILL", "--"]
-    return Containment(prefix=prefix, unit=unit)
+    return Containment(prefix=prefix + bind, unit=unit)
 
 
 def observed_tree_cpus(pid: int, *, proc_base: Path | None = None) -> set[int]:

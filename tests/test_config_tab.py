@@ -14,6 +14,7 @@ import pytest
 if not hasattr(_sys.modules.get("PySide6", None), "__path__"):
     pytest.skip("GUI tests require real PySide6", allow_module_level=True)
 
+from corecycler.config.settings import TestProfile
 from corecycler.engine.backends import load_all
 from corecycler.engine.topology import CPUTopology, PhysicalCore
 
@@ -27,7 +28,7 @@ def _qapp():
 def _topo() -> CPUTopology:
     topo = CPUTopology(model_name="Test 8C/16T", family=26, model=0x44, physical_cores=8, ccds=2)
     for cid in range(8):
-        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0 if cid < 4 else 1, ccx=None, logical_cpus=(cid, cid + 8))
+        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0 if cid < 4 else 1, logical_cpus=(cid, cid + 8))
     return topo
 
 
@@ -109,19 +110,21 @@ class TestCoreInputInjection:
             ("1,2,", [1, 2]),
             ("1,,2", [1, 2]),
             (",,,", None),
-            ("abc", None),
-            ("1,abc,2", None),
-            ("999", None),
-            ("-1", None),
-            ("0,999", [0]),
             ("7", [7]),
         ],
     )
-    def test_core_parser_never_crashes_and_filters_invalid(self, text, expected):
+    def test_valid_core_input_is_preserved(self, text, expected):
         tab = _tab()
         tab._cores_input.setText(text)
-        p = tab.get_profile()
-        assert p.cores_to_test == expected
+        assert tab.get_profile().cores_to_test == expected
+
+    @pytest.mark.parametrize("text", ["abc", "1,abc,2", "999", "-1", "0,999", "0,0"])
+    def test_invalid_core_input_refuses_a_profile(self, text):
+        tab = _tab()
+        tab._cores_input.setText(text)
+        with pytest.raises(ValueError, match="[Cc]ore"):
+            tab.get_profile()
+        assert not tab._cores_error_label.isHidden()
 
     def test_out_of_range_shows_error_label(self):
         tab = _tab()
@@ -162,6 +165,30 @@ class TestRoundTrip:
         assert int(out.idle_stability_test) == 15
         assert int(out.idle_between_cores) == 7
 
+    def test_an_invalid_import_does_not_mutate_the_widgets(self):
+        from corecycler.config.settings import TestProfile
+
+        tab = _tab()
+        before = tab.get_profile()
+        with pytest.raises(ValueError, match="backend"):
+            tab.set_profile(TestProfile(backend="missing"))
+        assert tab.get_profile() == before
+
+
+class TestBackendWorkloads:
+    def test_backend_change_exposes_only_supported_workloads(self):
+        from corecycler.engine.backends import get_backend
+
+        tab = _tab()
+        tab._backend_combo.setCurrentText("stress-ng")
+        backend = get_backend("stress-ng")
+        assert {tab._stress_mode_combo.itemText(i) for i in range(tab._stress_mode_combo.count())} == {
+            mode.name for mode in backend.get_supported_modes()
+        }
+        assert {tab._fft_combo.itemText(i) for i in range(tab._fft_combo.count())} == {
+            preset.name for preset in backend.get_supported_fft_presets()
+        }
+
 
 class TestRetestFailed:
     def test_failed_cores_enable_button_and_populate_input(self):
@@ -175,3 +202,51 @@ class TestRetestFailed:
         tab = _tab()
         tab.set_failed_cores([])
         assert not tab._retest_failed_btn.isEnabled()
+
+
+class TestProfileValidation:
+    @pytest.mark.parametrize(
+        "changes,field",
+        [
+            ({"stress_mode": "missing"}, "stress mode"),
+            ({"fft_preset": "missing"}, "FFT preset"),
+            ({"threads": 0}, "threads"),
+            ({"seconds_per_core": 0}, "seconds_per_core"),
+            ({"cycle_count": 0}, "cycle_count"),
+            ({"max_temperature": 0.0}, "max_temperature"),
+            ({"idle_stability_test": -1.0}, "idle_stability_test"),
+            ({"idle_between_cores": -1.0}, "idle_between_cores"),
+            ({"test_mode": "missing"}, "test preset"),
+            ({"cores_to_test": [True]}, "Core IDs must be integers"),
+            ({"cores_to_test": [0, 0]}, "Duplicate core IDs"),
+            ({"cores_to_test": [999]}, "detected topology"),
+            ({"fft_preset": "CUSTOM", "fft_min": None, "fft_max": None}, "Custom FFT range"),
+        ],
+    )
+    def test_each_invalid_field_is_refused_without_mutating_widgets(self, changes, field):
+        tab = _tab()
+        before = tab.get_profile()
+        profile = TestProfile()
+        for name, value in changes.items():
+            setattr(profile, name, value)
+
+        with pytest.raises(ValueError, match=field):
+            tab.set_profile(profile)
+
+        assert tab.get_profile() == before
+
+    def test_widget_profile_validation_refuses_an_out_of_contract_value(self):
+        tab = _tab()
+        tab._time_spin.setMinimum(0)
+        tab._time_spin.setValue(0)
+
+        with pytest.raises(ValueError, match="seconds_per_core"):
+            tab.get_profile()
+
+    def test_unknown_backend_change_preserves_workload_choices(self):
+        tab = _tab()
+        before = (tab._stress_mode_combo.currentText(), tab._fft_combo.currentText())
+
+        tab._on_backend_change("missing")
+
+        assert (tab._stress_mode_combo.currentText(), tab._fft_combo.currentText()) == before

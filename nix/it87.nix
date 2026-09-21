@@ -1,4 +1,4 @@
-# it87 kernel module — out-of-tree fork with support for newer ITE Super I/O chips.
+# it87 kernel module - out-of-tree fork with support for newer ITE Super I/O chips.
 # Provides temperature, fan speed, and voltage monitoring (in0 = Vcore on most boards).
 #
 # The in-tree it87 driver lags behind on newer chip IDs (IT8686E, IT8689E, etc.).
@@ -14,15 +14,16 @@
   llvmPackages_latest,
 }:
 let
-  kernelUsesLLVM = builtins.any (
-    flag:
-    builtins.match ".*LLVM=1.*" (toString flag) != null
-    || builtins.match ".*CC=clang.*" (toString flag) != null
-  ) (kernel.makeFlags or [ ]);
-
-  buildStdenv = if kernelUsesLLVM then llvmPackages_latest.stdenv else stdenv;
+  toolchain = import ./kernel-module-toolchain.nix {
+    inherit
+      lib
+      stdenv
+      kernel
+      llvmPackages_latest
+      ;
+  };
 in
-buildStdenv.mkDerivation {
+toolchain.buildStdenv.mkDerivation {
   pname = "it87";
   version = "unstable-2025-12-26";
 
@@ -35,19 +36,13 @@ buildStdenv.mkDerivation {
 
   hardeningDisable = [ "pic" ];
 
-  nativeBuildInputs =
-    kernel.moduleBuildDependencies
-    ++ lib.optionals kernelUsesLLVM [
-      llvmPackages_latest.lld
-    ];
+  nativeBuildInputs = toolchain.nativeBuildInputs;
 
   makeFlags = [
     "KERNEL_BUILD=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
   ]
-  ++ lib.optionals kernelUsesLLVM [
-    "LLVM=1"
-    "CC=clang"
-    "LD=ld.lld"
+  ++ toolchain.makeFlags
+  ++ lib.optionals toolchain.kernelUsesLLVM [
     "KCFLAGS=-Wno-unused-command-line-argument"
   ];
 
@@ -59,7 +54,7 @@ buildStdenv.mkDerivation {
 
   meta = {
     homepage = "https://github.com/frankcrawford/it87";
-    description = "ITE IT87xx Super I/O hwmon driver — extended fork with 38+ chip support";
+    description = "ITE IT87xx Super I/O hwmon driver - extended fork with 38+ chip support";
     license = lib.licenses.gpl2Plus;
     platforms = [ "x86_64-linux" ];
   };

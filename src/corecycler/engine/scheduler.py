@@ -93,6 +93,8 @@ class CoreScheduler:
         self._current_core: int | None = None
         self._current_cycle: int = 0
         self._stop_event = threading.Event()
+        self._lifecycle_lock = threading.Lock()
+        self._active_supervisor: Supervisor | None = None
         self._thermal: ThermalWatch | None = None
 
         self.on_core_start: list = []
@@ -130,8 +132,13 @@ class CoreScheduler:
 
     def run(self) -> dict[int, list[StressResult]]:
         """Run the full test cycle. Blocks until complete. Use run_async() for GUI."""
-        self.state = TestState.RUNNING
-        self._stop_event.clear()
+        with self._lifecycle_lock:
+            if self.state is TestState.RUNNING:
+                raise RuntimeError("scheduler is already running")
+            if self.state is TestState.STOPPING:
+                return self.results
+            self.state = TestState.RUNNING
+            self._stop_event.clear()
         self.observed_mce = []
         self.detector.reset()
         self._thermal = self._new_thermal()
@@ -142,34 +149,52 @@ class CoreScheduler:
             with SleepInhibitor("per-core stability test running"):
                 for cycle in range(self.config.cycle_count):
                     self._current_cycle = cycle
-                    if self._stop_event.is_set():
-                        break
+                    cycle_complete = not self._stop_event.is_set()
                     for core_id in cores:
                         if self._stop_event.is_set():
+                            cycle_complete = False
                             break
                         self._test_core(core_id, cycle)
-                        if self.config.idle_between_cores > 0 and not self._stop_event.is_set():
+                        if self._stop_event.is_set():
+                            cycle_complete = False
+                            break
+                        if self.config.idle_between_cores > 0:
                             self._idle_phase(core_id, self.config.idle_between_cores, "inter-core idle")
+                            if self._stop_event.is_set():
+                                cycle_complete = False
+                                break
+                    if not cycle_complete:
+                        break
                     for cb in self.on_cycle_complete:
                         cb(cycle)
         finally:
-            self.state = TestState.FINISHED
+            with self._lifecycle_lock:
+                self.state = TestState.FINISHED
             for cb in self.on_test_complete:
                 cb(self.results)
         return self.results
 
     def stop(self) -> None:
         self._stop_event.set()
-        self.state = TestState.STOPPING
+        with self._lifecycle_lock:
+            if self.state is not TestState.FINISHED:
+                self.state = TestState.STOPPING
 
     force_stop = stop
+
+    def force_teardown(self) -> bool:
+        """Stop and synchronously confirm that every active stress lane is gone."""
+        self.stop()
+        with self._lifecycle_lock:
+            supervisor = self._active_supervisor
+        return supervisor is None or supervisor.force_teardown()
 
     @property
     def _stop_requested(self) -> bool:
         return self._stop_event.is_set()
 
     def _supervisor(self, phase: str, *, stall_timeout: float | None = None) -> Supervisor:
-        return Supervisor(
+        supervisor = Supervisor(
             backend=self.backend,
             detector=self.detector,
             thermal=self._thermal or self._new_thermal(),
@@ -185,6 +210,9 @@ class CoreScheduler:
                 on_thermal=self._hook_thermal,
             ),
         )
+        with self._lifecycle_lock:
+            self._active_supervisor = supervisor
+        return supervisor
 
     def _hook_status(self, core_id: int, elapsed: float) -> None:
         status = self.core_status.get(core_id)
@@ -201,7 +229,7 @@ class CoreScheduler:
 
     def _hook_thermal(self, temperature: float) -> None:
         log.warning(
-            "CPU temperature %.1f C exceeds safety limit %.1f C — stopping test",
+            "CPU temperature %.1f C exceeds safety limit %.1f C - stopping test",
             temperature,
             self.config.max_temperature,
         )
@@ -222,6 +250,7 @@ class CoreScheduler:
         return Lane(
             core_id=core_id,
             cpus=tuple(core_info.logical_cpus[: self._requested_threads]),
+            sibling_cpus=tuple(core_info.logical_cpus),
             work_dir=self.work_dir / f"core_{core_id}",
         )
 
@@ -246,6 +275,7 @@ class CoreScheduler:
 
         passed = True
         error_msg = None
+        error_type = verdict.error_type if verdict is not None else None
         if verdict is None:
             status.state = "pending"
             status.current_phase = ""
@@ -260,10 +290,11 @@ class CoreScheduler:
                 self._stop_event.set()
 
         if passed and self.config.variable_load and self.config.duty_cycle is None and not self._stop_event.is_set():
-            var_passed, var_error = self._run_variable_load(lane, self.config.seconds_per_core / 3.0)
+            var_passed, var_error, var_error_type = self._run_variable_load(lane, self.config.seconds_per_core / 3.0)
             if not var_passed:
                 passed = False
                 error_msg = var_error
+                error_type = var_error_type
                 status.errors += 1
                 status.last_error = error_msg
 
@@ -272,7 +303,7 @@ class CoreScheduler:
             if idle_error:
                 passed = False
                 error_msg = idle_error
-
+                error_type = self._classify_error(idle_error)
         if passed and self._stop_event.is_set() and (self.config.variable_load or self.config.idle_stability_test > 0):
             status.state = "pending"
             status.current_phase = ""
@@ -290,7 +321,7 @@ class CoreScheduler:
             passed=passed,
             duration_seconds=elapsed,
             error_message=error_msg,
-            error_type=self._classify_error(error_msg) if error_msg else None,
+            error_type=error_type,
             iterations_completed=status.iterations,
         )
         self.results[core_id].append(result)
@@ -298,7 +329,7 @@ class CoreScheduler:
             cb(core_id, result)
         self.backend.cleanup(lane.work_dir, preserve_on_error=not passed)
 
-    def _run_variable_load(self, lane: Lane, total_duration: float) -> tuple[bool, str | None]:
+    def _run_variable_load(self, lane: Lane, total_duration: float) -> tuple[bool, str | None, str | None]:
         self._set_phase(lane.core_id, "variable load")
         supervisor = self._supervisor("variable load")
         start = time.monotonic()
@@ -311,14 +342,15 @@ class CoreScheduler:
                 verdict = supervisor.run([lane], lambda _lane: self.stress_config, segment)[lane.core_id]
                 if verdict is None:
                     self._stop_event.set()
-                    return True, None
+                    return True, None, None
                 if not verdict.passed:
                     if self.config.stop_on_error:
                         self._stop_event.set()
-                    return False, verdict.error_message
+                    return False, verdict.error_message, verdict.error_type
             else:
                 idle_error = execution.watch_idle(
                     cpus=lane.cpus,
+                    sibling_cpus=lane.sibling_cpus,
                     duration=segment,
                     thermal=self._thermal or self._new_thermal(),
                     detector=self.detector,
@@ -329,12 +361,12 @@ class CoreScheduler:
                 if idle_error:
                     if self.config.stop_on_error:
                         self._stop_event.set()
-                    return False, idle_error
+                    return False, idle_error, self._classify_error(idle_error)
             load_on = not load_on
             status = self.core_status.get(lane.core_id)
             if status:
                 status.elapsed_seconds = time.monotonic() - start
-        return True, None
+        return True, None, None
 
     def _idle_phase(self, core_id: int, duration: float, phase_name: str) -> str | None:
         self._set_phase(core_id, phase_name)
@@ -342,7 +374,7 @@ class CoreScheduler:
         cpus = tuple(core_info.logical_cpus) if core_info else ()
         error = execution.watch_idle(
             cpus=cpus,
-            duration=duration,
+            sibling_cpus=cpus,
             thermal=self._thermal or self._new_thermal(),
             detector=self.detector,
             stop_event=self._stop_event,
@@ -378,16 +410,23 @@ class CoreScheduler:
         core_work_dir = self.work_dir / "rapid_transition"
         core_work_dir.mkdir(parents=True, exist_ok=True)
         logical_ids = []
+        sibling_ids = []
         for c in cores:
             core_info = self.topology.cores.get(c)
             if core_info and core_info.logical_cpus:
                 logical_ids.append(core_info.logical_cpus[0])
+                sibling_ids.extend(core_info.logical_cpus)
         if not logical_ids:
             self.state = TestState.FINISHED
             return StressResult(
                 core_id, False, 0.0, "Rapid transition harness error: no requested core is in the topology", "startup"
             )
-        lane = Lane(core_id=core_id, cpus=tuple(sorted(logical_ids)), work_dir=core_work_dir)
+        lane = Lane(
+            core_id=core_id,
+            cpus=tuple(sorted(logical_ids)),
+            sibling_cpus=tuple(sorted(sibling_ids)),
+            work_dir=core_work_dir,
+        )
         elapsed = 0.0
         cycle = 0
         try:
@@ -416,6 +455,7 @@ class CoreScheduler:
                     segment_start = time.monotonic()
                     idle_error = execution.watch_idle(
                         cpus=lane.cpus,
+                        sibling_cpus=lane.sibling_cpus,
                         duration=min(idle_seconds, total_duration - elapsed),
                         thermal=self._thermal,
                         detector=self.detector,

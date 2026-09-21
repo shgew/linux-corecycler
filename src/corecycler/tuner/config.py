@@ -1,4 +1,4 @@
-"""Tuner configuration — all search parameters with best-practice defaults."""
+"""Tuner configuration - all search parameters with best-practice defaults."""
 
 from __future__ import annotations
 
@@ -7,7 +7,52 @@ import json
 import math
 from dataclasses import asdict, dataclass
 
+from corecycler.engine.backends.base import FFTPreset, StressMode
 from corecycler.tuner import regime
+
+FIELD_BOUNDS: dict[str, tuple[int | float, int | float]] = {
+    "start_offset": (-50, 30),
+    "coarse_step": (1, 15),
+    "fine_step": (1, 5),
+    "direction": (-1, 1),
+    "bios_guard_band_steps": (0, 10),
+    "search_duration_seconds": (10, 600),
+    "confirm_duration_seconds": (30, 1800),
+    "validate_duration_seconds": (30, 3600),
+    "max_offset": (-50, 30),
+    "max_confirm_retries": (0, 5),
+    "stretch_threshold_pct": (0, 100),
+    "midpoint_jump_threshold": (1, 100),
+    "abort_on_consecutive_failures": (0, 100),
+    "apparatus_failure_streak": (0, 100),
+    "resume_crash_quarantine_threshold": (1, 20),
+    "max_unattributed_crash_hunts": (1, 10),
+    "max_temperature_c": (60, 110),
+    "over_temp_grace_seconds": (0, 60),
+    "over_temp_hard_margin_c": (0, 30),
+    "max_thermal_retries": (0, 20),
+    "thermal_cooldown_seconds": (0, 3600),
+    "max_apparatus_retries": (0, 20),
+    "backoff_preconfirm_multiplier": (0.01, 100),
+    "regime_floor_pct": (0.01, 25),
+    "control_run_confirmations": (1, 10),
+    "probe_base_seconds": (60, 86400),
+    "probe_mttf_multiplier": (0.01, 100),
+    "probe_level_multiplier": (1, 10),
+    "probe_final_multiplier": (1, 100),
+    "suspicion_separation": (1, 100),
+    "suspicion_min_failures": (1, 100),
+    "anneal_bank_hours": (0.01, 8760),
+    "anneal_max_strikes": (1, 10),
+    "max_core_time_seconds": (1800, 14400),
+    "crash_penalty_steps": (1, 10),
+    "spectrum_slot_seconds": (30, 600),
+    "soak_duration_seconds": (60, 14400),
+    "endurance_slot_seconds": (60, 14400),
+    "endurance_slot_max_seconds": (60, 14400),
+}
+
+TEST_ORDERS: tuple[str, ...] = ("sequential", "round_robin", "weakest_first", "ccd_alternating", "ccd_round_robin")
 
 
 def _json_value_ok(default: object, value: object) -> bool:
@@ -47,7 +92,7 @@ class TunerConfig:
     coarse_step: int = 5
     fine_step: int = 1
     direction: int = -1  # -1 = negative (undervolting), +1 = positive
-
+    bios_guard_band_steps: int = 1
     # Test durations (seconds)
     search_duration_seconds: int = 60
     confirm_duration_seconds: int = 300
@@ -80,12 +125,9 @@ class TunerConfig:
     # the session instead of re-applying a profile that keeps crashing the machine.
     resume_crash_quarantine_threshold: int = 3
 
-    # Crash hunt (evidence-based attribution). When a hard crash cannot be
-    # attributed - no kernel MCE trace and multiple cores held offsets - the
-    # tuner never guesses a culprit: it runs isolated per-core hunts
-    # (candidate at its tuned value, every other core at stock) under
-    # variable/idle load. Repeated fruitless hunts pause the session for the
-    # user instead of continuing blind.
+    # Crash hunts control-probe stock, bisect reproducing groups, then confirm
+    # each suspect by removing it from the original live candidate universe.
+    # Repeated fruitless hunts pause instead of guessing a culprit.
     max_unattributed_crash_hunts: int = 2
 
     # Fail closed when no CPU temperature sensor is readable: refuse to drive a
@@ -132,7 +174,7 @@ class TunerConfig:
     # reproduce this many times at stock before we call it a platform fault.
     control_run_confirmations: int = 2
     # Probe budget: max(base, mttf_multiplier x observed time-to-failure),
-    # grown per bisection level and again for the final single-core check,
+    # grown per bisection level and again for final leave-one-out confirmation,
     # because a false clean near the leaves costs the whole answer.
     probe_base_seconds: int = 1800
     probe_mttf_multiplier: float = 4.0
@@ -158,7 +200,7 @@ class TunerConfig:
     validate_transitions: bool = True
 
     # S5 per-core light-load spectrum slots (all offsets live): max-boost
-    # bursts, load transitions and idle watch — the load class that exposes
+    # bursts, load transitions and idle watch - the load class that exposes
     # marginality sustained stress cannot reach.
     validate_spectrum: bool = True
     spectrum_slot_seconds: int = 60
@@ -202,8 +244,8 @@ class TunerConfig:
             raise ValueError("; ".join(errors))
         return config
 
-    def validate(self) -> list[str]:
-        """Return list of validation errors, empty if config is valid."""
+    def validate(self, co_range: tuple[int, int] | None = None) -> list[str]:
+        """Return every configuration error without silently changing requested values."""
         defaults = type(self)()
         if not isinstance(self.coarse_regimes, list):
             return ["coarse_regimes must be a list of regime names"]
@@ -214,14 +256,31 @@ class TunerConfig:
         ]
         if errors:
             return errors
+
+        for name, (minimum, maximum) in FIELD_BOUNDS.items():
+            value = getattr(self, name)
+            if not minimum <= value <= maximum:
+                errors.append(f"{name} must be {minimum:g}-{maximum:g}")
         if self.direction not in (-1, 1):
             errors.append(f"direction must be -1 or 1, got {self.direction}")
-        if self.coarse_step < 1:
-            errors.append(f"coarse_step must be >= 1, got {self.coarse_step}")
-        if self.fine_step < 1:
-            errors.append(f"fine_step must be >= 1, got {self.fine_step}")
         if self.fine_step > self.coarse_step:
             errors.append(f"fine_step ({self.fine_step}) must be <= coarse_step ({self.coarse_step})")
+        if self.direction * (self.max_offset - self.start_offset) <= 0:
+            errors.append("max_offset must lie beyond start_offset in the configured direction")
+        if co_range is not None:
+            minimum, maximum = co_range
+            for name in ("start_offset", "max_offset"):
+                value = getattr(self, name)
+                if not minimum <= value <= maximum:
+                    errors.append(f"{name} must be within the detected CO range {minimum}-{maximum}")
+
+        if self.test_order not in TEST_ORDERS:
+            errors.append(f"test_order must be one of {list(TEST_ORDERS)}")
+        if self.stress_mode not in StressMode.__members__:
+            errors.append(f"stress_mode must be one of {sorted(StressMode.__members__)}")
+        if self.fft_preset not in FFTPreset.__members__:
+            errors.append(f"fft_preset must be one of {sorted(FFTPreset.__members__)}")
+
         if self.cores_to_test is not None:
             if not self.cores_to_test:
                 errors.append("cores_to_test is empty - no cores to test")
@@ -229,38 +288,23 @@ class TunerConfig:
                 errors.append("cores_to_test must contain non-negative integer core IDs")
             elif len(set(self.cores_to_test)) != len(self.cores_to_test):
                 errors.append("cores_to_test contains duplicate core IDs")
-        if self.search_duration_seconds < 1:
-            errors.append("search_duration_seconds must be >= 1")
-        if self.confirm_duration_seconds < 1:
-            errors.append("confirm_duration_seconds must be >= 1")
-        if not 1 <= self.crash_penalty_steps <= 10:
-            errors.append("crash_penalty_steps must be 1-10")
-        if not 1 <= self.resume_crash_quarantine_threshold <= 20:
-            errors.append("resume_crash_quarantine_threshold must be 1-20")
-        if not 30 <= self.spectrum_slot_seconds <= 600:
-            errors.append("spectrum_slot_seconds must be 30-600")
-        if not 60 <= self.soak_duration_seconds <= 14400:
-            errors.append("soak_duration_seconds must be 60-14400")
-        if not 1 <= self.max_unattributed_crash_hunts <= 10:
-            errors.append("max_unattributed_crash_hunts must be 1-10")
-        if not 0 <= self.apparatus_failure_streak <= 100:
-            errors.append("apparatus_failure_streak must be 0-100 (0 disables)")
         if 0 < self.apparatus_failure_streak <= self.max_confirm_retries:
             errors.append(
                 "apparatus_failure_streak must exceed max_confirm_retries (legitimate confirm retries would trip it)"
             )
-        if not 1800 <= self.max_core_time_seconds <= 14400:
-            errors.append("max_core_time_seconds must be 1800-14400")
+
+        battery_errors: list[str] = []
         for i, entry in enumerate(self.battery):
-            errors.extend(_workload_errors("battery", i, entry))
-        if not errors and not self.battery:
+            battery_errors.extend(_workload_errors("battery", i, entry))
+        errors.extend(battery_errors)
+        if not self.battery:
             errors.append("battery must have at least one workload")
-        if not errors:
+        elif not battery_errors:
             covered = regime.regimes_covered(self.battery)
-            missing = sorted(str(r) for r in regime.Regime if r not in covered)
+            missing = sorted(str(item) for item in regime.Regime if item not in covered)
             if missing:
                 errors.append(f"battery does not cover regimes: {', '.join(missing)}")
-            valid_regimes = {str(r) for r in regime.Regime}
+            valid_regimes = {str(item) for item in regime.Regime}
             if not self.coarse_regimes:
                 errors.append("coarse_regimes must name at least one regime")
             else:
@@ -272,63 +316,20 @@ class TunerConfig:
                 for i in invalid_coarse:
                     errors.append(f"coarse_regimes[{i}] must be one of {sorted(valid_regimes)}")
                 if not invalid_coarse:
-                    missing_coarse = sorted(set(self.coarse_regimes) - {str(r) for r in covered})
+                    if len(set(self.coarse_regimes)) != len(self.coarse_regimes):
+                        errors.append("coarse_regimes contains duplicate regimes")
+                    missing_coarse = sorted(set(self.coarse_regimes) - {str(item) for item in covered})
                     if missing_coarse:
                         errors.append(f"coarse_regimes not present in battery: {', '.join(missing_coarse)}")
-        if not 0 < self.regime_floor_pct <= 100 / len(regime.Regime):
-            errors.append(f"regime_floor_pct must be 0-{100 / len(regime.Regime):.0f}")
-        if not 1 <= self.control_run_confirmations <= 10:
-            errors.append("control_run_confirmations must be 1-10")
-        if not 60 <= self.probe_base_seconds <= 86400:
-            errors.append("probe_base_seconds must be 60-86400")
-        if self.probe_mttf_multiplier <= 0:
-            errors.append("probe_mttf_multiplier must be > 0")
-        if self.probe_level_multiplier < 1:
-            errors.append("probe_level_multiplier must be >= 1")
-        if self.probe_final_multiplier < 1:
-            errors.append("probe_final_multiplier must be >= 1")
-        if self.suspicion_separation < 1:
-            errors.append("suspicion_separation must be >= 1")
-        if self.suspicion_min_failures < 1:
-            errors.append("suspicion_min_failures must be >= 1")
-        if self.anneal_bank_hours <= 0:
-            errors.append("anneal_bank_hours must be > 0")
-        if not 1 <= self.anneal_max_strikes <= 10:
-            errors.append("anneal_max_strikes must be 1-10")
+
         for i, workload in enumerate(self.endurance_workloads):
             errors.extend(_workload_errors("endurance_workloads", i, workload))
         if self.endurance and not self.auto_validate:
             errors.append("endurance requires auto_validate")
         if self.endurance and not self.endurance_workloads:
             errors.append("endurance requires at least one endurance_workloads entry")
-        if not 60 <= self.endurance_slot_seconds <= 14400:
-            errors.append("endurance_slot_seconds must be 60-14400")
-        if not self.endurance_slot_seconds <= self.endurance_slot_max_seconds <= 14400:
-            errors.append("endurance_slot_max_seconds must be endurance_slot_seconds-14400")
-        if not 60 <= self.max_temperature_c <= 110:
-            errors.append(f"max_temperature_c must be 60-110, got {self.max_temperature_c}")
-        if self.over_temp_grace_seconds < 0:
-            errors.append("over_temp_grace_seconds must be >= 0")
-        if self.over_temp_hard_margin_c < 0:
-            errors.append("over_temp_hard_margin_c must be >= 0")
-        if self.max_thermal_retries < 0:
-            errors.append("max_thermal_retries must be >= 0")
-        if self.max_apparatus_retries < 0:
-            errors.append("max_apparatus_retries must be >= 0")
-        if self.thermal_cooldown_seconds < 0:
-            errors.append("thermal_cooldown_seconds must be >= 0")
-        if self.validate_duration_seconds < 1:
-            errors.append("validate_duration_seconds must be >= 1")
-        if self.max_confirm_retries < 0:
-            errors.append("max_confirm_retries must be >= 0")
-        if self.midpoint_jump_threshold < 1:
-            errors.append("midpoint_jump_threshold must be >= 1")
-        if self.abort_on_consecutive_failures < 0:
-            errors.append("abort_on_consecutive_failures must be >= 0")
-        if self.backoff_preconfirm_multiplier <= 0:
-            errors.append("backoff_preconfirm_multiplier must be > 0")
-        if self.stretch_threshold_pct < 0:
-            errors.append("stretch_threshold_pct must be >= 0")
+        if self.endurance_slot_max_seconds < self.endurance_slot_seconds:
+            errors.append("endurance_slot_max_seconds must be >= endurance_slot_seconds")
         return errors
 
     def clamp_max_offset(self, co_range: tuple[int, int]) -> None:

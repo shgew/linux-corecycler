@@ -22,7 +22,7 @@ def _qapp():
 def _topo(cores: int = 4) -> CPUTopology:
     topo = CPUTopology(model_name="Test", family=26, model=0x44, physical_cores=cores, ccds=1)
     for cid in range(cores):
-        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, ccx=None, logical_cpus=(cid,))
+        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, logical_cpus=(cid,))
     return topo
 
 
@@ -41,10 +41,11 @@ def tab(monkeypatch):
 def _smu(**kw):
     smu = MagicMock()
     smu.get_co_offset.return_value = kw.get("get", -10)
+    smu.dry_run = kw.get("dry_run", False)
     smu.set_co_offset.return_value = kw.get("set", True)
     smu.reset_all_co.return_value = kw.get("reset", True)
     smu.has_backup.return_value = kw.get("has_backup", True)
-    smu.backup_co_offsets.return_value = kw.get("backup", {0: -10, 1: -5})
+    smu.backup_co_offsets.return_value = kw.get("backup", {cid: -10 for cid in range(4)})
     smu.restore_co_offsets.return_value = kw.get("restore", (True, []))
     return smu
 
@@ -96,11 +97,11 @@ class TestApplySingle:
         tab._apply_single(0)
         tab._smu.set_co_offset.assert_not_called()
 
-    def test_successful_write_updates_table(self, tab):
-        tab._smu = _smu(set=True)
+    def test_successful_write_rereads_hardware_value(self, tab):
+        tab._smu = _smu(set=True, get=-14)
         tab._spinboxes[0].setValue(-15)
         tab._apply_single(0)
-        assert tab._table.item(0, 2).text() == "-15"
+        assert tab._table.item(0, 2).text() == "-14"
 
     def test_failed_write_warns(self, tab):
         tab._smu = _smu(set=False)
@@ -145,24 +146,20 @@ class TestApplyAllAndReset:
         tab._smu = _smu()
         tab._tuner_active = True
         tab._reset_all_co()
-        tab._smu.reset_all_co.assert_not_called()
+        tab._smu.set_co_offset.assert_not_called()
 
     def test_reset_declined(self, tab, monkeypatch):
         tab._smu = _smu()
         monkeypatch.setattr(tab, "_confirm_co_write", lambda _d: False)
         tab._reset_all_co()
-        tab._smu.reset_all_co.assert_not_called()
-
-    def test_reset_uses_bulk_command(self, tab):
-        tab._smu = _smu(reset=True)
-        tab._reset_all_co()
-        tab._smu.reset_all_co.assert_called_once()
         tab._smu.set_co_offset.assert_not_called()
 
-    def test_reset_falls_back_to_per_core_writes(self, tab):
-        tab._smu = _smu(reset=False)
+    def test_reset_writes_zero_through_the_transaction(self, tab):
+        tab._smu = _smu(set=True)
         tab._reset_all_co()
-        assert tab._smu.set_co_offset.call_count == len(tab._spinboxes)
+        assert [call.args for call in tab._smu.set_co_offset.call_args_list] == [
+            (core_id, 0) for core_id in tab._spinboxes
+        ]
 
 
 class TestBackupRestore:
@@ -182,16 +179,139 @@ class TestBackupRestore:
 
     def test_restore_declined(self, tab, monkeypatch):
         tab._smu = _smu()
+        tab._co_backup = {core_id: -10 for core_id in tab._spinboxes}
         monkeypatch.setattr(tab, "_confirm_co_write", lambda _d: False)
         tab._restore_co()
-        tab._smu.restore_co_offsets.assert_not_called()
-
-    def test_restore_success_rereads(self, tab):
-        tab._smu = _smu(restore=(True, []))
-        tab._restore_co()
-        tab._smu.restore_co_offsets.assert_called_once()
+        tab._smu.set_co_offset.assert_not_called()
 
     def test_restore_partial_failure_still_rereads(self, tab):
-        tab._smu = _smu(restore=(False, [1]))
+        tab._smu = _smu(set=False)
+        tab._co_backup = {core_id: -10 for core_id in tab._spinboxes}
         tab._restore_co()
         tab._smu.get_co_offset.assert_called()
+
+
+class _OrderedSMU:
+    def __init__(self, backup: dict[int, int], *, dry_run: bool = False) -> None:
+        self.backup = backup
+        self.dry_run = dry_run
+        self.events: list[str] = []
+        self.writes: list[tuple[int, int]] = []
+
+    def backup_co_offsets(self, num_cores: int) -> dict[int, int]:
+        self.events.append("backup")
+        return dict(self.backup)
+
+    def set_co_offset(self, core_id: int, offset: int) -> bool:
+        self.events.append(f"write:{core_id}")
+        self.writes.append((core_id, offset))
+        return True
+
+    def is_available(self) -> bool:
+        return True
+
+    def get_co_offset(self, core_id: int) -> int:
+        return self.backup[core_id]
+
+    def has_backup(self) -> bool:
+        return True
+
+
+class TestCompleteWriteTransaction:
+    def test_apply_all_backs_up_all_16_cores_before_exact_plan(self, tab, monkeypatch):
+        tab.set_topology(_topo(16))
+        smu = _OrderedSMU({cid: -20 + cid for cid in range(16)})
+        tab._smu = smu
+        plans: list[str] = []
+        monkeypatch.setattr(tab, "_confirm_co_write", lambda plan: plans.append(plan) or True)
+        for cid, spin in tab._spinboxes.items():
+            spin.setValue(-cid)
+
+        tab._apply_all_co()
+
+        expected = [(cid, -cid) for cid in range(16)]
+        assert smu.events == ["backup", *(f"write:{cid}" for cid in range(16))]
+        assert smu.writes == expected
+        assert plans == ["Apply CO offsets to all cores:\n" + ", ".join(f"C{cid}={offset}" for cid, offset in expected)]
+
+    def test_incomplete_backup_aborts_without_replacing_complete_snapshot(self, tab, monkeypatch):
+        tab.set_topology(_topo(16))
+        complete = {cid: -10 for cid in range(16)}
+        smu = _OrderedSMU(complete)
+        tab._smu = smu
+        monkeypatch.setattr(tab, "_confirm_co_write", lambda _plan: True)
+        tab._apply_single(0)
+        assert tab._co_backup == complete
+
+        smu.backup = {cid: -5 for cid in range(15)}
+        smu.events.clear()
+        smu.writes.clear()
+        tab._apply_single(1)
+
+        assert smu.events == ["backup"]
+        assert smu.writes == []
+        assert tab._co_backup == complete
+
+    def test_dry_run_leaves_current_value_and_does_not_call_driver_write(self, tab, monkeypatch):
+        smu = _OrderedSMU({cid: -10 for cid in range(4)}, dry_run=True)
+        tab._smu = smu
+        monkeypatch.setattr(tab, "_confirm_co_write", lambda _plan: True)
+        tab._table.item(0, 2).setText("-7")
+        tab._spinboxes[0].setValue(-20)
+
+        tab._apply_single(0)
+
+        assert smu.events == []
+        assert tab._table.item(0, 2).text() == "-7"
+
+    def test_restore_confirmation_contains_exact_saved_plan(self, tab, monkeypatch):
+        backup = {cid: -10 - cid for cid in range(4)}
+        smu = _OrderedSMU(backup)
+        tab._smu = smu
+        tab._co_backup = backup
+        plans: list[str] = []
+        monkeypatch.setattr(tab, "_confirm_co_write", lambda plan: plans.append(plan) or True)
+
+        tab._restore_co()
+
+        assert plans == [
+            "Restore CO offsets from backup:\n" + ", ".join(f"C{cid}={value}" for cid, value in backup.items())
+        ]
+        assert smu.writes == list(backup.items())
+
+
+class TestTransactionOwnershipEdges:
+    def test_backup_helper_refuses_without_a_driver_or_topology(self, tab):
+        tab._smu = None
+        assert tab._take_complete_backup() is False
+
+    def test_tuner_takeover_during_backup_aborts_before_first_write(self, tab, monkeypatch):
+        tab.set_topology(_topo(16))
+        smu = _OrderedSMU({cid: -10 for cid in range(16)})
+        tab._smu = smu
+        monkeypatch.setattr(tab, "_confirm_co_write", lambda _plan: True)
+        backup = smu.backup_co_offsets
+
+        def take_over(num_cores):
+            snapshot = backup(num_cores)
+            tab.set_tuner_running(True)
+            return snapshot
+
+        smu.backup_co_offsets = take_over
+        tab._apply_single(0)
+
+        assert tab._tuner_active is True
+        assert smu.events == ["backup"]
+        assert smu.writes == []
+
+    def test_restore_refuses_while_tuner_owns_driver(self, tab):
+        backup = {cid: -10 for cid in range(4)}
+        smu = _OrderedSMU(backup)
+        tab._smu = smu
+        tab._co_backup = backup
+        tab.set_tuner_running(True)
+
+        tab._restore_co()
+
+        assert smu.events == []
+        assert smu.writes == []

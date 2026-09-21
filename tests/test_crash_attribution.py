@@ -18,6 +18,7 @@ from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine, _pick_report
 from corecycler.tuner.state import CoreState, TunerPhase
+from tests.silicon import complete_context
 
 # Real kernel MCE line shape (kernel: prefix stripped).
 CPU5_CORRECTED = (
@@ -43,6 +44,15 @@ class FakeSMU:
 
     def get_co_offset(self, core_id: int) -> int:
         return self.written.get(core_id, 0)
+
+    def get_all_co_offsets(self, num_cores: int) -> dict[int, int]:
+        return {core_id: self.get_co_offset(core_id) for core_id in range(num_cores)}
+
+    def get_pbo_scalar(self) -> float:
+        return 1.0
+
+    def get_boost_limit(self) -> int:
+        return 5500
 
 
 def _event(cpu: int, corrected: bool = True) -> MCEEvent:
@@ -72,7 +82,8 @@ def _make_engine(db, topo, mock_backend, **cfg_kwargs):
         backend=mock_backend,
         config=cfg,
     )
-    eng._session_id = tp.create_session(db, cfg, "", "")
+    context_id = complete_context(db, topo, eng._smu)
+    eng._session_id = db.create_tuner_session(cfg.to_json(), "Test BIOS", topo.model_name, context_id)
     return eng
 
 
@@ -93,10 +104,10 @@ def _seed_confirmed_validating(eng, db, best: dict[int, int], baselines: dict[in
             in_test=True,
         )
         eng._core_states[core_id] = cs
-        tp.save_core_state(db, sid, cs)
+        db.upsert_tuner_core_state(sid, cs)
         db.journal_co_intent(sid, core_id, offset, survived=True)
     db.update_tuner_session_status(sid, "validating")
-    return tp.get_session(db, sid)
+    return db.get_tuner_session(sid)
 
 
 BEST = {0: -41, 1: -37, 2: -36, 3: -43, 4: -42, 5: -30, 6: -41, 7: -50}
@@ -191,10 +202,9 @@ class TestForensicAttribution:
             in_test=True,
         )
         eng._core_states = {0: cs}
-        tp.save_core_state(db, eng._session_id, cs)
+        db.upsert_tuner_core_state(eng._session_id, cs)
         db.update_tuner_session_status(eng._session_id, "validating")
-        db.set_hunting_core(eng._session_id, 0)
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         outside_cpu = topo_dual_ccd_x3d.cores[1].logical_cpus[0]
         eng._forensics = lambda since, timeout=15.0, **kwargs: ([_event(outside_cpu)], True)
 
@@ -220,12 +230,11 @@ class TestForensicAttribution:
             for core in (0, 1)
         }
         for cs in eng._core_states.values():
-            tp.save_core_state(db, eng._session_id, cs)
+            db.upsert_tuner_core_state(eng._session_id, cs)
         db.journal_co_intent(eng._session_id, 0, BEST[0], survived=True)
         db.journal_co_intent(eng._session_id, 1, 0, survived=True)
         db.update_tuner_session_status(eng._session_id, "validating")
-        db.set_hunting_core(eng._session_id, 0)
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         stock_cpu = topo_dual_ccd_x3d.cores[1].logical_cpus[0]
         eng._forensics = lambda since, timeout=15.0, **kwargs: ([_event(stock_cpu)], True)
 
@@ -250,9 +259,9 @@ class TestForensicAttribution:
             ),
         }
         for cs in eng._core_states.values():
-            tp.save_core_state(db, eng._session_id, cs)
+            db.upsert_tuner_core_state(eng._session_id, cs)
             db.journal_co_intent(eng._session_id, cs.core_id, cs.current_offset, survived=True)
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         eng._forensics = lambda since, timeout=15.0, **kwargs: ([], True)
 
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
@@ -268,9 +277,9 @@ class TestForensicAttribution:
         stock = CoreState(core_id=3, phase=TunerPhase.COARSE_SEARCH, current_offset=0)
         eng._core_states = {2: tested, 3: stock}
         for cs in eng._core_states.values():
-            tp.save_core_state(db, eng._session_id, cs)
+            db.upsert_tuner_core_state(eng._session_id, cs)
             db.journal_co_intent(eng._session_id, cs.core_id, cs.current_offset, survived=True)
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         eng._forensics = lambda since, timeout=15.0, **kwargs: ([], True)
 
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
@@ -289,11 +298,11 @@ class TestCrashHunt:
         state.vector = dict(BEST)
         state.workload = eng._workload_snapshot(eng._core_states[5])
         state.armed = True
-        tp.set_hunt_state(db, eng._session_id, state.to_json())
-        tp.update_session_status(db, eng._session_id, "hunting")
+        db.set_hunt_state(eng._session_id, state.to_json())
+        db.update_tuner_session_status(eng._session_id, "hunting")
         for core_id in BEST:
             db.journal_co_intent(eng._session_id, core_id, 0, survived=True)
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         eng._forensics = lambda *args, **kwargs: pytest.fail("hunt probes own their crash verdict")
 
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
@@ -323,13 +332,13 @@ class TestCrashHunt:
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         cs = CoreState(core_id=5, phase=TunerPhase.COARSE_SEARCH, current_offset=-20, baseline_offset=0)
         eng._core_states = {5: cs}
-        tp.save_core_state(db, eng._session_id, cs)
-        tp.set_resume_crash_streak(db, eng._session_id, 2)
+        db.upsert_tuner_core_state(eng._session_id, cs)
+        db.set_resume_crash_streak(eng._session_id, 2)
         eng._run_next = lambda: None
 
         eng._on_test_finished(5, True, "", "", 60.0, 0.0)
 
-        assert tp.get_resume_crash_streak(db, eng._session_id) == 0
+        assert db.get_resume_crash_streak(eng._session_id) == 0
 
     @pytest.mark.parametrize(
         ("error_type", "message", "events"),
@@ -356,7 +365,7 @@ class TestCrashHunt:
     ):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         _seed_confirmed_validating(eng, db, BEST, BASELINES)
-        tp.set_resume_crash_streak(db, eng._session_id, 3)
+        db.set_resume_crash_streak(eng._session_id, 3)
         learned = {c: (cs.current_offset, cs.best_offset) for c, cs in eng._core_states.items()}
         monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
         eng._start_worker = lambda *a, **k: None
@@ -365,7 +374,7 @@ class TestCrashHunt:
         eng._start_hunt(loaded=[5])
         eng._on_test_finished(5, False, message, error_type, 60.0, 0.0, events)
 
-        assert tp.get_resume_crash_streak(db, eng._session_id) == 3
+        assert db.get_resume_crash_streak(eng._session_id) == 3
         assert {c: (cs.current_offset, cs.best_offset) for c, cs in eng._core_states.items()} == learned
 
     def test_passing_probes_and_exhausted_hunt_preserve_crash_streak_and_learned_offsets(
@@ -379,7 +388,7 @@ class TestCrashHunt:
             suspicion_min_failures=99,
         )
         _seed_confirmed_validating(eng, db, BEST, BASELINES)
-        tp.set_resume_crash_streak(db, eng._session_id, 3)
+        db.set_resume_crash_streak(eng._session_id, 3)
         learned = {c: (cs.current_offset, cs.best_offset) for c, cs in eng._core_states.items()}
         monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
         eng._start_worker = lambda *a, **k: None
@@ -388,7 +397,7 @@ class TestCrashHunt:
         eng._start_hunt(loaded=[5])
         eng._on_test_finished(5, True, "", "", 60.0, 0.0)
 
-        assert tp.get_resume_crash_streak(db, eng._session_id) == 3
+        assert db.get_resume_crash_streak(eng._session_id) == 3
         assert {c: (cs.current_offset, cs.best_offset) for c, cs in eng._core_states.items()} == learned
 
         while eng._hunt is not None:
@@ -396,7 +405,7 @@ class TestCrashHunt:
             if eng._hunt is not None:
                 eng._on_test_finished(5, True, "", "", 60.0, 0.0)
 
-        assert tp.get_resume_crash_streak(db, eng._session_id) == 3
+        assert db.get_resume_crash_streak(eng._session_id) == 3
         assert {c: (cs.current_offset, cs.best_offset) for c, cs in eng._core_states.items()} == learned
 
     def test_completed_hunt_probe_then_reboot_is_not_another_reproduction(
@@ -413,7 +422,7 @@ class TestCrashHunt:
 
         eng._on_test_finished(5, True, "", "", 60.0, 0.0)
 
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         completed = bisect.HuntState.from_json(session.hunt_state)
         assert completed is not None
         assert completed.armed is False
@@ -468,7 +477,7 @@ class TestForeignMceEvidence:
         assert cs.best_offset == -29
         assert cs.phase == TunerPhase.BACKOFF_PRECONFIRM  # must re-earn
         assert cs.crash_count == 0  # a warning, not a crash
-        rows = tp.get_test_log(db, eng._session_id, core_id=5)
+        rows = db.get_tuner_test_log(eng._session_id, core_id=5)
         assert any(r["phase"] == "mce_evidence" and r["error_type"] == "mce" for r in rows)
 
     def test_uncorrected_evidence_gets_crash_grade_penalty(self, db, topo_dual_ccd_x3d, mock_backend):
@@ -501,7 +510,7 @@ class TestForeignMceEvidence:
         cs = eng._core_states[4]
         assert cs.best_offset == before
         assert cs.phase == TunerPhase.CONFIRMED
-        rows = tp.get_test_log(db, eng._session_id, core_id=4)
+        rows = db.get_tuner_test_log(eng._session_id, core_id=4)
         assert any(r["phase"] == "mce_evidence" for r in rows)  # recorded, loudly
 
     def test_survival_marking_excludes_named_cores(self, db):
@@ -559,7 +568,7 @@ class TestDriftAgainstJournal:
         _seed_confirmed_validating(eng, db, BEST, BASELINES)
         for cs in eng._core_states.values():
             cs.in_test = False
-            tp.save_core_state(db, eng._session_id, cs)
+            db.upsert_tuner_core_state(eng._session_id, cs)
         for core_id, offset in BEST.items():
             eng._smu.written[core_id] = offset  # SMU == tuner's last write
         monkeypatch.setattr(engine_mod, "_rebooted_since", lambda *a, **k: False)
@@ -578,7 +587,7 @@ class TestDriftAgainstJournal:
         _seed_confirmed_validating(eng, db, BEST, BASELINES)
         for cs in eng._core_states.values():
             cs.in_test = False
-            tp.save_core_state(db, eng._session_id, cs)
+            db.upsert_tuner_core_state(eng._session_id, cs)
         for core_id, offset in BEST.items():
             eng._smu.written[core_id] = offset
         eng._smu.written[3] = -10  # someone changed core 3 behind our back
@@ -598,7 +607,7 @@ class TestNarrativePersistence:
     def test_log_messages_become_durable_events(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         eng.log_message.emit("the story survives the terminal")
-        events = tp.get_events(db, eng._session_id)
+        events = db.get_tuner_events(eng._session_id)
         assert [e["message"] for e in events] == ["the story survives the terminal"]
 
     def test_narrative_without_session_is_dropped(self, db, topo_dual_ccd_x3d, mock_backend):
@@ -641,7 +650,7 @@ class TestUnattributedMcePayload:
         sid = eng._session_id
         cs = CoreState(core_id=0, phase=TunerPhase.CONFIRMING, current_offset=-20, best_offset=-20, baseline_offset=0)
         eng._core_states = {0: cs}
-        tp.save_core_state(db, sid, cs)
+        db.upsert_tuner_core_state(sid, cs)
         eng._co_applied[0] = -20
         db.journal_co_intent(sid, 0, -20, survived=False)
         calls = []
@@ -660,26 +669,6 @@ class TestUnattributedMcePayload:
 
 
 class TestResumeHuntAttribution:
-    def test_an_in_flight_isolated_slot_penalizes_its_proven_culprit(self, db, topo_dual_ccd_x3d, mock_backend):
-        engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
-        _seed_confirmed_validating(engine, db, BEST, BASELINES)
-        for cs in engine._core_states.values():
-            cs.in_test = False
-            tp.save_core_state(db, engine._session_id, cs)
-        tp.set_hunting_core(db, engine._session_id, 5)
-        engine._forensics = lambda *_a, **_kw: ([], True)
-        session = tp.get_session(db, engine._session_id)
-
-        crashed, pending_hunt = engine._attribute_crash_after_reboot(session)
-
-        restored = tp.load_core_states(db, engine._session_id)
-        assert crashed == [5]
-        assert pending_hunt is False
-        assert restored[5].current_offset == BEST[5] + (engine._config.crash_penalty_steps * engine._config.fine_step)
-        assert restored[5].crash_count == 1
-        assert all(restored[cid].crash_count == 0 for cid in restored if cid != 5)
-        assert tp.get_session(db, engine._session_id).hunting_core is None
-
     def test_unattributed_hunt_preserves_the_last_workload_breadcrumb(self, db, topo_dual_ccd_x3d, mock_backend):
         engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         session = _seed_confirmed_validating(engine, db, BEST, BASELINES)
@@ -704,11 +693,11 @@ class TestResumeHuntAttribution:
             baseline_offset=0,
         )
         engine._core_states = {0: cs}
-        tp.save_core_state(db, engine._session_id, cs)
+        db.upsert_tuner_core_state(engine._session_id, cs)
         tp.journal_co_intent(db, engine._session_id, 0, -20, survived=False)
 
         assert engine._handle_journal_suspects({0}) == []
-        restored = tp.load_core_states(db, engine._session_id)[0]
+        restored = db.get_tuner_core_states(engine._session_id)[0]
         assert restored.current_offset == -20
         assert restored.crash_count == 0
 
@@ -738,11 +727,11 @@ class TestPersistedHuntResume:
 
         engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         _seed_confirmed_validating(engine, db, BEST, BASELINES)
-        tp.set_hunt_state(db, engine._session_id, "{corrupt")
-        tp.update_session_status(db, engine._session_id, "hunting")
+        db.set_hunt_state(engine._session_id, "{corrupt")
+        db.update_tuner_session_status(engine._session_id, "hunting")
         before = {
             core_id: (cs.phase, cs.current_offset, cs.best_offset)
-            for core_id, cs in tp.load_core_states(db, engine._session_id).items()
+            for core_id, cs in db.get_tuner_core_states(engine._session_id).items()
         }
         messages = []
         engine.log_message.connect(messages.append)
@@ -752,11 +741,11 @@ class TestPersistedHuntResume:
 
         after = {
             core_id: (cs.phase, cs.current_offset, cs.best_offset)
-            for core_id, cs in tp.load_core_states(db, engine._session_id).items()
+            for core_id, cs in db.get_tuner_core_states(engine._session_id).items()
         }
         assert engine._smu.written == {}
         assert engine.status == "paused"
-        assert tp.get_session(db, engine._session_id).status == "paused"
+        assert db.get_tuner_session(engine._session_id).status == "paused"
         assert after == before
         assert any("Persisted hunt state is invalid:" in message for message in messages)
 
@@ -771,8 +760,8 @@ class TestPersistedHuntResume:
         state = _armed_probe_state(engine)
         crashed_live = list(state.in_flight)
         workload = dict(state.workload)
-        tp.set_hunt_state(db, engine._session_id, state.to_json())
-        tp.update_session_status(db, engine._session_id, "hunting")
+        db.set_hunt_state(engine._session_id, state.to_json())
+        db.update_tuner_session_status(engine._session_id, "hunting")
         launches = []
         monkeypatch.setattr(engine_mod, "_rebooted_since", lambda *_a, **_kw: rebooted)
         monkeypatch.setattr(engine_mod.QTimer, "singleShot", lambda *_a: None)
@@ -799,8 +788,8 @@ class TestPersistedHuntResume:
         import corecycler.tuner.engine as engine_mod
 
         engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
-        tp.set_hunt_state(db, engine._session_id, "not-json")
-        tp.update_session_status(db, engine._session_id, "validating")
+        db.set_hunt_state(engine._session_id, "not-json")
+        db.update_tuner_session_status(engine._session_id, "validating")
         messages = []
         engine.log_message.connect(messages.append)
         monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda **_kw: False)
@@ -810,17 +799,17 @@ class TestPersistedHuntResume:
 
         assert engine._smu.written == {}
         assert engine.status == "paused"
-        assert tp.get_session(db, engine._session_id).status == "paused"
+        assert db.get_tuner_session(engine._session_id).status == "paused"
         assert any("Persisted hunt state is invalid:" in message for message in messages)
 
 
 class TestPersistedHuntSafety:
     def test_crash_attribution_rejects_corrupt_hunt_state(self, db, topo_dual_ccd_x3d, mock_backend):
         engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
-        tp.set_hunt_state(db, engine._session_id, "[]")
+        db.set_hunt_state(engine._session_id, "[]")
         messages = []
         engine.log_message.connect(messages.append)
-        session = tp.get_session(db, engine._session_id)
+        session = db.get_tuner_session(engine._session_id)
 
         crashed, pending_hunt = engine._attribute_crash_after_reboot(session)
 
@@ -845,9 +834,11 @@ class TestPersistedHuntSafety:
         engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         _seed_confirmed_validating(engine, db, BEST, BASELINES)
         state = bisect.HuntState(
+            candidates=sorted(BEST),
             stage=bisect.Stage.CONFIRM,
             pending=[[6, 7]],
-            in_flight=[5],
+            suspect=5,
+            in_flight=[0, 1, 2, 3, 4, 6, 7],
             loaded=[5, 6],
             armed=True,
             vector=dict(BEST),
@@ -856,12 +847,12 @@ class TestPersistedHuntSafety:
         engine._hunt = state
         engine._hunting = True
         engine._core_states[5].in_test = True
-        tp.save_core_state(db, engine._session_id, engine._core_states[5])
-        tp.set_hunt_state(db, engine._session_id, state.to_json())
+        db.upsert_tuner_core_state(engine._session_id, engine._core_states[5])
+        db.set_hunt_state(engine._session_id, state.to_json())
 
         engine._requeue_hunt_probe()
 
-        restored = bisect.HuntState.from_json(tp.get_session(db, engine._session_id).hunt_state)
+        restored = bisect.HuntState.from_json(db.get_tuner_session(engine._session_id).hunt_state)
         assert restored is not None
         assert restored.armed is False
         assert restored.stage is bisect.Stage.PROBE
@@ -869,4 +860,4 @@ class TestPersistedHuntSafety:
         assert restored.in_flight == []
         assert restored.found == []
         assert restored.exonerated == []
-        assert tp.load_core_states(db, engine._session_id)[5].in_test is False
+        assert db.get_tuner_core_states(engine._session_id)[5].in_test is False

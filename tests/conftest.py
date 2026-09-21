@@ -9,13 +9,14 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from tests._contract_hw import ring_b_requested
+from tests._contract_hw import hw_contracts_requested
 
 # add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -31,7 +32,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 # Ring B is the exception and keeps the real environment: its whole point is
 # the live session, and a fake XDG_RUNTIME_DIR hides the systemd user manager
 # that containment needs.
-_LIVE_TIER = ring_b_requested(" ".join(sys.argv[1:]))
+_LIVE_TIER = hw_contracts_requested()
 _TEST_HOME = None if _LIVE_TIER else Path(tempfile.mkdtemp(prefix="corecycler-test-home-"))
 
 if _TEST_HOME is not None:
@@ -113,9 +114,9 @@ if "PySide6" not in sys.modules:
         sys.modules["PySide6"] = _qt
         sys.modules["PySide6.QtCore"] = _qtcore
 
-from corecycler.engine.backends.base import StressBackend, StressConfig, StressMode
-from corecycler.engine.topology import CPUTopology, PhysicalCore
-from corecycler.smu.commands import CPUGeneration, SMUCommandSet
+from corecycler.engine.backends.base import StressBackend, StressConfig, StressMode  # noqa: E402
+from corecycler.engine.topology import CPUTopology, LogicalCPU, PhysicalCore  # noqa: E402
+from corecycler.smu.commands import CPUGeneration, SMUCommandSet  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Mock cpuinfo data for various CPU configurations
@@ -516,11 +517,7 @@ def _write_tree(base: Path, tree: dict) -> None:
             path.write_text(str(content))
 
 
-def build_topology(
-    cpuinfo_text: str,
-    num_ccds: int = 1,
-    l3_sizes: dict[int, str] | None = None,
-) -> CPUTopology:
+def build_topology(cpuinfo_text: str, *, num_ccds: int = 1) -> CPUTopology:
     """Build a CPUTopology from mock cpuinfo text by parsing it with the real parser.
 
     This patches file I/O so the real _parse_cpuinfo works on our fake data.
@@ -558,7 +555,6 @@ def build_topology(
         topo.cores[pc] = PhysicalCore(
             core_id=pc,
             ccd=None,
-            ccx=None,
             logical_cpus=core_lcpus[pc],
         )
 
@@ -567,14 +563,51 @@ def build_topology(
 
 
 @pytest.fixture
-def topo_dual_ccd_x3d():
-    """Topology fixture: 8-core dual-CCD X3D with SMT (16 logical)."""
+def topo_dual_ccd_x3d() -> CPUTopology:
+    """Synthetic topology: 8-core two-CCD layout with SMT, not a 9950X3D2."""
     topo = build_topology(CPUINFO_DUAL_CCD_SMT, num_ccds=2)
     # assign CCD manually: cores 0-3 = CCD0, cores 4-7 = CCD1
     for pc in topo.cores.values():
         ccd = 0 if pc.core_id < 4 else 1
         object.__setattr__(pc, "ccd", ccd)
     return topo
+
+
+@pytest.fixture
+def topo_9950x3d2() -> CPUTopology:
+    """9950X3D2: 16 physical cores, two 8-core V-Cache CCDs, and 32 logical CPUs."""
+    cores = {
+        core_id: PhysicalCore(
+            core_id=core_id,
+            ccd=core_id // 8,
+            logical_cpus=(core_id, core_id + 16),
+            has_vcache=True,
+        )
+        for core_id in range(16)
+    }
+    logical_map = {
+        logical_id: LogicalCPU(
+            logical_id=logical_id,
+            physical_core=logical_id % 16,
+            package_id=0,
+            core_cpus=(logical_id % 16, logical_id % 16 + 16),
+        )
+        for logical_id in range(32)
+    }
+    return CPUTopology(
+        model_name="AMD Ryzen 9 9950X3D2 16-Core Processor",
+        vendor="AuthenticAMD",
+        family=26,
+        model=0x44,
+        stepping=2,
+        physical_cores=16,
+        logical_cpus_count=32,
+        smt_enabled=True,
+        ccds=2,
+        is_x3d=True,
+        cores=cores,
+        logical_map=logical_map,
+    )
 
 
 @pytest.fixture
@@ -724,14 +757,20 @@ def no_real_freeze_monitor(monkeypatch):
 def sleep_lock(no_real_sleep_inhibitor, monkeypatch):
     """The shared inhibitor with a parked stand-in for systemd-inhibit.
 
-    `.held` answers whether the machine is currently kept awake.
+    Like the real inhibitor, the stand-in lives until its stdin closes, so the
+    watcher thread never mistakes it for a refused lock. `.held` answers whether
+    the machine is currently kept awake.
     """
     from corecycler import inhibit
 
     class Parked:
-        stdin = None
+        def __init__(self):
+            self._released = threading.Event()
+            self.stdin = SimpleNamespace(close=self._released.set)
 
         def wait(self, timeout=None):
+            if not self._released.wait(timeout):
+                raise subprocess.TimeoutExpired(inhibit._PARK, timeout)
             return 0
 
     monkeypatch.setattr(inhibit, "_spawn", lambda reason: Parked())
@@ -900,16 +939,10 @@ def no_network(monkeypatch):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Ring B is opt-in, never a side effect of the everyday gate.
-
-    `-m "not slow"` does not filter `contract`, so on a box with systemd cpuset
-    delegation or a stress backend installed, the hermetic run was spawning
-    real scopes and real binaries. Selecting the live tier now takes `-m
-    contract` or CORECYCLER_HW_CONTRACTS=1.
-    """
-    if ring_b_requested(config.getoption("markexpr")):
+    """Keep Ring B skipped unless the explicit hardware-contract switch is set."""
+    if hw_contracts_requested():
         return
-    opt_in = pytest.mark.skip(reason="Ring B is opt-in: run `pytest -m contract -n0` or set CORECYCLER_HW_CONTRACTS=1")
+    opt_in = pytest.mark.skip(reason="Ring B is opt-in: set CORECYCLER_HW_CONTRACTS=1 and run with -n0")
     for item in items:
         if item.get_closest_marker("contract"):
             item.add_marker(opt_in)

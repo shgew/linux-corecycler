@@ -31,6 +31,7 @@ class DutyCycleDriver:
         self.rng = rng if rng is not None else random.Random()
         self.cycles_completed = 0
         self.stopped_early = False
+        self.control_error: Exception | None = None
         self._stop_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._idle_lock = threading.Lock()
@@ -43,6 +44,7 @@ class DutyCycleDriver:
             return
         self._stop_event.clear()
         self.stopped_early = False
+        self.control_error = None
         thread = threading.Thread(target=self._run, name=f"duty-cycle-{self.pgid}", daemon=True)
         thread.start()
         self._thread = thread
@@ -55,6 +57,8 @@ class DutyCycleDriver:
                 self._thread.join()
         finally:
             self._continue_payload()
+        if self.control_error is not None:
+            raise RuntimeError(f"duty-cycle control failed: {self.control_error}") from self.control_error
 
     def _run(self) -> None:
         try:
@@ -67,6 +71,7 @@ class DutyCycleDriver:
             self.stopped_early = True
         except Exception as exc:
             self.stopped_early = True
+            self.control_error = exc
             log.exception("Duty-cycle driver stopped unexpectedly: %s", exc)
         finally:
             self._continue_payload()
@@ -119,13 +124,19 @@ class DutyCycleDriver:
             os.killpg(self.pgid, signal.SIGCONT)
         except ProcessLookupError:
             self.stopped_early = True
+            self._close_idle_interval()
         except OSError as exc:
+            self.stopped_early = True
+            self.control_error = exc
             log.warning("Could not resume duty-cycled process group %d: %s", self.pgid, exc)
-        finally:
-            with self._idle_lock:
-                if self._idle_started_at is not None:
-                    self._completed_idle_seconds += time.monotonic() - self._idle_started_at
-                    self._idle_started_at = None
+        else:
+            self._close_idle_interval()
+
+    def _close_idle_interval(self) -> None:
+        with self._idle_lock:
+            if self._idle_started_at is not None:
+                self._completed_idle_seconds += time.monotonic() - self._idle_started_at
+                self._idle_started_at = None
 
     @property
     def intentional_idle_seconds(self) -> float:

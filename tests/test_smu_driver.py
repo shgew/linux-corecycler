@@ -35,18 +35,9 @@ def zen3_cmds():
 
 @pytest.fixture
 def zen5_cmds():
-    return SMUCommandSet(
-        generation=CPUGeneration.ZEN5_GRANITE_RIDGE,
-        set_co_cmd=0x06,
-        get_co_cmd=0xD5,
-        set_all_co_cmd=0x07,
-        mailbox="rsmu",
-        co_range=(-60, 10),
-        encoding_scheme="zen4_5",
-        uniform_8core_ccds=True,
-        set_boost_limit_cmd=0x70,
-        get_boost_limit_cmd=0x6E,
-    )
+    commands = get_commands(CPUGeneration.ZEN5_GRANITE_RIDGE)
+    assert commands is not None
+    return commands
 
 
 @pytest.fixture
@@ -111,9 +102,10 @@ class TestSendCommand:
         _orig = Path.write_bytes
 
         def _sim(self_path, data):
-            _orig(self_path, data)
+            written = _orig(self_path, data)
             if self_path.name == cmd_name and self_path.parent == smu_dir:
                 _orig(self_path, struct.pack("<I", status))
+            return written
 
         monkeypatch.setattr(Path, "write_bytes", _sim)
 
@@ -136,11 +128,59 @@ class TestSendCommand:
         resp = smu._send_command(0x6, (1, 2, 3, 4, 5, 6, 7, 8))
         assert resp.success is True
 
-    def test_failure_response(self, smu_dir, zen5_cmds, monkeypatch):
-        self._patch_write(monkeypatch, smu_dir, "rsmu_cmd", 0)
+    @pytest.mark.parametrize("status", [0, 0xFC, 0xFD, 0xFE, 0xFF])
+    def test_failure_response(self, smu_dir, zen5_cmds, monkeypatch, status):
+        self._patch_write(monkeypatch, smu_dir, "rsmu_cmd", status)
         smu = RyzenSMU(zen5_cmds, smu_dir)
         resp = smu._send_command(0x6)
         assert resp.success is False
+
+    @pytest.mark.parametrize("sender", ["_send_command", "_send_rsmu_command"])
+    @pytest.mark.parametrize("short_file", ["smu_args", "rsmu_cmd"])
+    def test_short_write_fails(self, smu_dir, zen5_cmds, monkeypatch, sender, short_file):
+        original = Path.write_bytes
+
+        def short_write(path, data):
+            written = original(path, data)
+            if path.name == "rsmu_cmd":
+                original(path, struct.pack("<I", 1))
+            return written - 1 if path.name == short_file else written
+
+        monkeypatch.setattr(Path, "write_bytes", short_write)
+        response = getattr(RyzenSMU(zen5_cmds, smu_dir), sender)(0x6)
+        assert response.success is False
+
+    @pytest.mark.parametrize("sender", ["_send_command", "_send_rsmu_command"])
+    @pytest.mark.parametrize("reply_size", [3, 5])
+    def test_non_exact_status_reply_fails(self, smu_dir, zen5_cmds, monkeypatch, sender, reply_size):
+        self._patch_write(monkeypatch, smu_dir, "rsmu_cmd")
+        original = Path.read_bytes
+
+        def wrong_status_size(path):
+            reply = original(path)
+            if path.name != "rsmu_cmd":
+                return reply
+            return reply[:reply_size] if reply_size < len(reply) else reply + b"\x00"
+
+        monkeypatch.setattr(Path, "read_bytes", wrong_status_size)
+        response = getattr(RyzenSMU(zen5_cmds, smu_dir), sender)(0x6)
+        assert response.success is False
+
+    @pytest.mark.parametrize("sender", ["_send_command", "_send_rsmu_command"])
+    @pytest.mark.parametrize("reply_size", [23, 25])
+    def test_non_exact_args_reply_fails(self, smu_dir, zen5_cmds, monkeypatch, sender, reply_size):
+        self._patch_write(monkeypatch, smu_dir, "rsmu_cmd")
+        original = Path.read_bytes
+
+        def wrong_args_size(path):
+            reply = original(path)
+            if path.name != "smu_args":
+                return reply
+            return reply[:reply_size] if reply_size < len(reply) else reply + b"\x00"
+
+        monkeypatch.setattr(Path, "read_bytes", wrong_args_size)
+        response = getattr(RyzenSMU(zen5_cmds, smu_dir), sender)(0x6)
+        assert response.success is False
 
     def test_mp1_path(self, smu_dir, zen3_cmds, monkeypatch):
         self._patch_write(monkeypatch, smu_dir, "mp1_smu_cmd")
@@ -183,9 +223,9 @@ class TestGetCOOffset:
 
     def test_read_max_negative_zen5(self, smu_dir, zen5_cmds):
         smu = RyzenSMU(zen5_cmds, smu_dir)
-        resp = SMUResponse(success=True, args=(0xFFC4, 0, 0, 0, 0, 0), raw=b"\x00" * 24)
+        resp = SMUResponse(success=True, args=(0xFFCE, 0, 0, 0, 0, 0), raw=b"\x00" * 24)
         with patch.object(smu, "_send_command", return_value=resp):
-            assert smu.get_co_offset(0) == -60
+            assert smu.get_co_offset(0) == -50
 
 
 class TestSetCOOffset:
@@ -213,10 +253,10 @@ class TestSetCOOffset:
     def test_set_boundary_min(self, smu_dir, zen5_cmds):
         smu = RyzenSMU(zen5_cmds, smu_dir)
         with (
-            patch.object(smu, "_send_command", side_effect=self._mock_set_readback(-60)),
+            patch.object(smu, "_send_command", side_effect=self._mock_set_readback(-50)),
             patch.object(smu, "check_writable", return_value=(True, "OK")),
         ):
-            assert smu.set_co_offset(0, -60) is True
+            assert smu.set_co_offset(0, -50) is True
 
     def test_set_boundary_max(self, smu_dir, zen5_cmds):
         smu = RyzenSMU(zen5_cmds, smu_dir)
@@ -228,8 +268,8 @@ class TestSetCOOffset:
 
     def test_out_of_range_low(self, smu_dir, zen5_cmds):
         smu = RyzenSMU(zen5_cmds, smu_dir)
-        with pytest.raises(ValueError, match="CO value -61 out of range"):
-            smu.set_co_offset(0, -61)
+        with pytest.raises(ValueError, match="CO value -51 out of range"):
+            smu.set_co_offset(0, -51)
 
     def test_out_of_range_high(self, smu_dir, zen5_cmds):
         smu = RyzenSMU(zen5_cmds, smu_dir)
@@ -424,6 +464,7 @@ class TestDeterministicSlotMapping:
         smu = RyzenSMU(cmds, smu_dir)
         topo = MagicMock()
         topo.cores = cores
+        topo.cpus_all_online = True
         calls: list[int] = []
         smu._send_command = lambda cmd, args=(0,) * 6: (
             calls.append(cmd) or SMUResponse(success=True, args=(0,) * 6, raw=b"")
@@ -448,6 +489,7 @@ class TestDeterministicSlotMapping:
         smu = RyzenSMU(zen5_cmds, smu_dir)
         topo = MagicMock()
         topo.cores = {c: MagicMock(ccd=0) for c in (0, 1, 4, 5, 6, 7)}
+        topo.cpus_all_online = True
         smu.set_topology(topo)
         writes, store = _stateful_smu(smu, zen5_cmds)
         for c in (0, 1, 4, 5, 6, 7):
@@ -463,6 +505,7 @@ class TestDeterministicSlotMapping:
         ccd1 = (8, 9, 10, 11, 14, 15)
         topo = MagicMock()
         topo.cores = {**{c: MagicMock(ccd=0) for c in ccd0}, **{c: MagicMock(ccd=1) for c in ccd1}}
+        topo.cpus_all_online = True
         smu.set_topology(topo)
         writes, store = _stateful_smu(smu, zen5_cmds)
         for c in ccd0 + ccd1:
@@ -480,6 +523,7 @@ class TestDeterministicSlotMapping:
         smu = RyzenSMU(zen5_cmds, smu_dir)
         topo = MagicMock()
         topo.cores = {c: MagicMock(ccd=0) for c in (0, 1, 4, 5, 6, 7)}
+        topo.cpus_all_online = True
         smu.set_topology(topo)
         _writes, _store = _stateful_smu(smu, zen5_cmds)
         smu.set_co_offset(5, -30)
@@ -532,10 +576,16 @@ class TestBackupRestore:
         assert backup == {0: -10, 1: -5, 2: 0, 3: -15}
         assert smu.has_backup()
 
-    def test_backup_excludes_none(self, smu_dir, zen5_cmds):
+    def test_incomplete_backup_makes_restore_report_unreadable_cores(self, smu_dir, zen5_cmds):
         smu = RyzenSMU(zen5_cmds, smu_dir)
         with patch.object(smu, "get_co_offset", side_effect=[-10, None, 0, None]):
             assert smu.backup_co_offsets(4) == {0: -10, 2: 0}
+        assert not smu.has_backup()
+        with patch.object(smu, "set_co_offset", return_value=True) as restore:
+            ok, failed = smu.restore_co_offsets()
+        assert ok is False
+        assert failed == [1, 3]
+        assert [call.args for call in restore.call_args_list] == [(0, -10), (2, 0)]
 
     def test_restore_no_backup(self, smu_dir, zen5_cmds):
         smu = RyzenSMU(zen5_cmds, smu_dir)

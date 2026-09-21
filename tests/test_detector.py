@@ -82,7 +82,7 @@ class TestErrorState:
 
 
 # ===========================================================================
-# classify_mce_line — the single line classifier
+# classify_mce_line: the single line classifier
 # ===========================================================================
 
 
@@ -166,7 +166,7 @@ class TestClassifyClassicFormats:
 
 
 # ===========================================================================
-# ErrorDetector.check_mce — dmesg polling with consume-once semantics
+# ErrorDetector.check_mce: dmesg polling with consume-once semantics
 # ===========================================================================
 
 
@@ -208,7 +208,7 @@ class TestCheckMCE:
         det = _fresh_detector(baseline=100.0)
         with patch("subprocess.run", return_value=_dmesg_result(out)) as mock_run:
             det.check_mce()
-            events = det.check_mce()  # immediately again — inside the interval
+            events = det.check_mce()  # immediately again, inside the interval
         assert events == []
         assert mock_run.call_count == 1
 
@@ -346,7 +346,7 @@ class TestHarvestKernelMCE:
 
 
 # ===========================================================================
-# _is_mce_error_line — kept for classic formats
+# _is_mce_error_line, kept for classic formats
 # ===========================================================================
 
 
@@ -415,7 +415,7 @@ class TestGetDmesgTimestamp:
 
 
 # ===========================================================================
-# last_boot_ended_cleanly — freeze vs deliberate reboot
+# last_boot_ended_cleanly: freeze vs deliberate reboot
 # ===========================================================================
 
 

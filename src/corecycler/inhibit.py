@@ -85,9 +85,23 @@ class _SharedLock:
         with self._mutex:
             self._holders += 1
             if self._proc is None:
-                self._proc = _spawn(reason)
-                if self._proc is not None:
+                proc = _spawn(reason)
+                self._proc = proc
+                if proc is not None:
+                    threading.Thread(target=self._watch, args=(proc,), daemon=True).start()
                     log.debug("sleep inhibited: %s", reason)
+
+    def _watch(self, proc: subprocess.Popen) -> None:
+        try:
+            returncode = proc.wait()
+        except Exception as exc:
+            log.debug("sleep inhibitor watcher failed: %s", exc)
+            return
+        with self._mutex:
+            if self._proc is proc:
+                self._proc = None
+        if returncode:
+            log.debug("sleep inhibitor exited before release with status %s", returncode)
 
     def drop(self) -> None:
         with self._mutex:
@@ -100,7 +114,8 @@ class _SharedLock:
 
     @property
     def held(self) -> bool:
-        return self._proc is not None
+        with self._mutex:
+            return self._proc is not None
 
 
 _shared = _SharedLock()

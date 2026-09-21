@@ -127,8 +127,7 @@ def _count(source: str) -> int:
     return counter.seen
 
 
-def _build(path: Path, index: int) -> Mutant | None:
-    original = path.read_text()
+def _build(path: Path, index: int, original: str) -> Mutant | None:
     tree = ast.parse(original)
     mutator = _Mutator(target=index, inert=_inert(tree))
     mutated = mutator.visit(tree)
@@ -191,7 +190,7 @@ def main() -> int:
         print(f"== {path} ({len(indices)} of {total} mutants)")
         try:
             for index in indices:
-                mutant = _build(path, index)
+                mutant = _build(path, index, original)
                 if mutant is None:
                     continue
                 path.write_text(mutant.source)

@@ -90,6 +90,7 @@
                   pythonPkgs.pytestCheckHook
                   pythonPkgs.hypothesis
                   pythonPkgs.pytest-cov
+                  pythonPkgs.pytest-timeout
                   pythonPkgs.pytest-xdist
                 ];
                 doCheck = true;

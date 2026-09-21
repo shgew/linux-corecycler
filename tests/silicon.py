@@ -31,6 +31,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum, auto
 
+from corecycler.history.context import SystemContext, compute_context_hash
+
 # Verdicts a stress slot can produce in this model.
 
 
@@ -40,6 +42,31 @@ class Outcome(Enum):
     SOFT_FAIL = auto()
     #: The machine died. No core is named; recovery goes through the journal.
     HARD_CRASH = auto()
+
+
+def complete_context(db, topology, smu=None) -> int:
+    cores = len(topology.cores)
+    co = tuple(smu.get_co_offset(core_id) if smu is not None else 0 for core_id in range(cores))
+    values = {
+        "cpu_model": topology.model_name,
+        "physical_cores": cores,
+        "ccds": topology.ccds,
+        "co": co,
+        "pbo_scalar": smu.get_pbo_scalar() if smu is not None else 1.0,
+        "boost_limit_mhz": smu.get_boost_limit() if smu is not None else 5500,
+        "ppt_limit_w": None,
+        "tdc_limit_a": None,
+        "edc_limit_a": None,
+        "bios_version": "Test BIOS",
+    }
+    return db.get_or_create_context(
+        SystemContext(
+            **values,
+            context_hash=compute_context_hash(**values),
+            complete=True,
+            missing=(),
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)

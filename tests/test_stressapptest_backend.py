@@ -43,12 +43,12 @@ class TestStressapptestBackend:
         cmd = StressapptestBackend().get_command(StressConfig(memory_mb=memory_mb), tmp_path)
         assert _flag(cmd, "-M") == str(int(8192 * 0.75))
 
-    def test_parse_pass(self):
+    def test_unrequested_clean_exit_has_no_verdict(self):
         backend = StressapptestBackend()
         stdout = "Status: PASS - please pass all stress tests."
         passed, err = backend.parse_output(stdout, "", 0)
-        assert passed is True
-        assert err is None
+        assert passed is False
+        assert err is not None and "verdict unavailable" in err
 
     def test_parse_fail(self):
         backend = StressapptestBackend()
@@ -62,10 +62,11 @@ class TestStressapptestBackend:
         passed, err = backend.parse_output("", "", -15)
         assert passed is True
 
-    def test_supported_modes(self):
+    def test_supported_mode_is_a_workload_label_not_an_enforced_isa(self):
         backend = StressapptestBackend()
-        modes = backend.get_supported_modes()
-        assert StressMode.SSE in modes
+        assert StressMode.SSE in backend.get_supported_modes()
+        assert backend.instruction_set(StressConfig(mode=StressMode.SSE)) is None
+        assert backend.workload(StressConfig()) == ("memory",)
 
 
 class TestAvailableMemoryMb:
@@ -97,11 +98,16 @@ class TestDefaultMemoryMb:
         assert per_lane == int(29000 * 0.75) // 8
         assert per_lane * 8 <= 29000 * 0.75
 
-    def test_floor_holds_when_lanes_outnumber_memory(self, monkeypatch):
+    def test_batch_refuses_when_the_per_lane_minimum_would_overcommit(self, monkeypatch):
         monkeypatch.setattr(sat, "available_memory_mb", lambda: 1000)
-        assert default_memory_mb(64) == sat.MIN_MEMORY_MB
+        with pytest.raises(RuntimeError, match="64 concurrent stressapptest lanes"):
+            StressapptestBackend().default_memory_mb(64)
 
     def test_unknown_memory_falls_back_to_a_fixed_total(self, monkeypatch):
         monkeypatch.setattr(sat, "available_memory_mb", lambda: None)
         assert default_memory_mb() == sat.FALLBACK_MEMORY_MB
         assert default_memory_mb(4) == sat.FALLBACK_MEMORY_MB // 4
+
+    def test_backend_exposes_batch_aware_default(self, monkeypatch):
+        monkeypatch.setattr(sat, "available_memory_mb", lambda: 8192)
+        assert StressapptestBackend().default_memory_mb(4) == int(8192 * sat.MEMORY_SHARE) // 4

@@ -2,7 +2,7 @@
 
 site-packages is a global namespace shared by every package in a merged
 environment (a Nix profile, a venv). A flat top-level module like cli.py
-collides there with any other application shipping the same name — a Nix
+collides there with any other application shipping the same name - a Nix
 home profile holding corecycler and hermes-agent (which also ships a flat
 cli.py) failed to build on exactly that. Everything lives under the
 corecycler package; nothing installs flat.

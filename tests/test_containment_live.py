@@ -1,4 +1,4 @@
-"""Ring B live containment drift tests — real systemd scope, real kernel cpuset.
+"""Ring B live containment drift tests for a real systemd scope and kernel cpuset.
 
 Proves on real hardware that the boundary every stress backend runs behind
 cannot be widened from inside, and that the escape watchdog's observation
@@ -59,7 +59,7 @@ def test_the_watchdog_observation_matches_the_kernel_record():
         contained.prefix + [sys.executable, "-c", "import time; time.sleep(10)"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        preexec_fn=execution.make_preexec(),
+        start_new_session=True,
     )
     try:
         deadline = time.monotonic() + 10

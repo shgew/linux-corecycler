@@ -127,11 +127,23 @@ class StressBackend(ABC):
 
     @abstractmethod
     def get_supported_modes(self) -> list[StressMode]:
-        """Return list of stress modes this backend supports."""
+        """Return selectable stress modes implemented by this backend."""
+
+    def instruction_set(self, config: StressConfig) -> StressMode | None:
+        """Return the ISA constraint the backend can enforce, if any."""
+        return None
+
+    def workload(self, config: StressConfig) -> tuple[str, ...]:
+        """Return the concrete backend workload independently of its ISA target."""
+        return config.tests or ()
 
     def get_supported_fft_presets(self) -> list[FFTPreset]:
         """Return list of FFT presets this backend supports. Override if applicable."""
         return []
+
+    def default_memory_mb(self, lanes: int = 1) -> int | None:
+        """Return the per-lane share of a backend's default batch memory budget."""
+        return None
 
     def prepare(self, work_dir: Path, config: StressConfig) -> None:  # noqa: B027
         """Prepare working directory and config files before running. Override if needed."""
@@ -157,15 +169,18 @@ class StressBackend(ABC):
                 for post-mortem analysis of failures.
         """
 
+    def indefinite_exit_verdict(self, returncode: int) -> tuple[bool, str | None]:
+        """Classify termination after backend-specific errors have been excluded."""
+        if returncode in KILLED_BY_US_CODES:
+            return True, None
+        signal_name = CRASH_SIGNALS.get(returncode)
+        if signal_name:
+            return False, f"{self.name} crashed with {signal_name} (exit {returncode})"
+        return False, f"{self.name} exited with code {returncode} - verdict unavailable"
+
     @staticmethod
     def classify_exit_code(returncode: int) -> str | None:
-        """Classify a process exit code.
-
-        Returns:
-            "killed_by_us" if intentionally terminated by scheduler
-            "crash:<SIGNAL>" if killed by a crash signal (CPU instability)
-            None for normal exit (check stdout/stderr for pass/fail)
-        """
+        """Classify a process exit code."""
         if returncode in KILLED_BY_US_CODES:
             return "killed_by_us"
         signal_name = CRASH_SIGNALS.get(returncode)

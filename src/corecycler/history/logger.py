@@ -1,4 +1,4 @@
-"""TestRunLogger — connects TestWorker Qt signals to HistoryDB writes.
+"""TestRunLogger - connects TestWorker Qt signals to HistoryDB writes.
 
 All signal handlers run on the GUI thread (Qt signal delivery), so there
 are no threading concerns.  Each handler does a single auto-commit INSERT
@@ -13,7 +13,7 @@ import time
 from dataclasses import asdict
 from typing import TYPE_CHECKING
 
-from corecycler.history.context import capture_system_context, find_or_create_context
+from corecycler.history.context import capture_system_context
 from corecycler.history.db import (
     CoreResultRecord,
     EventRecord,
@@ -52,14 +52,18 @@ class TestRunLogger:
         self._start_time = time.monotonic()
         self._active_result_ids: dict[int, int] = {}  # core_id → core_results.id
 
-        # Capture tuning context (CO offsets, BIOS version, PBO state)
-        ctx = capture_system_context(smu=smu, num_cores=topology.physical_cores)
-        context_id = find_or_create_context(db, ctx)
+        ctx = capture_system_context(
+            smu=smu,
+            num_cores=topology.physical_cores,
+            cpu_model=topology.model_name,
+            ccds=topology.ccds,
+        )
+        context_id = db.get_or_create_context(ctx)
         log.info(
-            "Tuning context %d: BIOS=%s, CO hash=%s",
+            "Tuning context %d: BIOS=%s, context hash=%s",
             context_id,
             ctx.bios_version,
-            ctx.co_hash[:12] if ctx.co_hash else "none",
+            ctx.context_hash[:12],
         )
 
         # snapshot settings as JSON
@@ -163,47 +167,66 @@ class TestRunLogger:
         )
 
     def on_test_completed(self, results_json: str) -> None:
-        # Fail closed: a logging slot must never crash the GUI on a malformed or
-        # unexpectedly-shaped results payload.
         try:
             results = json.loads(results_json)
         except (json.JSONDecodeError, TypeError):
+            self.on_test_crashed("Worker returned malformed result data")
             return
-        if not isinstance(results, dict):
+        if not self._valid_results(results):
+            self.on_test_crashed("Worker returned malformed result data")
             return
-        tested = {k: v for k, v in results.items() if v}  # only cores with results
-        total = len(tested)
-        passed = sum(
-            1
-            for r_list in tested.values()
-            if isinstance(r_list, list) and r_list and all(isinstance(r, dict) and r.get("passed") for r in r_list)
-        )
-        failed = total - passed
-        elapsed = time.monotonic() - self._start_time
 
+        total = len(results)
+        passed = sum(all(result["passed"] for result in core_results) for core_results in results.values())
         self._db.finish_run(
             self._run_id,
             status="completed",
             total_cores=total,
             cores_passed=passed,
-            cores_failed=failed,
-            total_seconds=elapsed,
+            cores_failed=total - passed,
+            total_seconds=time.monotonic() - self._start_time,
         )
 
+    @staticmethod
+    def _valid_results(results: object) -> bool:
+        if not isinstance(results, dict):
+            return False
+        for core_id, core_results in results.items():
+            if not isinstance(core_id, str) or not core_id.isdigit():
+                return False
+            if not isinstance(core_results, list) or not core_results:
+                return False
+            if any(not isinstance(result, dict) or type(result.get("passed")) is not bool for result in core_results):
+                return False
+        return True
+
     def on_test_stopped(self) -> None:
-        elapsed = time.monotonic() - self._start_time
-        self._db.finish_run(
+        if self._db.finish_run(
             self._run_id,
             status="stopped",
-            total_seconds=elapsed,
-        )
-        self._db.insert_event(
-            EventRecord(
-                run_id=self._run_id,
-                event_type="info",
-                message="Test stopped by user",
+            total_seconds=time.monotonic() - self._start_time,
+        ):
+            self._db.insert_event(
+                EventRecord(
+                    run_id=self._run_id,
+                    event_type="info",
+                    message="Test stopped by user",
+                )
             )
-        )
+
+    def on_test_crashed(self, error: str) -> None:
+        if self._db.finish_run(
+            self._run_id,
+            status="crashed",
+            total_seconds=time.monotonic() - self._start_time,
+        ):
+            self._db.insert_event(
+                EventRecord(
+                    run_id=self._run_id,
+                    event_type="error",
+                    message=error,
+                )
+            )
 
     # ------------------------------------------------------------------
     # Telemetry recording (called from _poll_core_telemetry)
@@ -241,7 +264,7 @@ class TestRunLogger:
     ) -> None:
         result_id = self._active_result_ids.get(core_id)
         if result_id is None:
-            # Core already finished — look up the last result for this core
+            # Core already finished - look up the last result for this core
             return
         kwargs = {}
         if peak_freq_mhz is not None:

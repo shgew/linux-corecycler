@@ -263,7 +263,7 @@ class TestEncodeDecodeZen5:
     gen = CPUGeneration.ZEN5_GRANITE_RIDGE
 
     @pytest.mark.parametrize("core_id", [0, 1, 7, 8, 15, 16, 31])
-    @pytest.mark.parametrize("value", [-60, -50, -30, -10, -1, 0, 5, 10])
+    @pytest.mark.parametrize("value", [-50, -30, -10, -1, 0, 5, 10])
     def test_roundtrip(self, core_id, value):
         encoded = encode_co_arg(core_id, value, self.gen)
         decoded = decode_co_arg(core_id, encoded, self.gen)
@@ -274,14 +274,14 @@ class TestEncodeDecodeZen5:
         decoded = decode_co_arg(0, encoded, self.gen)
         assert decoded == 10
 
-    def test_max_negative(self):
+    def test_out_of_hardware_range_still_roundtrips_in_pure_codec(self):
         encoded = encode_co_arg(0, -60, self.gen)
         decoded = decode_co_arg(0, encoded, self.gen)
         assert decoded == -60
 
     def test_boundary_values(self):
         """Test exact boundary of CO range for Zen 5."""
-        for val in [-60, 10]:
+        for val in [-50, 10]:
             encoded = encode_co_arg(0, val, self.gen)
             decoded = decode_co_arg(0, encoded, self.gen)
             assert decoded == val

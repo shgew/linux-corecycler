@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import sys as _sys
-from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -24,7 +23,7 @@ def _topo(ccds=2):
     topo = CPUTopology(model_name="Test", family=26, model=0x44, physical_cores=8, ccds=ccds)
     per = 8 // ccds
     for cid in range(8):
-        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=cid // per, ccx=None, logical_cpus=(cid, cid + 8))
+        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=cid // per, logical_cpus=(cid, cid + 8))
     return topo
 
 
@@ -51,8 +50,8 @@ class TestCoreFreqBar:
     def test_live_readout_with_and_without_ceiling(self):
         from corecycler.gui.monitor_tab import CoreFreqBar
 
-        assert CoreFreqBar._freq_text(5200, 5500) == "5200/5500MHz"
-        assert CoreFreqBar._freq_text(5200, 0) == "5200MHz"
+        assert CoreFreqBar._freq_text(5200, 5500) == "5200/5500 MHz"
+        assert CoreFreqBar._freq_text(5200, 0) == "5200 MHz"
 
     def test_update_and_paint(self):
         bar = _bar()
@@ -95,26 +94,27 @@ class TestMonitorTab:
         tab.set_topology(_topo(ccds=1))
         assert sorted(tab._per_core_bars) == list(range(8))
 
-    def test_power_limits_na_when_pmtable_absent(self):
+    def test_power_limits_render_from_snapshot_or_missing(self):
+        from corecycler.gui.monitor_tab import MonitorSnapshot
+
         tab = _tab()
-        tab._pmtable = MagicMock()
-        tab._pmtable.is_available.return_value = False
-        tab._update_power_limits()
+        empty = MonitorSnapshot((), None, (), None, None, (), (), (), None, ())
+        tab._apply_snapshot(empty)
         assert "N/A" in tab._ppt_label.text()
 
-    def test_power_limits_formatted_when_present(self):
-        tab = _tab()
-        tab._pmtable = MagicMock()
-        tab._pmtable.is_available.return_value = True
-        tab._pmtable.read.return_value = SimpleNamespace(
-            ppt_value_w=120.0,
-            ppt_limit_w=200.0,
-            tdc_value_a=90.0,
-            tdc_limit_a=180.0,
-            edc_value_a=110.0,
-            edc_limit_a=230.0,
+        populated = MonitorSnapshot(
+            (),
+            None,
+            (),
+            None,
+            None,
+            (),
+            (),
+            (),
+            None,
+            (("PPT", 120.0, 200.0, "W"), ("TDC", 90.0, 180.0, "A"), ("EDC", 110.0, 230.0, "A")),
         )
-        tab._update_power_limits()
+        tab._apply_snapshot(populated)
         assert "120" in tab._ppt_label.text() and "200" in tab._ppt_label.text()
 
     def test_stop_monitoring_closes_msr(self):
@@ -122,3 +122,15 @@ class TestMonitorTab:
         tab._msr = MagicMock()
         tab.stop_monitoring()
         tab._msr.close.assert_called_once()
+
+
+def test_stop_monitoring_waits_for_an_inflight_sample():
+    tab = _tab()
+    tab._worker = MagicMock()
+    tab._worker.isRunning.return_value = True
+    tab._msr = MagicMock()
+
+    tab.stop_monitoring()
+
+    tab._worker.wait.assert_called_once_with()
+    tab._msr.close.assert_called_once_with()

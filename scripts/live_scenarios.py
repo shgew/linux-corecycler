@@ -20,6 +20,7 @@ import argparse
 import contextlib
 import json
 import os
+import pwd
 import sqlite3
 import subprocess
 import sys
@@ -67,6 +68,27 @@ def _hard_watchdog(seconds: float) -> None:
     sys.stderr.write(f"live_scenarios: watchdog fired after {seconds}s; killing stress tree\n")
     kill_app_stress_tree()
     os.kill(os.getpid(), _sig.SIGKILL)
+
+
+def _install_campaign_home(home: Path, *, real_home: Path | None = None) -> None:
+    """Install an isolated HOME/XDG tree before any corecycler import."""
+    home = home.resolve()
+    real_home = (real_home or Path(pwd.getpwuid(os.getuid()).pw_dir)).resolve()
+    if home == real_home:
+        raise ValueError(f"campaign home must not be the real home: {real_home}")
+    home.mkdir(parents=True, exist_ok=True)
+    xdg_dirs = {
+        "HOME": home,
+        "XDG_CONFIG_HOME": home / ".config",
+        "XDG_CACHE_HOME": home / ".cache",
+        "XDG_DATA_HOME": home / ".local" / "share",
+        "XDG_STATE_HOME": home / ".local" / "state",
+        "XDG_RUNTIME_DIR": home / "run",
+    }
+    for name, path in xdg_dirs.items():
+        path.mkdir(parents=True, exist_ok=True)
+        os.environ[name] = str(path)
+    (home / "run").chmod(0o700)
 
 
 def campaign_home() -> Path:
@@ -647,6 +669,7 @@ SCENARIOS = {
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--home", type=Path, required=True)
     parser.add_argument("scenario", choices=sorted(SCENARIOS))
     parser.add_argument("--backend", default="mprime")
     parser.add_argument("--mode", default="SSE")
@@ -658,6 +681,10 @@ def main() -> int:
     parser.add_argument("--mem-tool", default="stressapptest")
     args = parser.parse_args()
 
+    try:
+        _install_campaign_home(args.home)
+    except ValueError as exc:
+        parser.error(str(exc))
     os.environ.setdefault("QT_QPA_PLATFORM", "xcb")
     from corecycler.main import setup_logging
 

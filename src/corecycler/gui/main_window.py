@@ -1,4 +1,4 @@
-"""Main application window — tabs, toolbar, test control."""
+"""Main application window: tabs, toolbar, and test control."""
 
 from __future__ import annotations
 
@@ -7,8 +7,9 @@ import json
 import logging
 import os
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime, timedelta
+from enum import StrEnum
 from pathlib import Path
 
 from PySide6.QtCore import QThread, QTimer, Signal, Slot
@@ -28,7 +29,7 @@ from PySide6.QtWidgets import (
 )
 
 from corecycler.config.paths import ensure_work_dir, user_home
-from corecycler.config.settings import load_settings, save_settings
+from corecycler.config.settings import AppSettings, load_settings, save_settings
 from corecycler.engine.backends import get_backend, load_all
 from corecycler.engine.backends.base import StressConfig, StressResult
 from corecycler.engine.scheduler import CoreScheduler, CoreTestStatus, SchedulerConfig
@@ -39,19 +40,61 @@ from corecycler.gui.memory_tab import MemoryTab
 from corecycler.gui.monitor_tab import MonitorTab
 from corecycler.gui.results_tab import ResultsTab
 from corecycler.gui.smu_tab import SMUTab
-from corecycler.gui.style import theme
+from corecycler.gui.style import format_temperature, set_semantic_style, theme
 from corecycler.gui.tool_prompt import ensure_tool
 from corecycler.gui.tuner_tab import TunerTab
 from corecycler.gui.widgets.core_grid import CoreGridWidget
 from corecycler.history.context import detect_bios_change
 from corecycler.history.db import HistoryDB, adopt_legacy_root_db
 from corecycler.history.logger import TestRunLogger
-from corecycler.history.timefmt import format_local
 from corecycler.monitor.frequency import read_core_frequencies
 from corecycler.monitor.hwmon import HWMonReader
 from corecycler.monitor.msr import MSRReader
 
 log = logging.getLogger(__name__)
+
+
+class _WorkloadOwner(StrEnum):
+    NONE = "none"
+    MANUAL = "manual"
+    MEMORY = "memory"
+    TUNER = "tuner"
+
+
+@dataclass(frozen=True, slots=True)
+class _HistoryStartup:
+    db: HistoryDB | None = None
+    bios_changed: bool = False
+    bios_old: str = ""
+    bios_current: str = ""
+
+
+def _start_history(settings: AppSettings) -> _HistoryStartup:
+    if not settings.record_history:
+        return _HistoryStartup()
+    try:
+        db = HistoryDB()
+        try:
+            adopted = adopt_legacy_root_db(db)
+            if adopted:
+                log.info("Adopted legacy root history: %s", adopted)
+        except Exception:
+            log.exception("Legacy root history adoption failed - continuing")
+        recovered = db.recover_incomplete_runs()
+        for run_id, started_at in recovered:
+            log.info("Recovered stale session id=%d started_at=%s, marked as crashed", run_id, started_at)
+        if settings.history_retention_days > 0:
+            cutoff = datetime.now(UTC) - timedelta(days=settings.history_retention_days)
+            db.purge_before(cutoff.isoformat())
+        try:
+            changed, old, current = detect_bios_change(db)
+        except Exception:
+            log.exception("Failed to detect BIOS change")
+            return _HistoryStartup(db=db)
+        return _HistoryStartup(db=db, bios_changed=changed, bios_old=old, bios_current=current)
+    except Exception:
+        log.exception("Failed to initialize history database")
+        return _HistoryStartup()
 
 
 class TestWorker(QThread):
@@ -61,7 +104,7 @@ class TestWorker(QThread):
     core_finished = Signal(int, object)  # core_id, StressResult
     status_updated = Signal(int, object)  # core_id, CoreTestStatus
     cycle_completed = Signal(int)
-    test_completed = Signal(str)  # JSON-encoded results — avoids PySide6 dict marshalling crash
+    test_completed = Signal(str)  # JSON-encoded results avoid PySide6 dict marshalling crash
     thermal_throttled = Signal(float)
     stall_detected = Signal(int)
     phase_changed = Signal(int, str)
@@ -106,55 +149,26 @@ class MainWindow(QMainWindow):
         self._test_start_time: float = 0
         self._hwmon = HWMonReader()
         self._msr = MSRReader()
-        self._core_telemetry: dict[int, dict] = {}  # core_id -> {max_freq, max_temp, last_vcore}
+        self._core_telemetry: dict[int, dict] = {}
         self._core_status_cache: dict[int, CoreTestStatus] = {}
         self._cached_cycle: int = 0
         self._active_test_core: int | None = None
         self._logger: TestRunLogger | None = None
+        self._worker_crash: str | None = None
+        self._workload_owner = _WorkloadOwner.NONE
 
-        # History database
-        self._history_db: HistoryDB | None = None
-        if self._settings.record_history:
-            try:
-                self._history_db = HistoryDB()
-                # One-database guarantee: under sudo, merge any history left
-                # under /root into the user's database.
-                try:
-                    adopted = adopt_legacy_root_db(self._history_db)
-                    if adopted:
-                        log.info("Adopted legacy root history: %s", adopted)
-                except Exception:
-                    log.exception("Legacy root history adoption failed — continuing")
-                recovered = self._history_db.recover_incomplete_runs()
-                if recovered:
-                    for run_id, started_at in recovered:
-                        log.info("Recovered stale session id=%d started_at=%s, marked as crashed", run_id, started_at)
-                # Purge old runs
-                if self._settings.history_retention_days > 0:
-                    cutoff = datetime.now(UTC) - timedelta(days=self._settings.history_retention_days)
-                    self._history_db.purge_before(cutoff.isoformat())
-                # Check for BIOS version changes
-                self._bios_changed = False
-                self._bios_old = ""
-                self._bios_current = ""
-                try:
-                    changed, old, current = detect_bios_change(self._history_db)
-                    if changed:
-                        self._bios_changed = True
-                        self._bios_old = old
-                        self._bios_current = current
-                        log.info("BIOS version changed: %s -> %s", old, current)
-                except Exception:
-                    log.debug("Failed to detect BIOS change", exc_info=True)
-            except Exception:
-                log.exception("Failed to initialize history database")
-                self._history_db = None
+        history = _start_history(self._settings)
+        self._history_db = history.db
+        self._bios_changed = history.bios_changed
+        self._bios_old = history.bios_old
+        self._bios_current = history.bios_current
 
         self._detect_cpu()
         self._setup_ui()
         self._setup_toolbar()
         self._setup_status_bar()
         self._setup_timer()
+        self._refresh_workload_owner()
 
         self.resize(self._settings.window_width, self._settings.window_height)
 
@@ -186,7 +200,7 @@ class MainWindow(QMainWindow):
             if self._topology.smt_enabled:
                 info_parts.append("SMT")
             info_label = QLabel(" | ".join(info_parts))
-            info_label.setStyleSheet(f"color: {theme.COLOR_TEXT_DIM}; padding: 0 6px;")
+            set_semantic_style(info_label, lambda: f"color: {theme.COLOR_TEXT_DIM}; padding: 0 6px")
             left.addWidget(info_label)
 
         self._core_grid = CoreGridWidget(self._topology)
@@ -195,7 +209,7 @@ class MainWindow(QMainWindow):
 
         main_layout.addLayout(left, stretch=0)
 
-        # right: tabs — align with CPU header on the left
+        # right: tabs, aligned with the CPU header on the left
         self._tabs = QTabWidget()
         self._tabs.setContentsMargins(0, 0, 0, 0)
         self._tabs.setDocumentMode(True)
@@ -222,7 +236,7 @@ class MainWindow(QMainWindow):
         self._tabs.addTab(self._tuner_tab, "Auto-Tuner")
 
         self._history_tab = HistoryTab(self._history_db)
-        if getattr(self, "_bios_changed", False):
+        if self._bios_changed:
             self._history_tab.set_bios_warning(self._bios_old, self._bios_current)
         self._history_tab.load_profile_requested.connect(self._on_load_co_profile)
         self._tabs.addTab(self._history_tab, "History")
@@ -242,11 +256,14 @@ class MainWindow(QMainWindow):
 
         self._start_btn = QPushButton("▶ Start Test")
         self._start_btn.setFixedHeight(36)
-        self._start_btn.setStyleSheet(
-            f"QPushButton {{ background: {theme.BTN_GREEN}; color: white; padding: 0 16px; "
-            "border-radius: 4px; font-weight: bold; font-size: 13px; } "
-            f"QPushButton:hover {{ background: {theme.COLOR_PASS_DARK}; }} "
-            f"QPushButton:disabled {{ background: {theme.BORDER_DIM}; color: {theme.COLOR_MUTED}; }}"
+        set_semantic_style(
+            self._start_btn,
+            lambda: (
+                f"QPushButton {{ background: {theme.BTN_GREEN}; color: white; padding: 0 16px; "
+                "border-radius: 4px; font-weight: bold; font-size: 13px; } "
+                f"QPushButton:hover {{ background: {theme.COLOR_PASS_DARK}; }} "
+                f"QPushButton:disabled {{ background: {theme.BORDER_DIM}; color: {theme.COLOR_MUTED}; }}"
+            ),
         )
         self._start_btn.clicked.connect(self._start_test)
         toolbar.addWidget(self._start_btn)
@@ -254,11 +271,14 @@ class MainWindow(QMainWindow):
         self._stop_btn = QPushButton("⏹ Stop")
         self._stop_btn.setFixedHeight(36)
         self._stop_btn.setEnabled(False)
-        self._stop_btn.setStyleSheet(
-            f"QPushButton {{ background: {theme.BTN_RED}; color: white; padding: 0 16px; "
-            "border-radius: 4px; font-weight: bold; font-size: 13px; } "
-            f"QPushButton:hover {{ background: {theme.COLOR_FAIL_DARK}; }} "
-            f"QPushButton:disabled {{ background: {theme.BORDER_DIM}; color: {theme.COLOR_MUTED}; }}"
+        set_semantic_style(
+            self._stop_btn,
+            lambda: (
+                f"QPushButton {{ background: {theme.BTN_RED}; color: white; padding: 0 16px; "
+                "border-radius: 4px; font-weight: bold; font-size: 13px; } "
+                f"QPushButton:hover {{ background: {theme.COLOR_FAIL_DARK}; }} "
+                f"QPushButton:disabled {{ background: {theme.BORDER_DIM}; color: {theme.COLOR_MUTED}; }}"
+            ),
         )
         self._stop_btn.clicked.connect(self._stop_test)
         toolbar.addWidget(self._stop_btn)
@@ -302,52 +322,66 @@ class MainWindow(QMainWindow):
                     "grant. Launch through the setcap launcher (services.corecycler.msrAccess on "
                     "NixOS installs it at /run/wrappers/bin/corecycler) or run as root."
                 )
-            priv_label.setStyleSheet(f"color: {theme.COLOR_WARN_SOFT}; font: 10px monospace;")
+            set_semantic_style(priv_label, lambda: f"color: {theme.COLOR_WARN_SOFT}; font: 10px monospace")
             self._status_bar.addPermanentWidget(priv_label)
 
     def _setup_timer(self) -> None:
         self._elapsed_timer = QTimer(self)
         self._elapsed_timer.timeout.connect(self._update_elapsed)
 
+    def _active_workload_owner(self) -> _WorkloadOwner:
+        if self._workload_owner is not _WorkloadOwner.NONE:
+            return self._workload_owner
+        if self._worker and self._worker.isRunning():
+            return _WorkloadOwner.MANUAL
+        engine = getattr(self._tuner_tab, "_engine", None)
+        if self._tuner_tab.is_running or (engine and engine.status in {"running", "paused", "validating", "hunting"}):
+            return _WorkloadOwner.TUNER
+        if self._history_db and self._history_db.get_active_tuner_session() is not None:
+            return _WorkloadOwner.TUNER
+        memory_worker = getattr(self._memory_tab, "_stress_worker", None)
+        if memory_worker and memory_worker.isRunning():
+            return _WorkloadOwner.MEMORY
+        return _WorkloadOwner.NONE
+
+    def _workload_is_owned(self) -> bool:
+        return self._active_workload_owner() is not _WorkloadOwner.NONE
+
+    def _refresh_workload_owner(self) -> None:
+        self._workload_owner = self._active_workload_owner()
+        self._apply_workload_owner()
+
+    def _set_workload_owner(self, owner: _WorkloadOwner) -> None:
+        self._workload_owner = owner
+        self._apply_workload_owner()
+
+    def _apply_workload_owner(self) -> None:
+        owner = self._active_workload_owner()
+        self._start_btn.setEnabled(owner is _WorkloadOwner.NONE)
+        self._stop_btn.setEnabled(owner is _WorkloadOwner.MANUAL)
+        self._tuner_tab.set_test_running(owner in {_WorkloadOwner.MANUAL, _WorkloadOwner.MEMORY})
+        self._memory_tab.set_test_running(owner in {_WorkloadOwner.MANUAL, _WorkloadOwner.TUNER})
+        self._smu_tab.set_tuner_running(owner is _WorkloadOwner.TUNER)
+
     def _start_test(self) -> None:
         if not self._topology:
             QMessageBox.warning(self, "Error", "CPU topology not detected")
             return
 
-        # Check if memory stress is running
-        if (
-            hasattr(self, "_memory_tab")
-            and self._memory_tab._stress_worker
-            and self._memory_tab._stress_worker.isRunning()
-        ):
+        owner = self._active_workload_owner()
+        if owner is not _WorkloadOwner.NONE:
             QMessageBox.warning(
-                self, "Memory Stress Active", "A memory stress test is running. Stop it before starting a core test."
+                self,
+                "Workload Active",
+                f"The {owner.value} workload owns the stress hardware. Stop or abort it first.",
             )
             return
 
-        # Warn if an active/paused tuner session exists — running a manual test
-        # won't corrupt CO offsets (manual tests don't touch SMU), but the user
-        # should be aware their tuner session is waiting.
-        if self._history_db:
-            from corecycler.tuner import persistence as _tp
-
-            active = _tp.get_active_session(self._history_db)
-            if active:
-                reply = QMessageBox.question(
-                    self,
-                    "Active Tuner Session",
-                    f"A tuner session is {active.status} "
-                    f"(started {format_local(active.created_at, date_only=True)}).\n\n"
-                    "Manual stress tests don't modify CO offsets, but you may want to "
-                    "resume or abort the tuner session first.\n\n"
-                    "Continue with manual test anyway?",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                    QMessageBox.StandardButton.No,
-                )
-                if reply != QMessageBox.StandardButton.Yes:
-                    return
-
-        profile = self._config_tab.get_profile()
+        try:
+            profile = self._config_tab.get_profile()
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid profile", str(exc))
+            return
 
         # select backend
         backend = self._get_backend(profile.backend)
@@ -374,6 +408,7 @@ class MainWindow(QMainWindow):
             variable_load=profile.variable_load,
             idle_stability_test=profile.idle_stability_test,
             idle_between_cores=profile.idle_between_cores,
+            require_thermal_sensor=True,
         )
 
         try:
@@ -404,6 +439,7 @@ class MainWindow(QMainWindow):
         self._core_status_cache.clear()
         self._cached_cycle = 0
         self._active_test_core = None
+        self._worker_crash = None
         self._worker = TestWorker(scheduler)
         self._worker.core_started.connect(self._on_core_started)
         self._worker.core_finished.connect(self._on_core_finished)
@@ -433,11 +469,7 @@ class MainWindow(QMainWindow):
                 log.exception("Failed to create history logger")
                 self._logger = None
 
-        # UI state — mutual exclusion with tuner and memory stress
-        self._start_btn.setEnabled(False)
-        self._stop_btn.setEnabled(True)
-        self._tuner_tab.set_test_running(True)
-        self._memory_tab.set_test_running(True)
+        self._set_workload_owner(_WorkloadOwner.MANUAL)
         self._test_start_time = time.monotonic()
         self._elapsed_timer.start(1000)
         self._tabs.setCurrentWidget(self._results_tab)
@@ -451,7 +483,7 @@ class MainWindow(QMainWindow):
         self._stop_btn.setEnabled(False)
         self._status_msg.setText("Stopping...")
 
-        # Disconnect logger from worker signals BEFORE stopping — prevents
+        # Disconnect logger from worker signals before stopping. This prevents
         # half-torn-down logger from receiving queued signals during shutdown
         if self._logger and self._worker:
             with contextlib.suppress(RuntimeError):
@@ -486,7 +518,7 @@ class MainWindow(QMainWindow):
             self._logger = None
         self._core_telemetry.clear()
 
-        # Signal the scheduler to stop — worker thread will finish naturally
+        # Signal the scheduler to stop. The worker thread will finish naturally
         # and _on_worker_finished will handle UI cleanup
         self._worker.scheduler.stop()
 
@@ -505,12 +537,12 @@ class MainWindow(QMainWindow):
 
     @Slot(int, object)
     def _on_status_cached(self, core_id: int, status: CoreTestStatus) -> None:
-        """Cache core status from worker thread — signal/slot is thread-safe."""
+        """Cache core status from the worker thread via a thread-safe signal and slot."""
         self._core_status_cache[core_id] = status
 
     @Slot(int)
     def _on_cycle_cached(self, cycle: int) -> None:
-        """Cache cycle number from worker thread — signal/slot is thread-safe."""
+        """Cache the cycle number from the worker thread via a thread-safe signal and slot."""
         self._cached_cycle = cycle
 
     @Slot(int, object)
@@ -537,7 +569,7 @@ class MainWindow(QMainWindow):
             state = "PASS" if (result and result.passed) else "FAIL"
             self._results_tab.add_log(
                 core_id,
-                f"[{state}] Peak: {t['max_freq']:.0f} MHz, Max temp: {t['max_temp']:.1f}C{extra}",
+                f"[{state}] Peak: {t['max_freq']:.0f} MHz, Max temp: {format_temperature(t['max_temp'])}{extra}",
             )
 
             # Record peak telemetry in history
@@ -581,7 +613,7 @@ class MainWindow(QMainWindow):
 
         # Keys are stringified core_ids, values are lists of result dicts.
         # A core with no verdict (stopped before its test earned one) is not
-        # tested — counting it as failed would read as a silicon problem.
+        # tested. Counting it as failed would read as a silicon problem.
         tested = {cid: r_list for cid, r_list in results.items() if isinstance(r_list, list) and r_list}
         total = len(tested)
         passed = sum(1 for r_list in tested.values() if _all_passed(r_list))
@@ -611,39 +643,46 @@ class MainWindow(QMainWindow):
     def _on_worker_crashed(self, message: str) -> None:
         if self._closing:
             return
+        self._worker_crash = message
+        if self._logger:
+            try:
+                self._logger.on_test_crashed(message)
+            except Exception:
+                log.exception("Failed to record worker crash in history")
+            self._logger = None
         self._status_msg.setText(f"Test worker crashed: {message}")
 
     def _on_worker_finished(self) -> None:
         if self._closing:
             return
         was_stopping = not self._stop_btn.isEnabled()
+        crash = self._worker_crash
         self._cleanup_worker()
         self._logger = None
         self._history_tab.refresh()
-        if was_stopping:
+        if crash is not None:
+            self._status_msg.setText(f"Test worker crashed: {crash}")
+        elif was_stopping:
             self._status_msg.setText("Test stopped")
         else:
             self._status_msg.setText("Test complete")
 
     def _cleanup_worker(self) -> None:
-        """Reset UI state after worker finishes or crashes."""
-        self._start_btn.setEnabled(True)
-        self._stop_btn.setEnabled(False)
-        self._tuner_tab.set_test_running(False)
-        self._memory_tab.set_test_running(False)
+        self._worker = None
+        self._set_workload_owner(_WorkloadOwner.NONE)
         self._monitor_tab.set_active_core(None)
         self._elapsed_timer.stop()
         self._core_status_cache.clear()
         self._cached_cycle = 0
         self._active_test_core = None
-        self._worker = None
 
     @Slot(bool)
     def _on_tuner_running_changed(self, running: bool) -> None:
-        """Mutual exclusion: disable manual test Start and CO writes when tuner is active."""
-        self._start_btn.setEnabled(not running)
-        self._smu_tab.set_tuner_running(running)
-        self._memory_tab.set_test_running(running)
+        if running:
+            self._set_workload_owner(_WorkloadOwner.TUNER)
+            return
+        self._set_workload_owner(_WorkloadOwner.NONE)
+        self._refresh_workload_owner()
 
     @Slot(int, str)
     def _on_tuner_core_update(self, core_id: int, state: str) -> None:
@@ -665,28 +704,21 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_memory_stress_started(self) -> None:
-        """Set all cores to memory stress state; lock the other test starters."""
-        self._start_btn.setEnabled(False)
-        self._tuner_tab.set_test_running(True)
+        self._set_workload_owner(_WorkloadOwner.MEMORY)
         for core_id in self._core_grid._cells:
             status = CoreTestStatus(core_id=core_id, state="mem_stress")
             self._core_grid.update_core_status(core_id, status)
 
     @Slot(bool)
     def _on_memory_stress_done(self, passed: bool) -> None:
-        """Reset cores to pending; release the other test starters."""
-        self._start_btn.setEnabled(
-            (self._worker is None or not self._worker.isRunning()) and not self._tuner_tab.is_running
-        )
-        self._tuner_tab.set_test_running(False)
+        self._set_workload_owner(_WorkloadOwner.NONE)
         for core_id in self._core_grid._cells:
             status = CoreTestStatus(core_id=core_id, state="pending")
             self._core_grid.update_core_status(core_id, status)
 
-    @Slot(object)
-    def _on_load_co_profile(self, profile) -> None:
-        """Load CO profile from history into Curve Optimizer tab."""
-        self._smu_tab.set_co_profile(profile)
+    @Slot(object, str)
+    def _on_load_co_profile(self, profile: dict[int, int], source_cpu_model: str) -> None:
+        self._smu_tab.set_co_profile(profile, source_cpu_model)
         self._tabs.setCurrentWidget(self._smu_tab)
 
     @Slot(int)
@@ -694,7 +726,7 @@ class MainWindow(QMainWindow):
         """Refresh data when switching tabs."""
         widget = self._tabs.widget(index)
         # Auto-refresh CO values when switching to Curve Optimizer tab (only
-        # when tuner is idle — tuner sends live updates via update_current_co())
+        # when tuner is idle; tuner sends live updates via update_current_co())
         if widget is self._smu_tab and hasattr(self._smu_tab, "_read_all_co") and not self._tuner_tab.is_running:
             self._smu_tab._read_all_co()
 
@@ -762,11 +794,9 @@ class MainWindow(QMainWindow):
             if power_reading:
                 core_watts = power_reading.watts
 
-        # temperature (prefer per-CCD temp over package Tctl)
         hwmon_data = self._hwmon.read()
         ccd = core_info.ccd if core_info.ccd is not None else 0
-        # k10temp: Tccd1 -> CCD 0 (index offset)
-        temp = hwmon_data.tccd_temps.get(ccd + 1, hwmon_data.tctl_c or 0)
+        temp = hwmon_data.ccd_temperatures_c.get(ccd, hwmon_data.tctl_c)
         vcore = hwmon_data.vcore_v
 
         self._core_grid.update_core_telemetry(
@@ -794,7 +824,7 @@ class MainWindow(QMainWindow):
                 "max_freq": 0.0,
                 "max_stretch_pct": 0.0,
                 "core_watts": None,
-                "max_temp": 0.0,
+                "max_temp": None,
                 "last_vcore": None,
                 "min_vcore": None,
                 "max_vcore": None,
@@ -806,7 +836,7 @@ class MainWindow(QMainWindow):
             t["max_stretch_pct"] = stretch_pct
         if core_watts is not None:
             t["core_watts"] = core_watts
-        if temp > t["max_temp"]:
+        if temp is not None and (t["max_temp"] is None or temp > t["max_temp"]):
             t["max_temp"] = temp
         if vcore is not None:
             t["last_vcore"] = vcore
@@ -860,21 +890,22 @@ class MainWindow(QMainWindow):
         self._tuner_tab._resume_session(session.id)
 
     def closeEvent(self, event) -> None:
-        # Check if ANYTHING is running (manual test OR tuner OR memory stress)
         self._closing = True
-        manual_running = self._worker and self._worker.isRunning()
-        tuner_running = self._tuner_tab.is_running
-        memory_running = (
-            hasattr(self, "_memory_tab")
-            and self._memory_tab._stress_worker is not None
-            and self._memory_tab._stress_worker.isRunning()
+        manual_running = bool(self._worker and self._worker.isRunning())
+        tuner_engine = getattr(self._tuner_tab, "_engine", None)
+        tuner_running = bool(
+            self._tuner_tab.is_running
+            or (tuner_engine and tuner_engine.status in {"running", "paused", "validating", "hunting"})
         )
-
-        if manual_running or tuner_running or memory_running:
+        memory_worker = getattr(self._memory_tab, "_stress_worker", None)
+        memory_running = bool(memory_worker and memory_worker.isRunning())
+        owner = self._active_workload_owner()
+        workload_active = owner is not _WorkloadOwner.NONE
+        if workload_active:
             reply = QMessageBox.question(
                 self,
                 "Test Running",
-                "A test is still running. Stop and exit?",
+                "A workload owns the stress hardware. Stop and exit?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
@@ -882,51 +913,48 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
 
-        # Stop manual test worker
-        if manual_running:
-            # Disconnect logger BEFORE stopping worker — prevents queued signals
-            # from writing to the DB after we close it
-            if self._logger and self._worker:
+        if manual_running and self._worker:
+            self._worker.scheduler.force_stop()
+            if not self._worker.scheduler.force_teardown() or not self._worker.wait(5000):
+                self._closing = False
+                QMessageBox.warning(self, "Teardown incomplete", "The stress payload could not be confirmed stopped.")
+                event.ignore()
+                return
+            if self._logger:
                 with contextlib.suppress(RuntimeError):
                     self._worker.core_started.disconnect(self._logger.on_core_started)
                     self._worker.core_finished.disconnect(self._logger.on_core_finished)
                     self._worker.status_updated.disconnect(self._logger.on_status_updated)
                     self._worker.cycle_completed.disconnect(self._logger.on_cycle_completed)
                     self._worker.test_completed.disconnect(self._logger.on_test_completed)
-                # Mark the run as stopped before closing DB
                 with contextlib.suppress(Exception):
                     self._logger.on_test_stopped()
                 self._logger = None
-
-            # Disconnect thread-safety cache signals, and the finished handler:
-            # its queued delivery lands after this method closes the database.
             with contextlib.suppress(RuntimeError):
                 self._worker.status_updated.disconnect(self._on_status_cached)
                 self._worker.cycle_completed.disconnect(self._on_cycle_cached)
             with contextlib.suppress(RuntimeError, TypeError):
                 self._worker.finished.disconnect(self._on_worker_finished)
 
-            self._worker.scheduler.force_stop()
-            if not self._worker.wait(5000):
-                self._worker.terminate()
-                self._worker.wait(2000)
-
-        # Stop auto-tuner
         if tuner_running:
             self._tuner_tab.force_stop()
-
-        # Stop memory stress test if running
-        if hasattr(self, "_memory_tab"):
+        if memory_running:
             self._memory_tab.force_stop()
 
-        # save window size
-        self._settings.window_width = self.width()
-        self._settings.window_height = self.height()
-        save_settings(self._settings)
+        try:
+            profile = self._config_tab.get_profile()
+            self._settings.update_active_profile(profile)
+            self._settings.window_width = self.width()
+            self._settings.window_height = self.height()
+            save_settings(self._settings)
+        except (OSError, ValueError) as exc:
+            self._closing = False
+            QMessageBox.warning(self, "Settings not saved", str(exc))
+            event.ignore()
+            return
 
         self._monitor_tab.stop_monitoring()
-        if self._msr:
-            self._msr.close()
+        self._msr.close()
         if self._history_db:
             self._history_db.close()
         event.accept()

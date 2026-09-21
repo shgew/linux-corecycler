@@ -53,13 +53,16 @@ class MicroFreezeMonitor:
         self._thread = threading.Thread(target=self._run, name="micro-freeze-monitor", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
-        """Stop monitoring and wait for its thread to exit."""
+    def stop(self) -> bool:
+        """Stop monitoring and report whether its writer terminated."""
         self._stop_event.set()
-        if self._thread is not None:
-            self._thread.join(timeout=2.0)
-            if not self._thread.is_alive():
-                self._thread = None
+        if self._thread is None:
+            return True
+        self._thread.join(timeout=2.0)
+        if self._thread.is_alive():
+            return False
+        self._thread = None
+        return True
 
     def set_context(self, context: str) -> None:
         with self._lock:

@@ -68,3 +68,63 @@ class TestStressGuards:
         assert seen == [True]
         assert tab._stress_btn.isEnabled()
         assert not tab._stop_btn.isEnabled()
+
+
+class TestMemoryTelemetryWorker:
+    def test_inventory_spd_and_temperatures_are_sampled_by_worker(self, monkeypatch):
+        import corecycler.gui.memory_tab as mt
+        from corecycler.monitor.memory import DIMMInfo
+
+        tab = _tab()
+        dimm = DIMMInfo(locator="DIMM_A1", size_gb=32, mem_type="DDR5", speed_mt=6000)
+        monkeypatch.setattr(mt, "read_dimm_info", lambda: [dimm])
+        tab._memory_worker.spd_reader = MagicMock()
+        tab._memory_worker.spd_reader.spd_timings = None
+        tab._memory_worker.spd_reader.read_temperatures.return_value = [51.5]
+        tab._memory_worker.pm_reader = MagicMock()
+        tab._memory_worker.pm_reader.is_available.return_value = False
+        tab._memory_worker.run()
+
+        assert tab._dimms == [dimm]
+        assert "32" in tab._summary_label.text()
+        assert "51.5" in tab._temp_labels[0].text()
+
+    def test_source_failure_is_logged_without_dropping_inventory(self, monkeypatch, caplog):
+        import corecycler.gui.memory_tab as mt
+        from corecycler.monitor.memory import DIMMInfo
+
+        tab = _tab()
+        dimm = DIMMInfo(locator="DIMM_A1", size_gb=16, mem_type="DDR5")
+        monkeypatch.setattr(mt, "read_dimm_info", lambda: [dimm])
+        tab._memory_worker.spd_reader = MagicMock()
+        tab._memory_worker.spd_reader.spd_timings = None
+        tab._memory_worker.spd_reader.read_temperatures.side_effect = OSError("sensor gone")
+        tab._memory_worker.pm_reader = MagicMock()
+        tab._memory_worker.pm_reader.is_available.return_value = False
+
+        tab._memory_worker.run()
+
+        assert tab._dimms == [dimm]
+        assert not tab._temp_labels
+        assert "sensor gone" in caplog.text
+
+    def test_refresh_schedules_inventory_without_overlapping_worker(self):
+        tab = _tab()
+        worker = MagicMock()
+        worker.isRunning.return_value = False
+        tab._memory_worker = worker
+
+        tab._refresh_memory_info()
+
+        assert worker.refresh_inventory is True
+        worker.start.assert_called_once_with()
+
+        worker.reset_mock()
+        worker.isRunning.return_value = True
+        tab._request_update()
+        worker.start.assert_not_called()
+
+    def test_empty_inventory_is_rendered_as_unavailable(self):
+        tab = _tab()
+        tab._apply_inventory(())
+        assert "No DIMM info available" in tab._summary_label.text()

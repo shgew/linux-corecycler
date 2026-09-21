@@ -1,8 +1,8 @@
-# ryzen_smu kernel module — exposes AMD SMU interface for Curve Optimizer,
-# PBO limits, boost override, and PM table access.
-#
-# Supports both GCC and Clang/LLVM kernels (auto-detected from kernel makeFlags).
-# Source: https://github.com/amkillam/ryzen_smu (amkillam fork with Zen 5 support)
+# ryzen_smu kernel module for Curve Optimizer, PBO controls, and PM table access.
+# The local patch fixes two pinned-upstream safety defects: non-OK mailbox
+# responses being lost while retries remain, and stale SMN data after read failure.
+# Supports GCC and Clang/LLVM kernels through the shared toolchain helper.
+# Source: https://github.com/amkillam/ryzen_smu
 {
   lib,
   stdenv,
@@ -11,13 +11,14 @@
   llvmPackages_latest,
 }:
 let
-  kernelUsesLLVM = builtins.any (
-    flag:
-    builtins.match ".*LLVM=1.*" (toString flag) != null
-    || builtins.match ".*CC=clang.*" (toString flag) != null
-  ) (kernel.makeFlags or [ ]);
-
-  buildStdenv = if kernelUsesLLVM then llvmPackages_latest.stdenv else stdenv;
+  toolchain = import ./kernel-module-toolchain.nix {
+    inherit
+      lib
+      stdenv
+      kernel
+      llvmPackages_latest
+      ;
+  };
 
   version = "0.1.7-unstable-2026-08-15";
 
@@ -28,26 +29,21 @@ let
     hash = "sha256-OmEoycRO3hGkqueLa0i6AzmwMEbdkkPrwJkMyYxOTek=";
   };
 in
-buildStdenv.mkDerivation {
+toolchain.buildStdenv.mkDerivation {
   pname = "ryzen-smu-${kernel.version}";
   inherit version src;
+  patches = [ ./ryzen-smu-mailbox.patch ];
 
   hardeningDisable = [ "pic" ];
 
-  nativeBuildInputs =
-    kernel.moduleBuildDependencies
-    ++ lib.optionals kernelUsesLLVM [
-      llvmPackages_latest.lld
-    ];
+  nativeBuildInputs = toolchain.nativeBuildInputs;
 
   makeFlags = [
     "TARGET=${kernel.modDirVersion}"
     "KERNEL_BUILD=${kernel.dev}/lib/modules/${kernel.modDirVersion}/build"
   ]
-  ++ lib.optionals kernelUsesLLVM [
-    "LLVM=1"
-    "CC=clang"
-    "LD=ld.lld"
+  ++ toolchain.makeFlags
+  ++ lib.optionals toolchain.kernelUsesLLVM [
     "KCFLAGS=-Wno-unused-command-line-argument"
   ];
 

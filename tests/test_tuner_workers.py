@@ -9,6 +9,8 @@ stress process.
 from __future__ import annotations
 
 import json
+import threading
+import time
 from unittest.mock import MagicMock
 
 import pytest
@@ -81,10 +83,10 @@ class TestModuleHelpers:
         assert _read_cpu_times(9999) is None
 
     def test_cpu_times_tolerate_an_unreadable_proc(self, monkeypatch):
-        def _boom(*_args, **_kwargs):
+        def _boom():
             raise OSError("gone")
 
-        monkeypatch.setattr("builtins.open", _boom)
+        monkeypatch.setattr(eng, "_read_all_cpu_times", _boom)
         assert _read_cpu_times(0) is None
 
     def test_busy_fraction_needs_two_samples(self):
@@ -149,13 +151,52 @@ class TestTunerWorker:
 
     def test_a_live_msr_contributes_a_peak_stretch(self, monkeypatch):
         monkeypatch.setattr(eng, "_STRETCH_WARMUP_SECONDS", 0)
+        monkeypatch.setattr(eng, "_STRETCH_SAMPLE_INTERVAL", 0)
+        monkeypatch.setattr(eng, "_read_cpu_times", MagicMock(side_effect=[(0, 0), (0, 100)]))
+        sampled = threading.Event()
         msr = MagicMock()
         msr.is_available.return_value = True
-        msr.read_clock_stretch.return_value = {}
+        readings = iter([{}, {0: MagicMock(stretch_pct=4.25)}])
+
+        def read_stretch(_cpus):
+            value = next(readings)
+            if value:
+                sampled.set()
+            return value
+
+        msr.read_clock_stretch.side_effect = read_stretch
         worker = self._worker({0: [_result(0, True)]}, msr=msr)
+        worker.scheduler.run.side_effect = lambda: (sampled.wait(1), {0: [_result(0, True)]})[1]
         seen = _collect(worker)
         worker.run()
         assert seen[0][1] is True
+        assert seen[0][5] == pytest.approx(4.25)
+
+    def test_a_sampler_is_joined_when_the_scheduler_raises(self, monkeypatch):
+        monkeypatch.setattr(eng, "_STRETCH_WARMUP_SECONDS", 0)
+        monkeypatch.setattr(eng, "_STRETCH_SAMPLE_INTERVAL", 0)
+        sampled = threading.Event()
+        msr = MagicMock()
+        msr.is_available.return_value = True
+
+        def read_stretch(_cpus):
+            sampled.set()
+            return {0: MagicMock(stretch_pct=1.0)}
+
+        msr.read_clock_stretch.side_effect = read_stretch
+        worker = self._worker({}, msr=msr)
+
+        def fail_after_sample():
+            assert sampled.wait(1)
+            raise RuntimeError("scheduler failed")
+
+        worker.scheduler.run.side_effect = fail_after_sample
+        seen = _collect(worker)
+        worker.run()
+        reads_after_run = msr.read_clock_stretch.call_count
+        time.sleep(0.01)
+        assert seen[0][3] == "startup"
+        assert msr.read_clock_stretch.call_count == reads_after_run
 
     def test_the_scheduler_is_exposed_to_subclasses(self):
         scheduler = MagicMock()
@@ -281,6 +322,26 @@ class TestSoakWorker:
         assert seen[0][1] is True
         assert seen[0][2] == ""
 
+    @pytest.mark.parametrize(
+        ("temperature", "error_type", "message"),
+        [
+            (None, "startup", "No CPU temperature sensor available during soak"),
+            (95.5, "thermal", "CPU temperature 95.5 C exceeded the soak limit"),
+        ],
+    )
+    def test_an_unsafe_thermal_watch_stops_the_soak(self, temperature, error_type, message):
+        thermal = MagicMock(last_temperature=temperature)
+        thermal.safe.return_value = False
+        worker = _SoakWorker(0, 60, thermal=thermal)
+        worker.detector = MagicMock()
+        seen = _collect(worker)
+
+        worker.run()
+
+        assert seen[0][1] is False
+        assert seen[0][2] == message
+        assert seen[0][3] == error_type
+
     def test_a_kernel_event_ends_the_soak(self):
         worker = _SoakWorker(1, 60)
         worker.detector = MagicMock()
@@ -292,11 +353,14 @@ class TestSoakWorker:
         assert "corrected" in seen[0][2]
         assert json.loads(seen[0][6])[0]["cpu"] == 1
 
-    def test_a_quiet_watch_polls_until_its_duration_ends(self):
+    def test_a_quiet_watch_polls_until_its_duration_ends(self, monkeypatch):
         worker = _SoakWorker(0, 600)
         worker.detector = MagicMock()
         worker.detector.check_mce.return_value = []
-        worker._stop = _Ticks([False, False, True])
+        worker._stop = MagicMock()
+        worker._stop.is_set.return_value = False
+        worker._stop.wait.return_value = False
+        monkeypatch.setattr(eng.time, "monotonic", MagicMock(side_effect=[0.0, 0.0, 600.0, 600.0, 600.0]))
         seen = _collect(worker)
         worker.run()
         assert seen[0][1] is True
@@ -308,7 +372,8 @@ class TestSoakWorker:
         worker.stop()
         seen = _collect(worker)
         worker.run()
-        assert seen[0][1] is True
+        assert seen[0][1] is False
+        assert seen[0][3] == "killed"
 
     def test_a_broken_detector_is_an_apparatus_fault(self):
         worker = _SoakWorker(0, 10)

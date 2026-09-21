@@ -1,4 +1,4 @@
-"""Tests for UI data consistency — CoreGridWidget telemetry pipeline fix."""
+"""Tests for UI data consistency and the CoreGridWidget telemetry pipeline."""
 
 from __future__ import annotations
 
@@ -88,13 +88,12 @@ class TestCoreGridTelemetryFed:
     def test_core_grid_telemetry_fed(self, mock_freqs):
         """_feed_core_grid_telemetry with _active_test_core=0 calls update_core_telemetry."""
         from corecycler.gui.main_window import MainWindow
-        from corecycler.monitor.hwmon import HWMonData
 
         topo = CPUTopology()
-        topo.cores = {0: PhysicalCore(core_id=0, ccd=0, ccx=None, logical_cpus=(0,))}
+        topo.cores = {0: PhysicalCore(core_id=0, ccd=0, logical_cpus=(0,))}
 
         hwmon_mock = MagicMock()
-        hwmon_mock.read.return_value = HWMonData(tctl_c=65.0, tccd_temps={1: 62.0}, vcore_v=1.25)
+        hwmon_mock.read.return_value = HWMonData(tctl_c=65.0, ccd_temperatures_c={1: 62.0}, vcore_v=1.25)
 
         msr_mock = MagicMock()
         msr_mock.is_available.return_value = True
@@ -126,6 +125,12 @@ class TestCoreGridTelemetryFed:
         call_args = core_grid_mock.update_core_telemetry.call_args
         assert call_args[0][0] == 0  # core_id
         assert call_args[0][1] > 0  # freq_mhz
+        assert call_args[0][2] == 65.0
+
+        hwmon_mock.read.return_value = HWMonData(tctl_c=None, ccd_temperatures_c={}, vcore_v=None)
+        core_grid_mock.update_core_telemetry.reset_mock()
+        ns._feed_core_grid_telemetry()
+        assert core_grid_mock.update_core_telemetry.call_args.args[2] is None
 
 
 class TestActiveTestCoreSetBySignal:
@@ -224,116 +229,6 @@ class TestMonitorTabNarrowedException:
         assert "OSError" in content, "monitor_tab.py should handle OSError for sysfs/procfs failures"
 
 
-class TestStalenessIndicator:
-    def test_staleness_indicator(self):
-        """After 3 consecutive None hwmon reads, tctl label should turn grey."""
-        from corecycler.gui.monitor_tab import MonitorTab
-
-        tab = types.SimpleNamespace()
-        tab._hwmon = MagicMock()
-        tab._power = MagicMock()
-        tab._msr = MagicMock()
-        tab._msr.is_available.return_value = False
-        tab._cpu_usage = MagicMock()
-        tab._cpu_usage.read.return_value = {}
-        tab._topology = None
-        tab._per_core_bars = {}
-        tab._per_core_visible = False
-        tab._hwmon_fail_count = 0
-        tab._power_fail_count = 0
-
-        # Mock labels
-        tab._tctl_label = _MockStyleLabel("Tctl: 65.0\u00b0C")
-        tab._vcore_label = _MockStyleLabel("Vcore: 1.2500V")
-        tab._power_label = _MockStyleLabel("Package: 120.0W")
-        tab._ccd_temp_labels = {}
-
-        # Mock charts
-        tab._freq_chart = MagicMock()
-        tab._temp_chart = MagicMock()
-        tab._voltage_chart = MagicMock()
-        tab._power_chart = MagicMock()
-        tab._max_freq_label = MagicMock()
-        tab._update_power_limits = MagicMock()
-
-        # hwmon returns None tctl for 3 consecutive reads
-        tab._hwmon.read.return_value = HWMonData(tctl_c=None, tccd_temps={}, vcore_v=None)
-        tab._power.read_power_watts.return_value = None
-
-        # Bind _do_update
-        tab._do_update = MethodType(MonitorTab._do_update, tab)
-
-        # Access class constants
-        tab._STALE_THRESHOLD = MonitorTab._STALE_THRESHOLD
-        tab._NORMAL_STYLE = MonitorTab._NORMAL_STYLE
-        tab._stale_style = MonitorTab._stale_style
-
-        # 3 consecutive failure reads
-        for _ in range(3):
-            tab._do_update()
-
-        # After 3 failures, label should be grey
-        assert tab._tctl_label.styleSheet() == MonitorTab._stale_style(), (
-            "tctl label should turn stale after 3 consecutive failures"
-        )
-        # Last-known text must be preserved (not cleared)
-        assert "65.0" in tab._tctl_label.text(), "tctl label should preserve last-known value"
-
-
-class TestStalenessRecovery:
-    def test_staleness_recovery(self):
-        """After staleness, a successful read should remove grey styling."""
-        from corecycler.gui.monitor_tab import MonitorTab
-
-        tab = types.SimpleNamespace()
-        tab._hwmon = MagicMock()
-        tab._power = MagicMock()
-        tab._msr = MagicMock()
-        tab._msr.is_available.return_value = False
-        tab._cpu_usage = MagicMock()
-        tab._cpu_usage.read.return_value = {}
-        tab._topology = None
-        tab._per_core_bars = {}
-        tab._per_core_visible = False
-        tab._hwmon_fail_count = 0
-        tab._power_fail_count = 0
-
-        tab._tctl_label = _MockStyleLabel("Tctl: 65.0\u00b0C")
-        tab._vcore_label = _MockStyleLabel("Vcore: 1.2500V")
-        tab._power_label = _MockStyleLabel("Package: 120.0W")
-        tab._ccd_temp_labels = {}
-
-        tab._freq_chart = MagicMock()
-        tab._temp_chart = MagicMock()
-        tab._voltage_chart = MagicMock()
-        tab._power_chart = MagicMock()
-        tab._max_freq_label = MagicMock()
-        tab._update_power_limits = MagicMock()
-
-        tab._do_update = MethodType(MonitorTab._do_update, tab)
-        tab._STALE_THRESHOLD = MonitorTab._STALE_THRESHOLD
-        tab._NORMAL_STYLE = MonitorTab._NORMAL_STYLE
-        tab._stale_style = MonitorTab._stale_style
-
-        # First, trigger staleness with 3 failures
-        tab._hwmon.read.return_value = HWMonData(tctl_c=None, tccd_temps={}, vcore_v=None)
-        tab._power.read_power_watts.return_value = None
-        for _ in range(3):
-            tab._do_update()
-
-        assert tab._tctl_label.styleSheet() == MonitorTab._stale_style()
-
-        # Now a successful read
-        tab._hwmon.read.return_value = HWMonData(tctl_c=72.0, tccd_temps={}, vcore_v=1.30)
-        tab._do_update()
-
-        # Grey should be removed, fail count reset
-        assert tab._tctl_label.styleSheet() != MonitorTab._stale_style(), (
-            "tctl label should recover from grey after successful read"
-        )
-        assert tab._hwmon_fail_count == 0, "fail count should be reset on success"
-
-
 class TestLoadToCOEnabledForConfirmed:
     """A finished session must offer Load to CO.
 
@@ -370,12 +265,13 @@ class TestLoadToCOEnabledForConfirmed:
             i: CoreState(core_id=i, phase=p, current_offset=-10, best_offset=best_offset, baseline_offset=0)
             for i, p in enumerate(phases)
         }
-        with (
-            patch("corecycler.gui.history_tab.tp.load_core_states", return_value=states),
-            patch("corecycler.gui.history_tab.tp.get_test_log", return_value=[]),
-            patch("corecycler.gui.history_tab.tp.get_events", return_value=[]),
-        ):
-            MethodType(HistoryTab._show_tuner_session_detail, ns)(sess)
+        ns._db.get_tuner_best_profile.return_value = (
+            {i: best_offset for i in range(4)} if best_offset is not None else {}
+        )
+        ns._db.get_tuner_core_states.return_value = states
+        ns._db.get_tuner_test_log.return_value = []
+        ns._db.get_tuner_events.return_value = []
+        MethodType(HistoryTab._show_tuner_session_detail, ns)(sess)
         return ns
 
     def test_all_confirmed_session_enables_load(self):
@@ -450,9 +346,9 @@ class TestColorsAreReadLiveNotFrozen:
 
 
 class TestEngineInitiatedStops:
-    """The engine pauses, aborts and quarantines ITSELF (thermal, apparatus,
-    SMU faults, breaker) — the buttons must follow status_changed, or every
-    self-stop strands the tab with Start greyed out and the config locked."""
+    """The engine can pause, abort, and quarantine itself after thermal, apparatus,
+    SMU, or breaker faults. The buttons must follow status_changed so each self-stop
+    leaves Start or Resume available as appropriate."""
 
     def _ns(self):
         ns = types.SimpleNamespace()
@@ -492,7 +388,7 @@ class TestEngineInitiatedStops:
 
         ns = self._ns()
         ns._set_running_state = MethodType(TunerTab._set_running_state, ns)
-        MethodType(TunerTab._on_status_changed, ns)("quarantined")
+        MethodType(TunerTab._on_status_changed, ns)("profile_quarantined")
         ns._start_btn.setEnabled.assert_called_with(True)
         ns.tuner_running_changed.emit.assert_called_with(False)
 

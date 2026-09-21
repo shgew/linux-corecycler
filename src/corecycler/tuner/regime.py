@@ -118,7 +118,7 @@ class Workload:
 #: The shipped battery. One entry minimum per regime; several entries in a
 #: regime rotate freely, since they all bank into the same confidence bucket.
 DEFAULT_BATTERY: tuple[Workload, ...] = (
-    Workload(Regime.BOOST, "mprime", "SSE", "SMALLEST", threads=1),
+    Workload(Regime.BOOST, "mprime", "SSE", "SMALL", threads=1),
     Workload(Regime.BOOST, "ycruncher", "AVX2", "SMALL", threads=1, tests=("BKT",)),
     Workload(Regime.CURRENT, "mprime", "AVX2", "SMALL", threads=2),
     Workload(Regime.CURRENT, "ycruncher", "AVX2", "SMALL", threads=2, tests=("FFTv4", "N63")),

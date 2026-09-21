@@ -1,19 +1,21 @@
-"""Test history persistence — crash-safe SQLite storage, logging, and export."""
+"""Test history persistence - crash-safe SQLite storage, logging, and export."""
 
 from corecycler.history.context import (
-    TuningContextRecord,
+    SystemContext,
     capture_system_context,
-    compute_co_hash,
+    compute_context_hash,
     detect_bios_change,
-    find_or_create_context,
     read_bios_version,
 )
 from corecycler.history.db import (
     CoreResultRecord,
     EventRecord,
     HistoryDB,
+    InFlightRecord,
+    LegacySession,
     RunRecord,
     TelemetrySample,
+    TuningContextRecord,
 )
 from corecycler.history.export import (
     export_run_csv,
@@ -30,12 +32,15 @@ __all__ = [
     "CoreResultRecord",
     "EventRecord",
     "HistoryDB",
+    "InFlightRecord",
+    "LegacySession",
     "RunRecord",
+    "SystemContext",
     "TelemetrySample",
     "TestRunLogger",
     "TuningContextRecord",
     "capture_system_context",
-    "compute_co_hash",
+    "compute_context_hash",
     "detect_bios_change",
     "export_run_csv",
     "export_run_csv_file",
@@ -43,7 +48,6 @@ __all__ = [
     "export_run_json_file",
     "export_runs_bulk_csv",
     "export_runs_bulk_csv_file",
-    "find_or_create_context",
     "format_local",
     "read_bios_version",
 ]

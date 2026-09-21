@@ -49,6 +49,9 @@ class ScriptedSupervisor:
         step = ScriptedSupervisor.script.pop(0)
         return step(self, lanes, config_for, duration)
 
+    def force_teardown(self):
+        return True
+
 
 @pytest.fixture(autouse=True)
 def scripted(monkeypatch):
@@ -61,7 +64,7 @@ def scripted(monkeypatch):
 def make_topo(cores: dict[int, tuple[int, ...]] | None = None) -> CPUTopology:
     topo = CPUTopology()
     for core_id, cpus in (cores or {0: (0, 16), 1: (1, 17)}).items():
-        topo.cores[core_id] = PhysicalCore(core_id=core_id, ccd=core_id // 8, ccx=None, logical_cpus=cpus)
+        topo.cores[core_id] = PhysicalCore(core_id=core_id, ccd=core_id // 8, logical_cpus=cpus)
     return topo
 
 
@@ -249,6 +252,68 @@ class TestRunOrchestration:
         assert results[1] == []
         assert sched.core_status[1].state == "pending"
 
+    def test_interrupted_cycle_is_not_reported_complete(self, tmp_path):
+        sched = make_scheduler(tmp_path, stop_on_error=True)
+        ScriptedSupervisor.script = [step_fail]
+        completed: list[int] = []
+        sched.on_cycle_complete.append(completed.append)
+
+        sched.run()
+
+        assert completed == []
+
+    def test_stop_before_run_is_honored(self, tmp_path):
+        sched = make_scheduler(tmp_path)
+        sched.stop()
+
+        assert sched.run() == {0: [], 1: []}
+        assert ScriptedSupervisor.created == []
+
+    def test_stop_observed_before_first_core_interrupts_the_cycle(self, tmp_path, monkeypatch):
+        sched = make_scheduler(tmp_path)
+
+        def stop_before_cores():
+            sched._stop_event.set()
+            return [0, 1]
+
+        monkeypatch.setattr(sched, "_get_test_cores", stop_before_cores)
+
+        assert sched.run() == {0: [], 1: []}
+        assert ScriptedSupervisor.created == []
+
+    def test_second_concurrent_run_is_rejected(self, tmp_path):
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocking(sup, lanes, config_for, duration):
+            entered.set()
+            release.wait(15)
+            return {one.core_id: ok(one.core_id) for one in lanes}
+
+        sched = make_scheduler(tmp_path, cores_to_test=[0])
+        ScriptedSupervisor.script = [blocking]
+        worker = threading.Thread(target=sched.run)
+        worker.start()
+        assert entered.wait(15)
+        try:
+            with pytest.raises(RuntimeError, match="already running"):
+                sched.run()
+        finally:
+            release.set()
+            worker.join(15)
+
+    def test_one_thread_lane_retains_all_siblings_for_mce_attribution(self, tmp_path):
+        sched = make_scheduler(tmp_path, cores_to_test=[1])
+        seen: list[tuple[int, ...]] = []
+
+        def inspect(sup, lanes, config_for, duration):
+            seen.append(lanes[0].sibling_cpus)
+            return {1: ok(1)}
+
+        ScriptedSupervisor.script = [inspect]
+        sched.run()
+        assert seen == [(1, 17)]
+
     def test_an_interrupted_core_gets_no_invented_result(self, tmp_path):
         sched = make_scheduler(tmp_path)
 
@@ -300,6 +365,15 @@ class TestRunOrchestration:
         sched = make_scheduler(tmp_path)
         sched.force_stop()
         assert sched.state == TestState.STOPPING
+        assert sched._stop_requested
+
+    def test_force_teardown_propagates_unconfirmed_cleanup(self, tmp_path):
+        sched = make_scheduler(tmp_path)
+        supervisor = ScriptedSupervisor()
+        supervisor.force_teardown = lambda: False
+        sched._active_supervisor = supervisor
+
+        assert not sched.force_teardown()
         assert sched._stop_requested
 
 
@@ -359,10 +433,17 @@ class TestVariableLoadComposition:
 
 class TestRapidTransitions:
     def test_cycles_run_and_report_a_pass(self, tmp_path, monkeypatch):
-        monkeypatch.setattr(execution, "watch_idle", lambda **kwargs: None)
+        idle_siblings: list[tuple[int, ...]] = []
+        monkeypatch.setattr(
+            execution,
+            "watch_idle",
+            lambda **kwargs: idle_siblings.append(kwargs["sibling_cpus"]),
+        )
         sched = make_scheduler(tmp_path)
 
         def timed_pass(sup, lanes, config_for, duration):
+            assert lanes[0].cpus == (0, 1)
+            assert lanes[0].sibling_cpus == (0, 1, 16, 17)
             time.sleep(0.03)
             return {one.core_id: ok(one.core_id) for one in lanes}
 
@@ -370,6 +451,7 @@ class TestRapidTransitions:
         result = sched.run_rapid_transitions([0, 1], total_duration=0.1, load_seconds=0.03, idle_seconds=0.01)
         assert result.passed and result.error_message is None
         assert sched.state == TestState.FINISHED
+        assert idle_siblings and set(idle_siblings) == {(0, 1, 16, 17)}
 
     def test_a_failure_preserves_its_classification(self, tmp_path):
         sched = make_scheduler(tmp_path)

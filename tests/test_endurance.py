@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 from unittest.mock import MagicMock
 
 from corecycler.engine.backends.base import DutyCycle, FFTPreset, StressMode
-from corecycler.history.db import HistoryDB, TuningContextRecord
+from corecycler.history.db import HistoryDB
 from corecycler.tuner import bisect
 from corecycler.tuner import engine as engine_module
 from corecycler.tuner import persistence as tp
@@ -45,13 +45,10 @@ def db(tmp_path):
 def _seed(db, topo, backend, **cfg):
     """A session that already passed staged validation, poised at stage 9."""
     eng = _make_engine(db, topo, backend, endurance=True, **cfg)
-    context_id = db.create_context(TuningContextRecord(bios_version="Test BIOS", co_hash="ctx"))
-    db.delete_tuner_session(eng._session_id)
-    eng._session_id = tp.create_session(db, eng._config, "Test BIOS", "Test CPU", context_id)
     _seed_confirmed_validating(eng, db, BEST, BASELINES)
     for cs in eng._core_states.values():
         cs.in_test = False
-        tp.save_core_state(db, eng._session_id, cs)
+        db.upsert_tuner_core_state(eng._session_id, cs)
     eng._set_status("validating")
     eng._validation_core_order = list(ORDER)
     eng.solo = []
@@ -62,6 +59,17 @@ def _seed(db, topo, backend, **cfg):
     eng._start_multi_core_worker = lambda cores, duration, **kw: eng.multi.append((list(cores), duration, kw))
     eng._run_validation_stage4 = lambda *a, **k: None
     return eng
+
+
+def _reject_nonstock_but_restore(smu):
+    original_write = smu.set_co_offset
+
+    def write(core_id, offset):
+        if offset != 0:
+            return False
+        return original_write(core_id, offset)
+
+    smu.set_co_offset = write
 
 
 def _at(eng, round_=0, workload=0, index=0):
@@ -85,19 +93,19 @@ class TestEnteringEndurance:
         assert eng._validation_stage == 9
         assert eng.status == "validating"
         assert completed == []
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         assert session.status != "completed"
         assert session.validation_stage == 9
         assert (session.endurance_round, session.endurance_workload, session.endurance_index) == (0, 0, 0)
 
     def test_entering_endurance_clears_stale_unattributed_crashes(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _seed(db, topo_dual_ccd_x3d, mock_backend)
-        tp.set_unattributed_crashes(db, eng._session_id, 2)
+        db.set_unattributed_crashes(eng._session_id, 2)
         eng._validation_stage = 8
 
         eng._run_validation_next()
 
-        assert tp.get_unattributed_crashes(db, eng._session_id) == 0
+        assert db.get_unattributed_crashes(eng._session_id) == 0
 
 
 class TestSlotDispatch:
@@ -164,7 +172,7 @@ class TestSlotDispatch:
 
     def test_a_refused_offset_write_launches_nothing(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _at(_seed(db, topo_dual_ccd_x3d, mock_backend), index=2)
-        eng._smu.set_co_offset = lambda core, value: False
+        _reject_nonstock_but_restore(eng._smu)
 
         eng._run_validation_next()
 
@@ -175,7 +183,7 @@ class TestSlotDispatch:
         self, db, topo_dual_ccd_x3d, mock_backend
     ):
         eng = _at(_seed(db, topo_dual_ccd_x3d, mock_backend), index=len(ORDER))
-        eng._smu.set_co_offset = lambda core, value: False
+        _reject_nonstock_but_restore(eng._smu)
 
         eng._run_validation_next()
 
@@ -288,8 +296,8 @@ class TestWorkloadSelection:
         eng._work_dir = tmp_path
         eng._start_worker = engine_module.TunerEngine._start_worker.__get__(eng)
         eng._config.backend = "mock"
-        tp.set_validation_position(db, eng._session_id, 9, 0, 0, False, "[]")
-        tp.set_endurance_position(db, eng._session_id, 1, 1, 2)
+        db.set_validation_position(eng._session_id, 9, 0, 0, False, "[]")
+        db.set_endurance_position(eng._session_id, 1, 1, 2)
         eng._validation_stage = 0
         eng._endurance_round = 0
         eng._endurance_workload = 0
@@ -308,11 +316,11 @@ class TestWorkloadSelection:
         monkeypatch.setattr(engine_module, "_TunerWorker", ParkedWorker)
         monkeypatch.setattr(eng, "_start_freeze_monitor", lambda: None)
 
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         eng._enter_auto_validation(dict(BEST), resume_from=session)
 
         assert (eng._endurance_round, eng._endurance_workload, eng._endurance_index) == (1, 1, 2)
-        checkpoint = bisect.HuntState.from_json(tp.get_session(db, eng._session_id).hunt_state)
+        checkpoint = bisect.HuntState.from_json(db.get_tuner_session(eng._session_id).hunt_state)
         assert checkpoint is not None
         assert checkpoint.workload is not None
         assert {
@@ -454,7 +462,7 @@ class TestVerdicts:
         eng._on_validation_test_finished(ORDER[4], passed=True)
 
         assert eng._endurance_index == 5
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         assert (session.endurance_round, session.endurance_workload, session.endurance_index) == (1, 2, 5)
 
 
@@ -478,13 +486,13 @@ class TestRounds:
         assert (eng._endurance_round, eng._endurance_workload, eng._endurance_index) == (1, 0, 0)
         assert eng._validation_dirty is False
         assert eng._endurance_duration() == 1200
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         assert (session.endurance_round, session.endurance_workload) == (1, 0)
 
     def test_a_round_boundary_hands_a_fully_banked_core_to_annealing(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _seed(db, topo_dual_ccd_x3d, mock_backend)
         _at(eng, workload=len(eng._config.endurance_workloads))
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         assert session is not None
         assert session.context_id is not None
         eng._config.anneal_bank_hours = 1.0
@@ -499,35 +507,34 @@ class TestRounds:
         assert cs.current_offset == BEST[candidate] + eng._config.direction
         assert eng._validation_stage == 0
         assert eng.status == "running"
-        assert tp.get_session(db, eng._session_id).status == "running"
+        assert db.get_tuner_session(eng._session_id).status == "running"
 
     def test_a_clean_round_clears_unattributed_crashes(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _seed(db, topo_dual_ccd_x3d, mock_backend)
         _at(eng, workload=len(eng._config.endurance_workloads))
-        tp.set_unattributed_crashes(db, eng._session_id, 2)
+        db.set_unattributed_crashes(eng._session_id, 2)
         eng._validation_dirty = False
 
         eng._run_validation_next()
 
-        assert tp.get_unattributed_crashes(db, eng._session_id) == 0
+        assert db.get_unattributed_crashes(eng._session_id) == 0
 
     def test_a_round_with_backoffs_keeps_the_unexplained_incident_count(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _seed(db, topo_dual_ccd_x3d, mock_backend)
         _at(eng, workload=len(eng._config.endurance_workloads))
-        tp.set_unattributed_crashes(db, eng._session_id, 2)
+        db.set_unattributed_crashes(eng._session_id, 2)
         eng._validation_dirty = True
 
         eng._run_validation_next()
 
-        assert tp.get_unattributed_crashes(db, eng._session_id) == 2
+        assert db.get_unattributed_crashes(eng._session_id) == 2
 
     def test_a_finished_round_reports_each_cores_evidence(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _seed(db, topo_dual_ccd_x3d, mock_backend)
         _at(eng, workload=len(eng._config.endurance_workloads))
         lines: list[str] = []
         eng.log_message.connect(lines.append)
-        tp.log_test_result(
-            db,
+        db.insert_tuner_test_log(
             eng._session_id,
             0,
             BEST[0],
@@ -555,7 +562,7 @@ class TestTestLogRows:
 
         eng._on_test_finished(ORDER[0], True, "", "", 600.0, 0.0, "", "")
 
-        row = tp.get_test_log(db, eng._session_id, core_id=ORDER[0])[-1]
+        row = db.get_tuner_test_log(eng._session_id, core_id=ORDER[0])[-1]
         assert row["phase"] == "endurance"
         assert (row["backend"], row["stress_mode"], row["fft_preset"]) == (
             workload["backend"],
@@ -569,7 +576,7 @@ class TestTestLogRows:
 
     def test_a_clean_all_core_slot_banks_every_live_lane(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _at(_seed(db, topo_dual_ccd_x3d, mock_backend), index=len(ORDER))
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         assert session is not None
         assert session.context_id is not None
         eng._cores_under_stress = list(ORDER)
@@ -585,15 +592,15 @@ class TestTestLogRows:
 
 class TestResume:
     def _persist(self, eng, db, round_, workload, index):
-        tp.set_validation_position(db, eng._session_id, 9, 0, 0, False, "[]")
-        tp.set_endurance_position(db, eng._session_id, round_, workload, index)
-        return tp.get_session(db, eng._session_id)
+        db.set_validation_position(eng._session_id, 9, 0, 0, False, "[]")
+        db.set_endurance_position(eng._session_id, round_, workload, index)
+        return db.get_tuner_session(eng._session_id)
 
     def _log_solo_passes(self, eng, db, skip=()):
         for core, offset in BEST.items():
             if core in skip:
                 continue
-            tp.log_test_result(db, eng._session_id, core, offset, "validate_s1", True, duration=300.0)
+            db.insert_tuner_test_log(eng._session_id, core, offset, "validate_s1", True, duration=300.0)
 
     def test_a_reboot_resumes_the_persisted_endurance_cursor(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _seed(db, topo_dual_ccd_x3d, mock_backend)
@@ -620,7 +627,7 @@ class TestResume:
         eng = _seed(db, topo_dual_ccd_x3d, mock_backend)
         session = self._persist(eng, db, 2, 1, 4)
         self._log_solo_passes(eng, db, skip=(3,))
-        tp.log_test_result(db, eng._session_id, 3, BEST[3], "endurance", True, duration=600.0)
+        db.insert_tuner_test_log(eng._session_id, 3, BEST[3], "endurance", True, duration=600.0)
 
         eng._enter_auto_validation(dict(BEST), resume_from=session)
 
@@ -645,7 +652,7 @@ class TestResume:
         eng._enter_auto_validation(dict(BEST))
 
         assert (eng._endurance_round, eng._endurance_workload, eng._endurance_index) == (0, 0, 0)
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         assert (session.endurance_round, session.endurance_workload, session.endurance_index) == (0, 0, 0)
 
 
@@ -655,10 +662,9 @@ class TestEvidenceLedger:
 
     def _rows(self, db, sid):
         common = dict(backend="mprime", stress_mode="AVX2", fft_preset="SMALL")
-        tp.log_test_result(db, sid, 0, -41, "validate_s1", True, duration=600.0, threads=2, **common)
-        tp.log_test_result(db, sid, 0, -40, "endurance", True, duration=600.0, threads=1, **common)
-        tp.log_test_result(
-            db,
+        db.insert_tuner_test_log(sid, 0, -41, "validate_s1", True, duration=600.0, threads=2, **common)
+        db.insert_tuner_test_log(sid, 0, -40, "endurance", True, duration=600.0, threads=1, **common)
+        db.insert_tuner_test_log(
             sid,
             0,
             -41,
@@ -669,13 +675,13 @@ class TestEvidenceLedger:
             regime="current",
             **common,
         )
-        tp.log_test_result(db, sid, 0, -41, "hunt", True, duration=300.0, threads=2, **common)
-        tp.log_test_result(db, sid, 0, -40, "endurance", False, duration=300.0, threads=2, **common)
-        tp.log_test_result(db, sid, 0, -38, "validate_s1", True, duration=600.0, threads=2, **common)
-        tp.log_test_result(db, sid, 0, -40, "endurance", True, duration=None, threads=2, **common)
+        db.insert_tuner_test_log(sid, 0, -41, "hunt", True, duration=300.0, threads=2, **common)
+        db.insert_tuner_test_log(sid, 0, -40, "endurance", False, duration=300.0, threads=2, **common)
+        db.insert_tuner_test_log(sid, 0, -38, "validate_s1", True, duration=600.0, threads=2, **common)
+        db.insert_tuner_test_log(sid, 0, -40, "endurance", True, duration=None, threads=2, **common)
 
     def test_only_live_passes_at_the_current_offset_count(self, db):
-        sid = tp.create_session(db, TunerConfig(), "", "")
+        sid = db.create_tuner_session(TunerConfig().to_json(), "", "")
         self._rows(db, sid)
         states = {0: CoreState(core_id=0, best_offset=-40)}
 
@@ -686,9 +692,9 @@ class TestEvidenceLedger:
         assert summary == {0: {two_thread: 900.0, one_thread: 600.0}}
 
     def test_a_core_without_a_best_offset_falls_back_to_its_baseline(self, db):
-        sid = tp.create_session(db, TunerConfig(), "", "")
-        tp.log_test_result(
-            db, sid, 1, -5, "endurance", True, duration=1800.0, backend="mprime", stress_mode="SSE", fft_preset="SMALL"
+        sid = db.create_tuner_session(TunerConfig().to_json(), "", "")
+        db.insert_tuner_test_log(
+            sid, 1, -5, "endurance", True, duration=1800.0, backend="mprime", stress_mode="SSE", fft_preset="SMALL"
         )
         states = {1: CoreState(core_id=1, best_offset=None, baseline_offset=-5)}
 
@@ -698,10 +704,11 @@ class TestEvidenceLedger:
         assert line == "core 1 @ n/a: 0.5h live evidence (mprime SSE SMALL 0.5h)"
 
     def test_rows_for_unknown_cores_are_ignored(self, db):
-        sid = tp.create_session(db, TunerConfig(), "", "")
-        tp.log_test_result(db, sid, 9, -5, "endurance", True, duration=60.0, backend="mprime")
+        sid = db.create_tuner_session(TunerConfig().to_json(), "", "")
+        db.insert_tuner_test_log(sid, 9, -5, "endurance", True, duration=60.0, backend="mprime")
 
         assert tp.evidence_summary(db, sid, {}, direction=-1) == {}
+        db.close()
 
     def test_a_spectrum_slot_is_labelled_apart_from_sustained_stress(self):
         assert tp.workload_label("mprime", "SSE", "SMALL", None, "spectrum") == "mprime SSE SMALL spectrum"

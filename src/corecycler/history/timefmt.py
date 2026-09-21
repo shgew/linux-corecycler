@@ -19,7 +19,7 @@ def format_local(iso: str, *, date_only: bool = False) -> str:
 
     Accepts the UTC-aware strings written by ``HistoryDB._now_iso`` (e.g.
     ``2026-06-15T18:30:00+00:00``). A naive string (no offset) is assumed to
-    be UTC — matching the storage convention — so legacy rows localize
+    be UTC - matching the storage convention - so legacy rows localize
     correctly instead of being misread as local wall-clock. Returns an empty
     string for empty input, and falls back to a raw slice if the value cannot
     be parsed, so a display path never raises on malformed data.

@@ -107,11 +107,17 @@ def test_monitor_start_is_idempotent_and_stop_joins(monkeypatch: pytest.MonkeyPa
     thread = monitor._thread
     monitor.start()
     assert monitor._thread is thread, "a second start must not spawn a second thread"
-    monitor.stop()
+    assert monitor.stop()
 
     assert thread is not None
     assert thread.daemon
     assert not thread.is_alive()
+
+
+def test_stop_before_start_is_already_stopped(tmp_path: Path) -> None:
+    monitor = MicroFreezeMonitor(tmp_path / "breadcrumb")
+
+    assert monitor.stop()
 
 
 def test_timed_out_writer_remains_owned_and_blocks_replacement(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -129,7 +135,7 @@ def test_timed_out_writer_remains_owned_and_blocks_replacement(monkeypatch: pyte
     monitor.start()
     writer = threads[0]
     stop_event = monitor._stop_event
-    monitor.stop()
+    assert not monitor.stop()
 
     writer.join.assert_called_once_with(timeout=2.0)
     assert monitor._thread is writer

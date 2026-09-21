@@ -1,4 +1,4 @@
-"""Tests for history.export — JSON and CSV export."""
+"""Tests for history.export - JSON and CSV export."""
 
 from __future__ import annotations
 
@@ -168,11 +168,11 @@ class TestBulkCsvExport:
 class TestJsonExportWithContext:
     def test_includes_tuning_context(self, db):
         """A run linked to a tuning context embeds that context in the JSON export."""
-        ctx_id = db.create_context(
+        ctx_id = db.get_or_create_context(
             TuningContextRecord(
                 bios_version="1.0.0.0",
                 co_offsets_json='{"0": -30, "1": -25}',
-                co_hash="ctx-hash-abc",
+                context_hash="ctx-hash-abc",
                 ppt_limit_w=225.0,
             )
         )
@@ -182,5 +182,5 @@ class TestJsonExportWithContext:
         data = json.loads(export_run_json(db, run_id))
 
         assert "tuning_context" in data
-        assert data["tuning_context"]["co_hash"] == "ctx-hash-abc"
+        assert data["tuning_context"]["context_hash"] == "ctx-hash-abc"
         assert data["tuning_context"]["ppt_limit_w"] == 225.0

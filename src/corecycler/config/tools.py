@@ -29,7 +29,7 @@ import shutil
 from dataclasses import dataclass
 from pathlib import Path
 
-from .paths import atomic_write, user_home
+from .paths import atomic_write, ensure_directory, user_home
 
 log = logging.getLogger(__name__)
 
@@ -110,6 +110,12 @@ TOOLS: dict[str, ExternalTool] = {
             names=("systemd-run",),
         ),
         ExternalTool(
+            key="systemctl",
+            kind=CORE,
+            package="systemd",
+            names=("systemctl",),
+        ),
+        ExternalTool(
             key="setpriv",
             kind=CORE,
             package="util-linux",
@@ -180,7 +186,9 @@ def load_configured_paths() -> dict[str, str]:
     """Read the recorded paths from disk and install them. Never raises."""
     recorded: dict[str, str] = {}
     try:
-        stored = json.loads(paths_file().read_text())
+        target = paths_file()
+        ensure_directory(target.parent)
+        stored = json.loads(target.read_text())
     except (OSError, ValueError) as exc:
         log.debug("no usable tool-paths file: %s", exc)
         stored = {}
@@ -197,7 +205,7 @@ def record_path(key: str, path: str) -> None:
     recorded = load_configured_paths()
     recorded[key] = str(path)
     target = paths_file()
-    target.parent.mkdir(parents=True, exist_ok=True)
+    ensure_directory(target.parent)
     atomic_write(target, json.dumps(recorded, indent=2))
     set_configured_paths(recorded)
 

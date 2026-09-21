@@ -137,7 +137,7 @@ class TestSchedulerProcessSafety:
     def _make_scheduler(self, mock_backend, tmp_path, topo=None):
         if topo is None:
             topo = CPUTopology()
-            topo.cores[0] = PhysicalCore(core_id=0, ccd=0, ccx=None, logical_cpus=(0,))
+            topo.cores[0] = PhysicalCore(core_id=0, ccd=0, logical_cpus=(0,))
         return CoreScheduler(
             topology=topo,
             backend=mock_backend,

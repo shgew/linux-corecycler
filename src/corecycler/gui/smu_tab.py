@@ -1,4 +1,4 @@
-"""SMU / Curve Optimizer tab — read/write per-core CO offsets."""
+"""SMU / Curve Optimizer tab - read/write per-core CO offsets."""
 
 from __future__ import annotations
 
@@ -41,6 +41,7 @@ class SMUTab(QWidget):
         self._smu: RyzenSMU | None = None
         self._commands: SMUCommandSet | None = None
         self._tuner_active = False
+        self._co_backup: dict[int, int] = {}
         self._setup_ui()
 
         if topology:
@@ -148,7 +149,7 @@ class SMUTab(QWidget):
 
         # warning
         warn = QLabel(
-            "\u26a0 CO offsets set via SMU are VOLATILE \u2014 they reset on reboot. "
+            "CO offsets set via SMU are VOLATILE - they reset on reboot. "
             "Use BIOS for persistent values. Requires ryzen_smu kernel module and root access."
         )
         warn.setWordWrap(True)
@@ -161,61 +162,60 @@ class SMUTab(QWidget):
 
     def set_topology(self, topology: CPUTopology) -> None:
         self._topology = topology
-
-        # detect CPU generation and get commands
+        self._smu = None
+        self._co_backup = {}
         gen = detect_generation(topology.family, topology.model, topology.model_name)
         self._commands = get_commands(gen)
 
         smu_available = self._commands is not None and RyzenSMU.is_available()
-        has_co = self._commands is not None and self._commands.has_co
-
-        if smu_available and has_co:
+        if smu_available and self._commands is not None and self._commands.has_co:
             self._smu = RyzenSMU(self._commands, dry_run=self._dry_run_cb.isChecked())
             self._smu.set_topology(topology)
             map_err = core_map_blocked(self._smu)
-            if map_err is not None:
+            if map_err is None:
+                self._status_label.setText("ryzen_smu: Connected")
+                self._status_label.setStyleSheet(f"color: {theme.COLOR_PASS};")
+                co_min, co_max = self._commands.co_range
+                self._range_label.setText(f"CO Range: [{co_min}, {co_max}]")
+            else:
                 self._status_label.setText("ryzen_smu: Connected (per-core CO unavailable)")
                 self._status_label.setStyleSheet(f"color: {theme.COLOR_ORANGE};")
                 self._status_label.setToolTip(map_err)
-                self._gen_label.setText(f"Generation: {gen.name}")
                 self._range_label.setText(f"CO disabled: {map_err}")
                 self._range_label.setWordWrap(True)
-            else:
-                self._status_label.setText("ryzen_smu: Connected")
-                self._status_label.setStyleSheet(f"color: {theme.COLOR_PASS};")
-                self._gen_label.setText(f"Generation: {gen.name}")
-                co_min, co_max = self._commands.co_range
-                self._range_label.setText(f"CO Range: [{co_min}, {co_max}]")
-        elif smu_available and not has_co:
-            self._smu = RyzenSMU(self._commands, dry_run=self._dry_run_cb.isChecked())
-            self._smu.set_topology(topology)
+        elif smu_available:
             self._status_label.setText("ryzen_smu: Connected (no CO support)")
             self._status_label.setStyleSheet(f"color: {theme.COLOR_ORANGE};")
-            self._gen_label.setText(f"Generation: {gen.name}")
             self._range_label.setText("CO: Not supported on this generation")
         elif self._commands:
             self._status_label.setText("ryzen_smu: Driver not loaded")
             self._status_label.setStyleSheet(f"color: {theme.COLOR_FAIL};")
-            self._gen_label.setText(f"Generation: {gen.name}")
         else:
             self._status_label.setText(f"Unsupported CPU generation: {gen.name}")
             self._status_label.setStyleSheet(f"color: {theme.COLOR_ORANGE};")
-
-        # Disable CO buttons if SMU is not available, the generation lacks CO,
-        # or the core map could not be discovered (writes would refuse anyway).
-        co_available = smu_available and has_co and core_map_blocked(self._smu) is None
-        self._apply_all_btn.setEnabled(co_available)
-        self._reset_btn.setEnabled(co_available)
-        self._backup_btn.setEnabled(co_available)
-        self._restore_btn.setEnabled(False)  # no backup yet
-
+        self._gen_label.setText(f"Generation: {gen.name}")
+        available = self._co_write_available()
+        self._apply_all_btn.setEnabled(available)
+        self._reset_btn.setEnabled(available)
+        self._backup_btn.setEnabled(available)
+        self._restore_btn.setEnabled(False)
         self._populate_table()
+
+    def _co_write_available(self) -> bool:
+        return bool(
+            self._topology
+            and self._commands
+            and self._commands.has_co
+            and self._smu
+            and self._smu.is_available()
+            and core_map_blocked(self._smu) is None
+        )
 
     def _populate_table(self) -> None:
         if not self._topology:
             return
 
-        smu_available = self._smu is not None and core_map_blocked(self._smu) is None
+        smu_available = self._co_write_available()
 
         cores = sorted(self._topology.cores.values(), key=lambda c: c.core_id)
         self._table.setRowCount(len(cores))
@@ -236,12 +236,11 @@ class SMUTab(QWidget):
             self._table.setCellWidget(row, 3, spin)
 
             apply_btn = QPushButton("Apply")
-            apply_btn.setEnabled(smu_available)
+            apply_btn.setEnabled(smu_available and not self._tuner_active)
             apply_btn.clicked.connect(lambda checked, cid=core.core_id: self._apply_single(cid))
             self._table.setCellWidget(row, 4, apply_btn)
 
-        # auto-read if SMU available
-        if self._smu:
+        if self._co_write_available():
             self._read_all_co()
 
     # ------------------------------------------------------------------
@@ -272,7 +271,7 @@ class SMUTab(QWidget):
 
         Returns True if the user confirmed, False otherwise.
         """
-        dry_tag = " [DRY RUN — no actual write]" if self._dry_run_cb.isChecked() else ""
+        dry_tag = " [DRY RUN - no actual write]" if self._dry_run_cb.isChecked() else ""
         reply = QMessageBox.warning(
             self,
             f"Confirm CO Write{dry_tag}",
@@ -311,166 +310,133 @@ class SMUTab(QWidget):
             if val is not None and core_id in self._spinboxes:
                 self._spinboxes[core_id].setValue(val)
 
-    def _apply_single(self, core_id: int) -> None:
-        if not self._smu:
-            QMessageBox.warning(self, "Error", "ryzen_smu driver not available")
-            return
+    def _warn_write_unavailable(self) -> bool:
         if self._tuner_active:
             QMessageBox.warning(
                 self,
                 "Tuner Running",
-                "The auto-tuner owns the SMU right now — CO writes are locked until it stops.",
+                "The auto-tuner owns the SMU right now - CO writes are locked until it stops.",
             )
-            return
+            return True
+        if not self._co_write_available():
+            QMessageBox.warning(self, "Error", "Curve Optimizer writes are unavailable")
+            return True
+        return False
 
+    @staticmethod
+    def _co_plan_summary(plan: dict[int, int]) -> str:
+        return ", ".join(f"C{core_id}={offset}" for core_id, offset in sorted(plan.items()))
+
+    def _take_complete_backup(self) -> bool:
+        if not self._smu or not self._topology:
+            return False
+        expected = set(self._topology.cores)
+        backup = self._smu.backup_co_offsets(len(expected))
+        if set(backup) != expected:
+            missing = sorted(expected - set(backup))
+            QMessageBox.warning(self, "Backup Failed", f"CO write refused: could not read cores {missing}")
+            return False
+        self._co_backup = dict(sorted(backup.items()))
+        self._restore_btn.setEnabled(not self._tuner_active and self._co_write_available())
+        return True
+
+    def _write_co_plan(self, plan: dict[int, int], *, take_backup: bool) -> list[int] | None:
+        if self._warn_write_unavailable() or not self._smu:
+            return None
+        if self._smu.dry_run:
+            QMessageBox.information(self, "Dry Run", f"Would write: {self._co_plan_summary(plan)}")
+            return []
+        if take_backup and not self._take_complete_backup():
+            return None
+        if self._warn_write_unavailable():
+            return None
+
+        self._apply_all_btn.setEnabled(False)
+        self._reset_btn.setEnabled(False)
+        failed = [core_id for core_id, offset in sorted(plan.items()) if not self._smu.set_co_offset(core_id, offset)]
+        self._apply_all_btn.setEnabled(self._co_write_available() and not self._tuner_active)
+        self._reset_btn.setEnabled(self._co_write_available() and not self._tuner_active)
+        if failed:
+            QMessageBox.warning(self, "Error", f"Failed to set CO for cores: {failed}")
+        self._read_all_co()
+        return failed
+
+    def _apply_single(self, core_id: int) -> None:
+        if self._warn_write_unavailable():
+            return
         spin = self._spinboxes.get(core_id)
-        if not spin:
+        if spin is None:
             return
-
-        value = spin.value()
-
-        if not self._confirm_co_write(f"Set core {core_id} CO offset to {value}.") or self._tuner_active:
+        plan = {core_id: spin.value()}
+        if not self._confirm_co_write(f"Set core {core_id} CO offset to {spin.value()}."):
             return
-
-        success = self._smu.set_co_offset(core_id, value)
-        if success:
-            row = self._core_row_map().get(core_id)
-            if row is not None:
-                self._table.setItem(row, 2, _item(str(value)))
-        else:
-            QMessageBox.warning(self, "Error", f"Failed to set CO for core {core_id}")
+        self._write_co_plan(plan, take_backup=True)
 
     def _apply_all_co(self) -> None:
-        if not self._smu:
-            QMessageBox.warning(self, "Error", "ryzen_smu driver not available")
+        if self._warn_write_unavailable():
             return
-        if self._tuner_active:
-            QMessageBox.warning(
-                self,
-                "Tuner Running",
-                "The auto-tuner owns the SMU right now — CO writes are locked until it stops.",
-            )
+        plan = {core_id: spin.value() for core_id, spin in self._spinboxes.items()}
+        if not self._confirm_co_write(f"Apply CO offsets to all cores:\n{self._co_plan_summary(plan)}"):
             return
-
-        summary = ", ".join(f"C{cid}={spin.value()}" for cid, spin in sorted(self._spinboxes.items()))
-        if not self._confirm_co_write(f"Apply CO offsets to all cores:\n{summary}") or self._tuner_active:
-            return
-
-        self._apply_all_btn.setEnabled(False)
-        self._reset_btn.setEnabled(False)
-        try:
-            failed = []
-            for core_id, spin in self._spinboxes.items():
-                value = spin.value()
-                if not self._smu.set_co_offset(core_id, value):
-                    failed.append(core_id)
-
-            if failed:
-                QMessageBox.warning(self, "Error", f"Failed to set CO for cores: {failed}")
-            else:
-                self._read_all_co()
-                self._profile_banner.setVisible(False)
-        finally:
-            self._apply_all_btn.setEnabled(True)
-            self._reset_btn.setEnabled(True)
+        failed = self._write_co_plan(plan, take_backup=True)
+        if failed == []:
+            self._profile_banner.setVisible(False)
 
     def _reset_all_co(self) -> None:
-        if not self._smu:
+        if self._warn_write_unavailable():
             return
-        if self._tuner_active:
-            QMessageBox.warning(
-                self,
-                "Tuner Running",
-                "The auto-tuner owns the SMU right now — CO writes are locked until it stops.",
-            )
+        plan = dict.fromkeys(self._spinboxes, 0)
+        if not self._confirm_co_write(f"Reset all Curve Optimizer offsets:\n{self._co_plan_summary(plan)}"):
             return
-
-        if not self._confirm_co_write("Reset all Curve Optimizer offsets to 0.") or self._tuner_active:
-            return
-
-        self._apply_all_btn.setEnabled(False)
-        self._reset_btn.setEnabled(False)
-        try:
-            if self._smu.reset_all_co():
-                self._read_all_co()
-            else:
-                # manual reset: set each core to 0
-                for core_id in self._spinboxes:
-                    self._smu.set_co_offset(core_id, 0)
-                self._read_all_co()
-        finally:
-            self._apply_all_btn.setEnabled(True)
-            self._reset_btn.setEnabled(True)
-
-    # ------------------------------------------------------------------
-    # Backup / Restore
-    # ------------------------------------------------------------------
+        self._write_co_plan(plan, take_backup=True)
 
     def _backup_co(self) -> None:
-        if not self._smu or not self._topology:
+        if self._warn_write_unavailable() or not self._take_complete_backup():
             return
-
-        num_cores = len(self._topology.cores)
-        backup = self._smu.backup_co_offsets(num_cores)
-        self._restore_btn.setEnabled(not self._tuner_active and self._smu.has_backup())
         QMessageBox.information(
             self,
             "Backup Complete",
-            f"Saved CO offsets for {len(backup)} cores.\n"
+            f"Saved CO offsets for {len(self._co_backup)} cores.\n"
             "Use 'Restore Backup' to revert within this session.\n\n"
             "Note: CO values are volatile and reset on reboot regardless.",
         )
 
     def _restore_co(self) -> None:
-        if not self._smu or not self._smu.has_backup():
-            QMessageBox.warning(self, "Error", "No backup available to restore.")
+        if not self._co_backup:
+            QMessageBox.warning(self, "Error", "No complete backup available to restore.")
             return
-
-        if self._tuner_active or not self._confirm_co_write("Restore CO offsets from backup.") or self._tuner_active:
+        if self._warn_write_unavailable():
             return
-
-        ok, failed = self._smu.restore_co_offsets()
-        if ok:
-            self._read_all_co()
+        plan = dict(self._co_backup)
+        detail = f"Restore CO offsets from backup:\n{self._co_plan_summary(plan)}"
+        if not self._confirm_co_write(detail):
+            return
+        failed = self._write_co_plan(plan, take_backup=False)
+        if failed == []:
             QMessageBox.information(self, "Restored", "CO offsets restored from backup.")
-        else:
-            QMessageBox.warning(self, "Partial Failure", f"Failed to restore CO for cores: {failed}")
-            self._read_all_co()
 
     def set_tuner_running(self, running: bool) -> None:
-        """Disable CO write operations while the auto-tuner controls SMU.
-
-        Reading is still allowed (informational). Writing would conflict
-        with the tuner's CO isolation and validation offsets.
-        """
+        """Disable CO write operations while the auto-tuner controls SMU."""
         self._tuner_active = running
-
-        # When re-enabling, check that SMU is still available
-        smu_ok = self._smu is not None and self._smu.is_available() if hasattr(self, "_smu") else False
-        write_enabled = not running and smu_ok
-
+        write_enabled = not running and self._co_write_available()
         self._dry_run_cb.setEnabled(not running)
         self._apply_all_btn.setEnabled(write_enabled)
         self._reset_btn.setEnabled(write_enabled)
-        self._restore_btn.setEnabled(write_enabled and self._smu is not None and self._smu.has_backup())
-        # Per-row Apply buttons
+        self._backup_btn.setEnabled(write_enabled)
+        self._restore_btn.setEnabled(write_enabled and bool(self._co_backup))
         for row in range(self._table.rowCount()):
             btn = self._table.cellWidget(row, 4)
             if btn is not None:
                 btn.setEnabled(write_enabled)
-        # Spinboxes
         for spin in self._spinboxes.values():
-            spin.setEnabled(not running)  # editing is fine even without SMU
-
+            spin.setEnabled(not running)
         if running:
             self._apply_all_btn.setToolTip("Disabled while auto-tuner is running")
+        elif write_enabled:
+            self._read_all_co()
+            self._apply_all_btn.setToolTip("")
         else:
-            # Tuner stopped — refresh Current CO from hardware
-            if smu_ok:
-                self._read_all_co()
-                self._apply_all_btn.setToolTip("")
-            else:
-                self._apply_all_btn.setToolTip("SMU not available")
+            self._apply_all_btn.setToolTip("SMU not available")
 
     def update_current_co(self, core_id: int, offset: int) -> None:
         """Update the Current CO display for a core (called by tuner)."""
@@ -530,11 +496,23 @@ class SMUTab(QWidget):
             QMessageBox.warning(self, "Empty", "No CO offsets found in file")
             return
 
-        self.set_co_profile(profile)
+        self._populate_co_profile(profile)
         filename = Path(path).name
-        self._profile_banner.setText(f"Loaded from {filename} \u2014 click 'Apply All New Values' to write to SMU")
+        self._profile_banner.setText(f"Loaded from {filename} - click 'Apply All New Values' to write to SMU")
 
-    def set_co_profile(self, profile: dict[int, int]) -> None:
+    def set_co_profile(self, profile: dict[int, int], source_cpu_model: str) -> None:
+        """Populate a history profile only when it belongs to this exact CPU model."""
+        if not self._topology or source_cpu_model != self._topology.model_name:
+            current = self._topology.model_name if self._topology else "unknown"
+            QMessageBox.warning(
+                self,
+                "CPU Mismatch",
+                f"Profile is for {source_cpu_model or 'unknown'}, but this system is {current}.",
+            )
+            return
+        self._populate_co_profile(profile)
+
+    def _populate_co_profile(self, profile: dict[int, int]) -> None:
         """Populate CO spinboxes from a profile without applying to hardware."""
         altered: list[str] = []
         for core_id, offset in profile.items():
@@ -547,7 +525,7 @@ class SMUTab(QWidget):
                 altered.append(f"core {core_id}: {offset} clamped to {spin.value()}")
         count = len(profile)
         self._profile_banner.setText(
-            f"Loaded {count} core(s) from tuner session \u2014 click 'Apply All New Values' to write to SMU"
+            f"Loaded {count} core(s) from tuner session - click 'Apply All New Values' to write to SMU"
         )
         self._profile_banner.setVisible(True)
         if altered:

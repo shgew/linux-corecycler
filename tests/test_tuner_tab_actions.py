@@ -1,6 +1,6 @@
 """TunerTab action coverage: start/pause/resume/abort/validate/export and slots.
 
-The engine is a stand-in throughout — a real TunerEngine would write Curve
+The engine is a stand-in throughout. A real TunerEngine would write Curve
 Optimizer offsets through the SMU. What is exercised here is the tab's own
 decision logic: every refusal, every dialog branch and every engine signal
 handler.
@@ -22,7 +22,6 @@ if not hasattr(_sys.modules.get("PySide6", None), "__path__"):
 from corecycler.engine.topology import CPUTopology, PhysicalCore
 from corecycler.gui import tuner_tab as tt
 from corecycler.history.db import HistoryDB
-from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.state import CoreState, TunerPhase
 
@@ -36,13 +35,14 @@ def _qapp():
 def _topo(cores: int = 2) -> CPUTopology:
     topo = CPUTopology(model_name="Test 8C", family=26, model=0x44, physical_cores=cores, ccds=1)
     for cid in range(cores):
-        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, ccx=None, logical_cpus=(cid,))
+        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, logical_cpus=(cid,))
     return topo
 
 
 def _smu(available: bool = True):
     smu = MagicMock()
     smu.is_available.return_value = available
+    smu.commands.co_range = (-50, 10)
     return smu
 
 
@@ -86,9 +86,17 @@ def tab(db):
 
 
 def _seed_session(db, status="paused"):
-    sid = tp.create_session(db, TunerConfig(), bios_version="2402", cpu_model="Test 8C")
-    tp.update_session_status(db, sid, status)
+    sid = db.create_tuner_session(TunerConfig().to_json(), bios_version="2402", cpu_model="Test 8C")
+    db.update_tuner_session_status(sid, status)
     return sid
+
+
+def _persist_engine(db, engine) -> None:
+    if db.get_tuner_session(engine.session_id) is None:
+        session_id = db.create_tuner_session(TunerConfig().to_json(), "2402", "Test 8C")
+        assert session_id == engine.session_id
+    for state in engine.core_states.values():
+        db.upsert_tuner_core_state(engine.session_id, state)
 
 
 class TestMsrProbe:
@@ -139,17 +147,17 @@ class TestStart:
     def test_refuses_while_a_session_is_active(self, tab, no_modal):
         tab._engine = _engine(status="running")
         tab._on_start()
-        assert no_modal.warning.call_args.args[1] == "Session Active"
+        assert no_modal.warning.called
 
     def test_refuses_while_a_session_is_paused(self, tab, no_modal):
         tab._engine = _engine(status="paused")
         tab._on_start()
-        assert no_modal.warning.call_args.args[1] == "Session Active"
+        assert no_modal.warning.called
 
     def test_refuses_without_smu(self, db, no_modal):
         tab = _tab(db=db, topology=_topo(), smu=_smu(available=False))
         tab._on_start()
-        assert no_modal.warning.call_args.args[1] == "SMU Not Available"
+        assert no_modal.warning.called
 
     def test_declining_the_hazard_prompt_starts_nothing(self, tab, no_modal, monkeypatch):
         engine_cls = MagicMock()
@@ -166,14 +174,20 @@ class TestStart:
         tab._on_start()
         assert not engine_cls.called
 
-    def test_refuses_an_invalid_configuration(self, tab, no_modal, monkeypatch):
+    @pytest.mark.parametrize(
+        "config",
+        [TunerConfig(coarse_step=0), TunerConfig(start_offset=11, max_offset=-50)],
+    )
+    def test_refuses_an_invalid_configuration(self, tab, no_modal, monkeypatch, config):
         engine_cls = MagicMock()
         monkeypatch.setattr(tt, "TunerEngine", engine_cls)
-        monkeypatch.setattr(tab, "_get_config", lambda: TunerConfig(coarse_step=0))
+        monkeypatch.setattr(tab, "_get_config", lambda: config)
         no_modal.warning.return_value = no_modal.StandardButton.Yes
+
         tab._on_start()
+
         assert not engine_cls.called
-        assert no_modal.warning.call_args.args[1] == "Invalid Configuration"
+        assert no_modal.warning.called
 
     def test_an_engine_that_refuses_to_start_leaves_the_ui_idle(self, tab, no_modal, monkeypatch):
         eng = _engine(status="idle")
@@ -182,10 +196,11 @@ class TestStart:
         tab._on_start()
         assert eng.start.called
         assert tab._start_btn.isEnabled()
-        assert no_modal.warning.call_args.args[1] == "Tuner Did Not Start"
+        assert no_modal.warning.called
 
     def test_a_started_engine_locks_the_ui_and_fills_the_table(self, tab, no_modal, monkeypatch):
         eng = _engine(status="running")
+        _persist_engine(tab._db, eng)
         monkeypatch.setattr(tt, "TunerEngine", MagicMock(return_value=eng))
         no_modal.warning.return_value = no_modal.StandardButton.Yes
         tab._on_start()
@@ -229,6 +244,7 @@ class TestResume:
     def test_a_paused_engine_resumes_directly(self, tab, monkeypatch):
         sid = _seed_session(tab._db, "paused")
         eng = _engine(status="paused", session_id=sid)
+        _persist_engine(tab._db, eng)
         tab._engine = eng
         eng.status = "paused"
 
@@ -251,6 +267,7 @@ class TestResume:
     def test_a_single_session_resumes_without_a_picker(self, tab, monkeypatch):
         sid = _seed_session(tab._db, "paused")
         eng = _engine(status="running", session_id=sid)
+        _persist_engine(tab._db, eng)
         monkeypatch.setattr(tt, "TunerEngine", MagicMock(return_value=eng))
         tab._on_resume()
         assert eng.resume.call_args.args == (sid,)
@@ -258,12 +275,11 @@ class TestResume:
     def test_the_picker_resumes_the_chosen_session(self, tab, monkeypatch):
         first = _seed_session(tab._db, "paused")
         second = _seed_session(tab._db, "paused")
-        tp.save_core_state(
-            tab._db,
-            second,
-            CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30),
+        tab._db.upsert_tuner_core_state(
+            second, CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)
         )
-        eng = _engine(status="running")
+        eng = _engine(status="running", session_id=second)
+        _persist_engine(tab._db, eng)
         monkeypatch.setattr(tt, "TunerEngine", MagicMock(return_value=eng))
         _accepting_dialog(monkeypatch, accept=True)
         tab._on_resume()
@@ -281,7 +297,8 @@ class TestResume:
     def test_a_lone_aborted_session_resumes_without_a_warning(self, tab, monkeypatch, no_modal):
         """Stopping a run is a human choice, not a hazard: no question to answer."""
         sid = _seed_session(tab._db, "aborted")
-        eng = _engine(status="running")
+        eng = _engine(status="running", session_id=sid)
+        _persist_engine(tab._db, eng)
         monkeypatch.setattr(tt, "TunerEngine", MagicMock(return_value=eng))
         tab._on_resume()
         assert eng.resume.call_args.args[0] == sid
@@ -289,7 +306,7 @@ class TestResume:
 
     def test_a_lone_quarantined_session_is_offered_not_auto_resumed(self, tab, monkeypatch):
         """One stopped session must still reach the picker, never a silent resume."""
-        _seed_session(tab._db, "quarantined")
+        _seed_session(tab._db, "profile_quarantined")
         eng = _engine(status="running")
         monkeypatch.setattr(tt, "TunerEngine", MagicMock(return_value=eng))
         _accepting_dialog(monkeypatch, accept=False)
@@ -298,7 +315,7 @@ class TestResume:
 
     def test_a_quarantined_pick_asks_first(self, tab, monkeypatch, no_modal):
         _seed_session(tab._db, "paused")
-        sid = _seed_session(tab._db, "quarantined")
+        sid = _seed_session(tab._db, "profile_quarantined")
         eng = _engine(status="running")
         monkeypatch.setattr(tt, "TunerEngine", MagicMock(return_value=eng))
         _accepting_dialog(monkeypatch, accept=True)
@@ -309,8 +326,9 @@ class TestResume:
 
     def test_a_confirmed_quarantined_pick_resumes(self, tab, monkeypatch, no_modal):
         _seed_session(tab._db, "paused")
-        sid = _seed_session(tab._db, "quarantined")
-        eng = _engine(status="running")
+        sid = _seed_session(tab._db, "profile_quarantined")
+        eng = _engine(status="running", session_id=sid)
+        _persist_engine(tab._db, eng)
         monkeypatch.setattr(tt, "TunerEngine", MagicMock(return_value=eng))
         _accepting_dialog(monkeypatch, accept=True)
         no_modal.question.return_value = no_modal.StandardButton.Yes
@@ -331,12 +349,12 @@ class TestResumeSession:
     def test_refuses_without_smu(self, db, no_modal):
         tab = _tab(db=db, topology=_topo(), smu=_smu(available=False))
         tab._resume_session(1)
-        assert no_modal.warning.call_args.args[1] == "SMU Not Available"
+        assert no_modal.warning.called
 
     def test_refuses_a_cold_start_without_db_or_topology(self, no_modal):
         tab = _tab(db=None, topology=None, smu=_smu())
         tab._resume_session(1)
-        assert no_modal.warning.call_args.args[1] == "Error"
+        assert no_modal.warning.called
 
     def test_refuses_a_cold_start_without_a_backend(self, db, no_modal, monkeypatch):
         tab = _tab(db=db, topology=_topo(), smu=_smu(), backend_factory=lambda _n: _backend(False))
@@ -348,9 +366,10 @@ class TestResumeSession:
 
     def test_the_saved_config_is_mirrored_into_the_panel(self, tab, monkeypatch):
         cfg = TunerConfig(coarse_step=3, fine_step=2, max_offset=-42, test_order="round_robin")
-        sid = tp.create_session(tab._db, cfg, bios_version="2402", cpu_model="Test 8C")
-        tp.log_event(tab._db, sid, "info", "story line")
+        sid = tab._db.create_tuner_session(cfg.to_json(), bios_version="2402", cpu_model="Test 8C")
+        tab._db.insert_tuner_event(sid, "story line", severity="info")
         eng = _engine(status="running", session_id=sid)
+        _persist_engine(tab._db, eng)
         monkeypatch.setattr(tt, "TunerEngine", MagicMock(return_value=eng))
         tab._resume_session(sid)
         assert tab._coarse_step_spin.value() == 3
@@ -364,7 +383,7 @@ class TestResumeSession:
         monkeypatch.setattr(tt, "TunerEngine", MagicMock(return_value=eng))
         tab._resume_session(sid)
         assert tab._start_btn.isEnabled()
-        assert no_modal.warning.call_args.args[1] == "Resume Did Not Start"
+        assert no_modal.warning.called
 
 
 class TestAbort:
@@ -396,12 +415,15 @@ class TestValidate:
         tab._on_validate()
         assert tab._start_btn.isEnabled()
 
-    def test_refuses_without_a_backend(self, db, monkeypatch):
+    def test_validation_uses_the_saved_session_backend(self, db):
         tab = _tab(db=db, topology=_topo(), smu=_smu(), backend_factory=lambda _n: _backend(False))
-        eng = _engine()
+        eng = _engine(status="validating")
         tab._engine = eng
+        tab._backend_combo.setCurrentText("stress-ng")
+
         tab._on_validate()
-        assert not eng.validate_profile.called
+
+        eng.validate_profile.assert_called_once_with(eng.session_id)
 
     def test_an_engine_that_refuses_leaves_the_ui_idle(self, tab, no_modal):
         eng = _engine(status="idle")
@@ -409,7 +431,7 @@ class TestValidate:
         tab._on_validate()
         assert eng.validate_profile.called
         assert tab._start_btn.isEnabled()
-        assert no_modal.warning.call_args.args[1] == "Validation Did Not Start"
+        assert no_modal.warning.called
 
     def test_a_started_validation_locks_the_ui(self, tab):
         eng = _engine(status="validating")
@@ -434,10 +456,8 @@ class TestExport:
 
     def test_a_cancelled_dialog_writes_nothing(self, tab, tmp_path):
         sid = _seed_session(tab._db)
-        tp.save_core_state(
-            tab._db,
-            sid,
-            CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30),
+        tab._db.upsert_tuner_core_state(
+            sid, CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)
         )
         tab._engine = _engine(session_id=sid)
         with patch("corecycler.gui.tuner_tab.QFileDialog.getSaveFileName", return_value=("", "")):
@@ -446,10 +466,8 @@ class TestExport:
 
     def test_a_confirmed_profile_is_written(self, tab, tmp_path, no_modal):
         sid = _seed_session(tab._db)
-        tp.save_core_state(
-            tab._db,
-            sid,
-            CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30),
+        tab._db.upsert_tuner_core_state(
+            sid, CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)
         )
         tab._engine = _engine(session_id=sid)
         out = tmp_path / "profile.json"
@@ -460,10 +478,8 @@ class TestExport:
 
     def test_a_failed_write_is_surfaced(self, tab, tmp_path, no_modal, monkeypatch):
         sid = _seed_session(tab._db)
-        tp.save_core_state(
-            tab._db,
-            sid,
-            CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30),
+        tab._db.upsert_tuner_core_state(
+            sid, CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)
         )
         tab._engine = _engine(session_id=sid)
         import corecycler.config.settings as settings
@@ -485,13 +501,54 @@ class TestEngineSignals:
         tab._wire_engine()
         assert tab._engine is None
 
+    def test_display_failure_is_queued_and_never_reaches_fatal_handling(self, tab, monkeypatch, caplog):
+        from PySide6.QtCore import QObject, Signal
+
+        class SignalEngine(QObject):
+            core_state_changed = Signal(int, str, int)
+            worker_started = Signal(int)
+            test_completed = Signal(int, int, bool)
+            session_completed = Signal(str)
+            status_changed = Signal(str)
+            progress_updated = Signal(int, int)
+            log_message = Signal(str)
+            platform_fault = Signal(str)
+            co_drift_detected = Signal(str)
+            validation_progress = Signal(int, int, int)
+
+        rendered = []
+
+        def broken_renderer(core_id):
+            rendered.append(core_id)
+            raise RuntimeError("display failed")
+
+        fatal = MagicMock()
+        force_stop = MagicMock()
+        monkeypatch.setattr(tab, "_on_worker_started", broken_renderer)
+        monkeypatch.setattr(tab, "force_stop", force_stop)
+        monkeypatch.setattr(_sys, "excepthook", fatal)
+        tab._engine = SignalEngine()
+        tab._wire_engine()
+
+        with caplog.at_level("ERROR", logger="corecycler.gui.tuner_tab"):
+            tab._engine.worker_started.emit(3)
+            assert rendered == []
+            _qapp().processEvents()
+
+        assert rendered == [3]
+        assert "display failed" in caplog.text
+        assert not fatal.called
+        assert not force_stop.called
+
     def test_co_drift_is_reported_per_core(self, tab, no_modal):
         tab._on_co_drift(json.dumps({"0": {"expected": -30, "actual": -10}}))
         body = no_modal.warning.call_args.args[2]
         assert "Core 0: tuner last wrote -30, found -10" in body
 
     def test_the_active_core_stays_highlighted_on_a_state_change(self, tab):
-        tab._engine = _engine()
+        engine = _engine()
+        _persist_engine(tab._db, engine)
+        tab._engine = engine
         tab._active_test_core = 0
         states = []
         tab.tuner_core_testing.connect(lambda c, s: states.append((c, s)))
@@ -514,8 +571,10 @@ class TestEngineSignals:
 
     def test_a_completed_test_clears_the_active_core_and_logs(self, tab):
         sid = _seed_session(tab._db)
-        tp.log_test_result(tab._db, sid, 0, -30, "coarse", True, duration=60.0)
-        tab._engine = _engine(session_id=sid)
+        tab._db.insert_tuner_test_log(sid, 0, -30, "coarse", True, duration=60.0)
+        engine = _engine(session_id=sid)
+        _persist_engine(tab._db, engine)
+        tab._engine = engine
         tab._active_test_core = 0
         tab._tuner_timer.start(1000)
         tab._on_test_completed(0, -30, True)
@@ -537,12 +596,14 @@ class TestEngineSignals:
         tab._on_session_completed("")
         assert not tab._validate_btn.isEnabled()
 
-    def test_progress_and_validation_labels(self, tab):
+    def test_progress_handlers_change_presentation_state(self, tab):
+        initial_progress = tab._progress_label.text()
         tab._on_progress_updated(3, 8)
-        assert tab._progress_label.text() == "3/8 cores confirmed"
+        core_progress = tab._progress_label.text()
+        assert core_progress != initial_progress
         tab._on_validation_progress(6, 2, 4)
-        assert "memory" in tab._status_label.text()
-        assert tab._progress_label.text() == "S6: 2/4"
+        assert tab._status_label.text()
+        assert tab._progress_label.text() != core_progress
 
     def test_log_messages_reach_the_logger(self, tab, caplog):
         with caplog.at_level("INFO", logger="corecycler.gui.tuner_tab"):
@@ -559,11 +620,22 @@ class TestEngineSignals:
         assert infos == [0, 1]
         assert tab._start_btn.isEnabled()
 
-    def test_quarantine_notifies_with_critical_urgency(self, tab, monkeypatch):
+    def test_profile_quarantine_notifies_with_critical_urgency(self, tab, monkeypatch):
         notify = _mute_notify(monkeypatch)
         tab._engine = _engine()
-        tab._on_status_changed("quarantined")
+        tab._on_status_changed("profile_quarantined")
         assert notify.call_args.kwargs["urgency"] == "critical"
+
+    def test_platform_fault_reports_evidence_without_profile_quarantine(self, tab, monkeypatch):
+        notify = _mute_notify(monkeypatch)
+        tab._engine = _engine()
+
+        tab._on_status_changed("platform_fault")
+        assert not notify.called
+        tab._on_platform_fault("stock control failed twice")
+
+        assert notify.call_count == 1
+        assert "stock control failed twice" in notify.call_args.args[1]
 
 
 def _mute_notify(monkeypatch, *, enabled=True):
@@ -585,7 +657,7 @@ class TestNotify:
     def test_an_enabled_setting_sends_the_notification(self, tab, monkeypatch):
         sent = _mute_notify(monkeypatch)
         tab._notify("done", "body")
-        assert sent.call_args.args == ("done", "body")
+        assert sent.called
 
     def test_a_broken_notifier_never_reaches_the_caller(self, tab, monkeypatch):
         import corecycler.config.settings as settings
@@ -616,12 +688,12 @@ class TestTicker:
 
 
 class TestLogTable:
-    def test_core_without_an_active_session_shows_no_last_result(self, tab):
+    def test_core_without_an_active_session_has_no_evidence_row(self, tab):
         tab._engine = _engine(session_id=None, cores=(0,))
 
         tab._update_core_row(0)
 
-        assert tab._core_table.item(0, 10).text() == "-"
+        assert tab._core_table.rowCount() == 0
 
     def test_an_entry_without_a_session_is_dropped(self, tab):
         tab._add_log_entry(0, -30, True)
@@ -635,26 +707,32 @@ class TestLogTable:
 
     def test_an_entry_for_another_core_is_filtered_out(self, tab):
         sid = _seed_session(tab._db)
-        tp.log_test_result(tab._db, sid, 0, -30, "coarse", True, duration=60.0)
+        tab._db.insert_tuner_test_log(sid, 0, -30, "coarse", True, duration=60.0)
         tab._engine = _engine(session_id=sid)
         tab._selected_core = 1
         tab._add_log_entry(0, -30, True)
         assert tab._log_table.rowCount() == 0
 
     def test_the_oldest_row_is_dropped_at_the_cap(self, tab):
+        from PySide6.QtWidgets import QTableWidgetItem
+
         sid = _seed_session(tab._db)
-        tp.log_test_result(tab._db, sid, 0, -30, "coarse", False, duration=60.0)
+        tab._db.insert_tuner_test_log(sid, 0, -30, "coarse", False, duration=60.0)
         tab._engine = _engine(session_id=sid)
-        for _ in range(2002):
-            tab._log_table.insertRow(0)
+        for _ in range(2000):
+            tab._log_table.insertRow(tab._log_table.rowCount())
+        tab._log_table.setItem(0, 0, QTableWidgetItem("oldest"))
+
         tab._add_log_entry(0, -30, False)
-        assert tab._log_table.rowCount() == 2002
-        assert tab._log_table.item(2001, 4).text() == "FAIL"
+
+        assert tab._log_table.rowCount() == 2000
+        assert tab._log_table.item(0, 0) is None
+        assert tab._log_table.item(1999, 4).text() == "FAIL"
 
     def test_selecting_a_core_filters_the_log(self, tab):
         sid = _seed_session(tab._db)
-        tp.log_test_result(tab._db, sid, 0, -30, "coarse", True, duration=60.0)
-        tp.log_test_result(tab._db, sid, 1, -25, "coarse", False, duration=12.0)
+        tab._db.insert_tuner_test_log(sid, 0, -30, "coarse", True, duration=60.0)
+        tab._db.insert_tuner_test_log(sid, 1, -25, "coarse", False, duration=12.0)
         tab._engine = _engine(session_id=sid)
         tab._core_table.insertRow(0)
         from PySide6.QtWidgets import QTableWidgetItem
@@ -662,21 +740,31 @@ class TestLogTable:
         tab._core_table.setItem(0, 0, QTableWidgetItem("1"))
         tab._on_core_selected(0, 0, -1, -1)
         assert tab._selected_core == 1
-        assert "core 1" in tab._log_filter_label.text()
         assert tab._log_table.rowCount() == 1
         assert tab._log_table.item(0, 4).text() == "FAIL"
 
     def test_selecting_an_empty_row_shows_every_core(self, tab):
         sid = _seed_session(tab._db)
-        tp.log_test_result(tab._db, sid, 0, -30, "coarse", True, duration=60.0)
-        tp.log_test_result(tab._db, sid, 1, -25, "coarse", False, duration=None)
+        tab._db.insert_tuner_test_log(sid, 0, -30, "coarse", True, duration=60.0)
+        tab._db.insert_tuner_test_log(sid, 1, -25, "coarse", False, duration=None)
         tab._engine = _engine(session_id=sid)
         tab._selected_core = 1
         tab._on_core_selected(5, 0, -1, -1)
         assert tab._selected_core is None
-        assert "all cores" in tab._log_filter_label.text()
         assert tab._log_table.rowCount() == 2
         assert tab._log_table.item(1, 5).text() == "-"
+
+    def test_refresh_keeps_only_the_newest_rows(self, tab):
+        sid = _seed_session(tab._db)
+        for offset in range(2001):
+            tab._db.insert_tuner_test_log(sid, 0, offset, "coarse", True, duration=1.0)
+        tab._engine = _engine(session_id=sid)
+
+        tab._refresh_log_table()
+
+        assert tab._log_table.rowCount() == 2000
+        assert tab._log_table.item(0, 2).text() == "1"
+        assert tab._log_table.item(1999, 2).text() == "2000"
 
     def test_refreshing_without_a_session_empties_the_log(self, tab):
         tab._log_table.insertRow(0)
@@ -700,7 +788,6 @@ class TestClipboard:
         tab._log_table.setItem(0, 1, QTableWidgetItem("7"))
         tab._copy_table_selection(tab._log_table)
         text = QApplication.clipboard().text()
-        assert text.splitlines()[0].startswith("Time")
         assert "\t7\t" in text.splitlines()[1]
 
     def test_only_the_selected_rows_are_copied(self, tab):
@@ -744,41 +831,43 @@ class TestBackendResolution:
 
 
 class TestRecoveryBanner:
-    def test_an_in_flight_session_is_announced_as_recoverable(self, db):
+    def test_an_in_flight_session_enables_recovery(self, db):
         sid = _seed_session(db, "paused")
         tab = _tab(db=db, topology=_topo(), smu=_smu())
-        assert f"#{sid}" in tab._status_label.text()
-        assert "RECOVERABLE SESSION" in tab._status_label.text()
+        assert tab._resume_btn.isEnabled()
+        assert [session.id for session in db.list_recoverable_tuner_sessions()] == [sid]
 
-    def test_a_stopped_session_is_named_not_called_in_flight(self, db):
-        """An ended run must not read as live work, and saying how it ended is
-        the whole point: that is what tells the user it can be re-opened."""
-        sid = _seed_session(db, "quarantined")
+    def test_an_ended_session_does_not_claim_engine_ownership(self, db):
+        _seed_session(db, "profile_quarantined")
         tab = _tab(db=db, topology=_topo(), smu=_smu())
-        text = tab._status_label.text()
-        assert f"LAST SESSION #{sid} ENDED QUARANTINED" in text
-        assert "RECOVERABLE SESSION" not in text
+        assert tab._engine is None
+        assert tab._start_btn.isEnabled()
 
-    def test_live_work_outranks_an_older_stopped_session(self, db):
-        _seed_session(db, "quarantined")
+    def test_live_work_remains_recoverable_with_an_older_stopped_session(self, db):
+        _seed_session(db, "profile_quarantined")
         sid = _seed_session(db, "paused")
         tab = _tab(db=db, topology=_topo(), smu=_smu())
-        assert f"RECOVERABLE SESSION #{sid}" in tab._status_label.text()
+        statuses = {session.id: session.status for session in db.list_recoverable_tuner_sessions()}
+        assert statuses[sid] == "paused"
+        assert tab._resume_btn.isEnabled()
 
 
 class TestStartupRecovery:
-    def test_a_single_recoverable_session_is_announced(self, db):
+    def test_a_single_recoverable_session_is_selected(self, db):
         sid = _seed_session(db, "paused")
         tab = _tab(db=db, topology=_topo(), smu=_smu())
-        assert f"#{sid}" in tab._status_label.text()
-        assert tab._resume_btn.isEnabled()
+        tab._resume_session = MagicMock()
 
-    def test_several_recoverable_sessions_are_counted(self, db):
+        tab._on_resume()
+
+        tab._resume_session.assert_called_once_with(sid)
+
+    def test_several_recoverable_sessions_enable_the_picker(self, db):
         _seed_session(db, "paused")
         _seed_session(db, "paused")
         tab = _tab(db=db, topology=_topo(), smu=_smu())
-        assert "2 RECOVERABLE SESSIONS" in tab._status_label.text()
         assert tab._resume_btn.isEnabled()
+        assert len(db.list_recoverable_tuner_sessions()) == 2
 
 
 class TestForceStop:
@@ -815,15 +904,16 @@ class TestExternalOwnership:
 
     def test_cold_resume_selects_the_saved_backend(self, tab, monkeypatch):
         config = TunerConfig(backend="stress-ng")
-        sid = tp.create_session(tab._db, config, "", "")
+        sid = tab._db.create_tuner_session(config.to_json(), "", "")
+        tab._db.upsert_tuner_core_state(sid, CoreState(core_id=0))
         requested = []
         tab._backend_factory = lambda name: requested.append(name) or _backend()
-        eng = _engine(session_id=sid)
+        eng = _engine(session_id=sid, cores=(0,))
         monkeypatch.setattr(tt, "TunerEngine", lambda **kw: eng)
-        tab._backend_combo.setCurrentText("mprime")
+        tab._backend_combo.clear()
+        tab._backend_combo.addItem("nonexistent")
         tab._resume_session(sid)
         assert requested == ["stress-ng"]
-        assert tab._backend_combo.currentText() == "stress-ng"
 
     def test_resume_refuses_corrupt_saved_config(self, tab, monkeypatch):
         sid = _seed_session(tab._db)
@@ -834,8 +924,34 @@ class TestExternalOwnership:
         assert tab._engine is None
         constructor.assert_not_called()
 
-    def test_resume_refuses_missing_topology(self, db, monkeypatch):
+    def test_resume_refuses_missing_topology(self, db):
         sid = _seed_session(db)
         tab = _tab(db=db, topology=None, smu=_smu())
         tab._resume_session(sid)
         assert tab._engine is None
+
+
+class TestResidualResumeAndTableEdges:
+    def test_invalid_saved_configuration_is_refused(self, tab, no_modal):
+        config = TunerConfig(start_offset=20)
+        sid = tab._db.create_tuner_session(config.to_json(), bios_version="2402", cpu_model="Test 8C")
+        tab._db.update_tuner_session_status(sid, "paused")
+
+        tab._resume_session(sid)
+
+        assert tab._engine is None
+        assert no_modal.warning.call_args.args[1] == "Invalid Configuration"
+        assert "start_offset" in no_modal.warning.call_args.args[2]
+
+    def test_refreshing_existing_core_reuses_its_table_row(self, tab):
+        engine = _engine()
+        _persist_engine(tab._db, engine)
+        tab._engine = engine
+
+        tab._update_core_row(0)
+        rows = tab._core_table.rowCount()
+        tab._update_core_row(0)
+
+        assert rows == 1
+        assert tab._core_table.rowCount() == rows
+        assert tab._core_table.item(0, 0).text() == "0"

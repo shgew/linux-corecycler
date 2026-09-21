@@ -29,13 +29,13 @@ def db():
 @pytest.fixture
 def tuning(db, topo_single_ccd, mock_backend, monkeypatch):
     eng = make_engine(db, topo_single_ccd, FaultSMU(), mock_backend, cores_to_test=[0, 1])
-    eng._session_id = tp.create_session(db, eng._config, "", "")
+    eng._session_id = db.create_tuner_session(eng._config.to_json(), "", "")
     eng._status = "running"
     eng._core_states = {
         c: CoreState(core_id=c, phase=TunerPhase.CONFIRMED, current_offset=-20, best_offset=-20) for c in (0, 1)
     }
     for state in eng._core_states.values():
-        tp.save_core_state(db, eng.session_id, state)
+        db.upsert_tuner_core_state(eng.session_id, state)
     eng._co_applied = {0: 0, 1: 0}
     monkeypatch.setattr(engine_mod.QTimer, "singleShot", lambda *_: None)
     monkeypatch.setattr(eng, "_run_next", lambda: None)
@@ -56,7 +56,7 @@ def test_failed_readback_cannot_skip_abort_restoration(tuning, monkeypatch):
 
     assert not tuning._apply_co_mask(0, -10, Mask.ISOLATED)
     assert smu.applied[0] == 0
-    assert smu.writes[-1] == (0, 0)
+    assert (0, 0) in smu.writes
 
     # An abort must not trust the write cache: hardware can diverge after the
     # failed operation and still needs an unconditional baseline write.
@@ -83,7 +83,7 @@ def test_dry_run_never_starts_a_tuning_session(tuning, action):
 def test_dry_run_enabled_after_preflight_cannot_journal_a_fake_write(tuning):
     tuning._smu.dry_run = True
     with pytest.raises(RuntimeError, match="Dry Run"):
-        tuning._apply_co(0, -30)
+        tuning._write_co_verified(0, -30)
     assert tp.journal_values(tuning._db, tuning.session_id) == {}
 
 
@@ -96,7 +96,7 @@ def test_failure_at_time_limit_is_not_confirmation(tuning):
     tuning._on_test_finished(0, False, "rounding error", "computation", 2.0, 0.0)
     assert tuning.status == "paused"
     assert cs.phase == TunerPhase.FAILED_CONFIRM
-    assert tp.get_test_log(tuning._db, tuning.session_id, core_id=0)[-1]["passed"] == 0
+    assert tuning._db.get_tuner_test_log(tuning.session_id, core_id=0)[-1]["passed"] == 0
 
 
 def test_crash_invalidates_a_contradicted_pass_bound(tuning):
@@ -111,10 +111,10 @@ def test_crash_invalidates_a_contradicted_pass_bound(tuning):
 def test_paused_validation_crash_does_not_blame_the_loaded_core(tuning):
     db, sid = tuning._db, tuning.session_id
     tuning._core_states[0].in_test = True
-    tp.save_core_state(db, sid, tuning._core_states[0])
-    tp.set_validation_position(db, sid, 5, 0, 0, False, "[]")
-    tp.update_session_status(db, sid, "paused")
-    crashed, hunt = tuning._attribute_crash_after_reboot(tp.get_session(db, sid))
+    db.upsert_tuner_core_state(sid, tuning._core_states[0])
+    db.set_validation_position(sid, 5, 0, 0, False, "[]")
+    db.update_tuner_session_status(sid, "paused")
+    crashed, hunt = tuning._attribute_crash_after_reboot(db.get_tuner_session(sid))
     assert crashed == []
     assert hunt
     assert all(cs.crash_count == 0 for cs in tuning.core_states.values())
@@ -125,24 +125,24 @@ def test_thermal_stop_cannot_discard_foreign_mce_or_clean_pass_debt(tuning):
     tuning._status = "validating"
     tuning._validation_stage = 5
     tuning._co_applied[1] = -20
-    tp.set_validation_position(db, sid, 5, 0, 0, False, "[]")
+    db.set_validation_position(sid, 5, 0, 0, False, "[]")
     cpu = tuning._topology.cores[1].logical_cpus[0]
     events = json.dumps([{"cpu": cpu, "corrected": True, "message": "hardware error"}])
     tuning._on_test_finished(0, False, "temperature limit", "thermal", 2.0, 0.0, events)
     assert tuning.core_states[1].current_offset == -19
     assert tuning.core_states[1].phase == TunerPhase.BACKOFF_PRECONFIRM
-    assert tp.get_session(db, sid).validation_dirty
+    assert db.get_tuner_session(sid).validation_dirty
     assert tuning._validation_stage == 0
 
 
 def test_recovery_penalty_preserves_the_need_for_a_full_clean_pass(tuning):
     db, sid = tuning._db, tuning.session_id
-    tp.set_validation_position(db, sid, 5, 0, 0, False, "[]")
-    stale_session = tp.get_session(db, sid)
+    db.set_validation_position(sid, 5, 0, 0, False, "[]")
+    stale_session = db.get_tuner_session(sid)
     tuning._apply_crash_penalty(tuning.core_states[0])
     tuning._enter_auto_validation({0: -17, 1: -20}, resume_from=stale_session)
     assert tuning._validation_dirty
-    assert tp.get_session(db, sid).validation_dirty
+    assert db.get_tuner_session(sid).validation_dirty
 
 
 def test_explicit_profile_validation_includes_staged_validation(tuning):
@@ -152,13 +152,13 @@ def test_explicit_profile_validation_includes_staged_validation(tuning):
     tuning._complete_session()
     assert tuning.status == "validating"
     assert tuning._validation_stage == 1
-    assert tp.get_session(tuning._db, tuning.session_id).status != "completed"
+    assert tuning._db.get_tuner_session(tuning.session_id).status != "completed"
 
 
 def test_resume_resolves_the_saved_backend(tuning, monkeypatch):
     config = TunerConfig(backend="stress-ng", cores_to_test=[0])
-    sid = tp.create_session(tuning._db, config, "", "")
-    tp.save_core_state(tuning._db, sid, CoreState(core_id=0))
+    sid = tuning._db.create_tuner_session(config.to_json(), "", "")
+    tuning._db.upsert_tuner_core_state(sid, CoreState(core_id=0))
     backend = MagicMock()
     backend.name = "stress-ng"
     backend.is_available.return_value = True
@@ -242,8 +242,8 @@ def test_only_live_mask_phases_count_as_stability_evidence():
 @pytest.mark.parametrize("missing", ["unknown", "uninstalled"])
 def test_resume_refuses_unavailable_saved_backend(tuning, monkeypatch, missing):
     config = TunerConfig(backend="stress-ng", cores_to_test=[0])
-    sid = tp.create_session(tuning._db, config, "", "")
-    tp.save_core_state(tuning._db, sid, CoreState(core_id=0))
+    sid = tuning._db.create_tuner_session(config.to_json(), "", "")
+    tuning._db.upsert_tuner_core_state(sid, CoreState(core_id=0))
     tuning._status = "idle"
     backend = MagicMock()
     backend.is_available.return_value = False

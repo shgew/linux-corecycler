@@ -21,7 +21,7 @@ from corecycler.engine.topology import CPUTopology, PhysicalCore
 
 def _single_core_topology() -> CPUTopology:
     topo = CPUTopology()
-    topo.cores[0] = PhysicalCore(core_id=0, ccd=0, ccx=None, logical_cpus=(0,))
+    topo.cores[0] = PhysicalCore(core_id=0, ccd=0, logical_cpus=(0,))
     topo.ccds = 1
     return topo
 

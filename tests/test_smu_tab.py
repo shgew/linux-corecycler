@@ -26,7 +26,7 @@ def _qapp():
 def _topo():
     topo = CPUTopology(model_name="Test 8C", family=26, model=0x44, physical_cores=8, ccds=2)
     for cid in range(8):
-        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0 if cid < 4 else 1, ccx=None, logical_cpus=(cid, cid + 8))
+        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0 if cid < 4 else 1, logical_cpus=(cid, cid + 8))
     return topo
 
 
@@ -40,23 +40,30 @@ def _tab():
 class TestProfileLoad:
     def test_valid_profile_populates_spinboxes(self):
         tab = _tab()
-        tab.set_co_profile({0: -20, 1: -30, 7: -10})
+        tab.set_co_profile({0: -20, 1: -30, 7: -10}, "Test 8C")
         assert tab._spinboxes[0].value() == -20
         assert tab._spinboxes[7].value() == -10
 
     def test_out_of_range_offset_is_clamped_and_warns(self):
         tab = _tab()
         with patch("corecycler.gui.smu_tab.QMessageBox.warning") as warn:
-            tab.set_co_profile({0: -200})
+            tab.set_co_profile({0: -200}, "Test 8C")
         assert tab._spinboxes[0].value() == tab._commands.co_range[0]
         assert warn.called
 
     def test_offset_for_absent_core_warns(self):
         tab = _tab()
         with patch("corecycler.gui.smu_tab.QMessageBox.warning") as warn:
-            tab.set_co_profile({0: -10, 999: -10})
+            tab.set_co_profile({0: -10, 999: -10}, "Test 8C")
         assert warn.called
         assert tab._spinboxes[0].value() == -10
+
+    def test_profile_from_different_cpu_is_refused(self):
+        tab = _tab()
+        with patch("corecycler.gui.smu_tab.QMessageBox.warning") as warn:
+            tab.set_co_profile({0: -20}, "Different CPU")
+        assert tab._spinboxes[0].value() == 0
+        assert warn.called
 
 
 class TestTunerLock:
@@ -81,7 +88,7 @@ class TestTunerLock:
         tab = _tab()
         tab._smu = MagicMock()
         tab._smu.is_available.return_value = True
-        tab._smu.has_backup.return_value = True
+        tab._co_backup = {core_id: -10 for core_id in tab._spinboxes}
 
         def confirm(detail):
             tab.set_tuner_running(True)
@@ -90,6 +97,7 @@ class TestTunerLock:
         with (
             patch.object(tab, "_confirm_co_write", side_effect=confirm),
             patch("corecycler.gui.smu_tab.QMessageBox.information"),
+            patch("corecycler.gui.smu_tab.QMessageBox.warning"),
         ):
             tab._restore_co()
         tab._smu.restore_co_offsets.assert_not_called()
@@ -171,7 +179,7 @@ class TestCoreMapRefusal:
         _qapp()
         topo = CPUTopology(model_name="Test", family=26, model=0x44, physical_cores=6, ccds=1)
         for cid in range(6):
-            topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, ccx=None, logical_cpus=(cid,))
+            topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, logical_cpus=(cid,))
         tab = st.SMUTab(topo)
         assert tab._smu is not None
         assert tab._smu.core_map_error is not None

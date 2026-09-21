@@ -44,7 +44,7 @@ def _topo(n_cores: int):
 
     topo = CPUTopology()
     for i in range(n_cores):
-        topo.cores[i] = PhysicalCore(core_id=i, ccd=0, ccx=None, logical_cpus=(i,))
+        topo.cores[i] = PhysicalCore(core_id=i, ccd=0, logical_cpus=(i,))
     topo.ccds = 1
     return topo
 
@@ -54,7 +54,14 @@ def _uniform(n_cores: int, load: int, idle: int) -> FakeSilicon:
 
 
 def _assert_clean_convergence(run, silicon: FakeSilicon) -> None:
-    assert run.terminal_reason is TerminalReason.CLEAN_CONVERGED, run.terminal_reason
+    assert run.terminal_reason is TerminalReason.CLEAN_CONVERGED, (
+        run.terminal_reason,
+        run.status,
+        run.engine._validation_stage,
+        run.engine._validation_dirty,
+        run.engine._hunting,
+        [(cs.phase, cs.current_offset, cs.best_offset, cs.in_test) for cs in run.engine._core_states.values()],
+    )
     assert run.context_id is not None
     assert all(bank and all(seconds > 0 for seconds in bank.values()) for bank in run.regime_banks.values())
     assert run.anneal_eligible <= run.annealed_cores

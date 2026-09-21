@@ -1,4 +1,4 @@
-"""Tests for history.logger — TestRunLogger with mock-backed HistoryDB."""
+"""Tests for history.logger - TestRunLogger with mock-backed HistoryDB."""
 
 from __future__ import annotations
 
@@ -32,7 +32,7 @@ def topology():
     topo.ccds = 2
     topo.is_x3d = True
     for i in range(8):
-        topo.cores[i] = PhysicalCore(core_id=i, ccd=i // 4, ccx=None, logical_cpus=(i, i + 8))
+        topo.cores[i] = PhysicalCore(core_id=i, ccd=i // 4, logical_cpus=(i, i + 8))
     return topo
 
 
@@ -136,6 +136,11 @@ class TestStatusAndCycle:
         results = db.get_core_results(logger.run_id)
         assert results[0].elapsed_seconds == 30.0
 
+    def test_status_for_inactive_core_is_ignored(self, db, logger):
+        logger.on_status_updated(0, CoreTestStatus(core_id=0, elapsed_seconds=30.0))
+
+        assert db.get_core_results(logger.run_id) == []
+
     def test_cycle_completed(self, db, logger):
         logger.on_cycle_completed(0)
 
@@ -161,10 +166,31 @@ class TestTestCompletion:
         assert run.total_cores == 3
         assert run.finished_at is not None
 
-    def test_on_test_completed_malformed_payload_is_safe(self, db, logger):
-        # Fail closed: a malformed or wrongly-shaped payload must not crash the slot.
-        for bad in ("", "not json", "[1,2,3]", "null", "42", '{"0": "x"}', '{"0": [42]}', '{"0": [{"no_passed": 1}]}'):
-            logger.on_test_completed(bad)  # must not raise
+    @pytest.mark.parametrize(
+        "bad",
+        ("", "not json", "[1,2,3]", "null", "42", '{"0": "x"}', '{"0": [42]}', '{"0": [{"no_passed": 1}]}'),
+    )
+    def test_on_test_completed_malformed_payload_is_crashed(self, db, logger, bad):
+        logger.on_test_completed(bad)
+        run = db.get_run(logger.run_id)
+        assert run.status == "crashed"
+        assert db.get_events(logger.run_id, event_type="error")[0].message == "Worker returned malformed result data"
+
+    def test_on_test_completed_rejects_non_numeric_core_id(self, db, logger):
+        logger.on_test_completed('{"core":[{"passed":true}]}')
+
+        run = db.get_run(logger.run_id)
+        assert run.status == "crashed"
+        assert db.get_events(logger.run_id, event_type="error")[0].message == "Worker returned malformed result data"
+
+    def test_first_terminal_signal_wins(self, db, logger):
+        logger.on_test_crashed("worker vanished")
+        logger.on_test_stopped()
+        logger.on_test_completed('{"0":[{"passed":true}]}')
+
+        run = db.get_run(logger.run_id)
+        assert run.status == "crashed"
+        assert db.get_events(logger.run_id, event_type="error")[0].message == "worker vanished"
 
     def test_on_test_stopped(self, db, logger):
         logger.on_test_stopped()
@@ -200,6 +226,11 @@ class TestTelemetry:
         assert results[0].peak_freq_mhz == 5800.0
         assert results[0].max_temp_c == 82.0
 
+    def test_update_peaks_for_inactive_core_is_ignored(self, db, logger):
+        logger.update_core_telemetry_peaks(0, peak_freq_mhz=5800.0)
+
+        assert db.get_core_results(logger.run_id) == []
+
 
 class TestEventHelpers:
     def test_record_phase_change(self, db, logger):
@@ -230,9 +261,8 @@ class TestTuningContext:
 
         ctx = db.get_context(run.context_id)
         assert ctx is not None
-        # Without SMU, CO offsets should be empty
-        assert ctx.co_offsets_json == "{}"
-        assert ctx.co_hash == ""
+        assert ctx.co_offsets_json == '{"0":null,"1":null,"2":null,"3":null,"4":null,"5":null,"6":null,"7":null}'
+        assert len(ctx.context_hash) == 64
 
     def test_two_runs_same_context(self, db, topology, profile):
         """Two runs without SMU share the same tuning context."""

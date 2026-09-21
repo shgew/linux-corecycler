@@ -14,14 +14,11 @@ stock is judged on exactly that.
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from enum import StrEnum
 
-from corecycler.history.context import compute_co_hash, find_or_create_context
-from corecycler.history.db import TuningContextRecord
+from corecycler.history.context import SystemContext, compute_context_hash
 from corecycler.tuner import engine as engine_mod
-from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine
 from corecycler.tuner.state import CoreState, TunerPhase
@@ -111,13 +108,13 @@ def drive(
         "coarse_step": 5,
         "fine_step": 1,
         "max_offset": -50,
-        "search_duration_seconds": 1,
-        "confirm_duration_seconds": 1,
-        "validate_duration_seconds": 1,
+        "search_duration_seconds": 10,
+        "confirm_duration_seconds": 30,
+        "validate_duration_seconds": 30,
         "probe_base_seconds": 60,
         "spectrum_slot_seconds": 30,
         "endurance_slot_seconds": 60,
-        "anneal_bank_hours": 1 / 3600,
+        "anneal_bank_hours": 0.01,
         # Stages that do not route through the two patched worker entry points
         # (rapid transitions, the memory backend, the no-load soak) would start
         # real threads, so the model cannot judge them.
@@ -133,19 +130,28 @@ def drive(
     world = {"rebooted": True}
     engine_mod._rebooted_since = lambda *a, **k: world["rebooted"]
 
-    stock = {core_id: 0 for core_id in cores}
-    co_hash = compute_co_hash(stock)
-    context_id = find_or_create_context(
-        db,
-        TuningContextRecord(
-            bios_version="Silicon model BIOS",
-            co_offsets_json=json.dumps(stock, sort_keys=True),
-            co_hash=co_hash,
-            pbo_scalar=smu.get_pbo_scalar(),
-            boost_limit_mhz=smu.get_boost_limit(),
-        ),
+    co = tuple(0 for _ in cores)
+    context_values = dict(
+        cpu_model="Silicon model CPU",
+        physical_cores=len(cores),
+        ccds=topo.ccds,
+        co=co,
+        pbo_scalar=smu.get_pbo_scalar(),
+        boost_limit_mhz=smu.get_boost_limit(),
+        ppt_limit_w=None,
+        tdc_limit_a=None,
+        edc_limit_a=None,
+        bios_version="Silicon model BIOS",
     )
-    sid = tp.create_session(db, cfg, "Silicon model BIOS", "Silicon model CPU", context_id)
+    context = SystemContext(
+        **context_values,
+        context_hash=compute_context_hash(**context_values),
+        complete=True,
+        missing=(),
+    )
+    context_id = db.get_or_create_context(context)
+    engine_mod.capture_system_context = lambda *_, **__: context
+    sid = db.create_tuner_session(cfg.to_json(), "Silicon model BIOS", "Silicon model CPU", context_id)
     pending: list[tuple[frozenset[int], int, float]] = []
 
     def solo(core_id: int, duration: int, **kw) -> None:
@@ -182,7 +188,7 @@ def drive(
     eng = fresh()
     eng._core_states = {c: CoreState(core_id=c) for c in cores}
     for cs in eng._core_states.values():
-        tp.save_core_state(db, sid, cs)
+        db.upsert_tuner_core_state(sid, cs)
     eng._set_status("running")
     holder = {"eng": eng}
     holder["eng"]._run_next()

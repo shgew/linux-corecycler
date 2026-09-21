@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import subprocess
 import sys
 import threading
 import time
@@ -175,31 +174,6 @@ class TestThermalEdges:
         assert watch.safe() is False
 
 
-class TestTemperatureSourceEdges:
-    def test_a_nameless_or_unreadable_hwmon_node_is_skipped(self, tmp_path):
-        nameless = tmp_path / "hwmon0"
-        nameless.mkdir()
-        unreadable = tmp_path / "hwmon1"
-        unreadable.mkdir()
-        (unreadable / "name").mkdir()
-        real = tmp_path / "hwmon2"
-        real.mkdir()
-        (real / "name").write_text("k10temp\n")
-        (real / "temp1_input").write_text("51000\n")
-        with patch.object(execution, "Path", lambda _p: tmp_path):
-            assert execution.read_cpu_temperature() == 51.0
-
-
-class TestReapEdges:
-    def test_an_unwaited_child_is_reaped(self):
-        proc = subprocess.Popen(["true"])
-        deadline = time.monotonic() + 5
-        while proc.poll() is None and time.monotonic() < deadline:
-            time.sleep(0.01)
-        execution.reap_zombies()
-        execution.reap_zombies()
-
-
 def _idle_supervisor(backend=None, **overrides):
     from test_execution import FakeBackend, FakeDetector
 
@@ -217,6 +191,7 @@ def _idle_supervisor(backend=None, **overrides):
         observed=[],
         poll_interval=0.01,
         containment_for=lambda cpus: None,
+        scope_terminator=lambda unit: True,
     )
     kwargs.update(overrides)
     return execution.Supervisor(**kwargs)
@@ -285,10 +260,9 @@ class TestSupervisorInternalsEdges:
     def test_a_busy_cpu_sample_is_never_a_stall(self, tmp_path):
         supervisor = _idle_supervisor(stall_timeout=0.0)
         run = _LaneRun(lane=Lane(core_id=0, cpus=(0,), work_dir=tmp_path))
-        with patch.object(execution, "cpu_times", side_effect=[(0, 100), (0, 200)]):
-            now = time.monotonic()
-            assert supervisor._is_stalled(run, now) is False
-            assert supervisor._is_stalled(run, now + 60.0) is False
+        now = time.monotonic()
+        assert supervisor._is_stalled(run, now, {0: (0, 100)}) is False
+        assert supervisor._is_stalled(run, now + 60.0, {0: (0, 200)}) is False
 
     def test_a_late_unattributed_event_lands_on_the_anchor(self, tmp_path):
         from test_execution import FakeBackend, FakeDetector
@@ -308,14 +282,14 @@ class TestSupervisorInternalsEdges:
         supervisor = _idle_supervisor()
         run = _LaneRun(lane=Lane(core_id=0, cpus=(0,), work_dir=tmp_path))
         run.proc = SimpleNamespace(returncode=-9)
-        verdict = supervisor._final_verdict(run, elapsed=5.0, interrupted=False)
+        verdict = supervisor._classify_completed(run, elapsed=5.0, interrupted=False)
         assert verdict is not None and verdict.error_type == "killed"
 
     def test_final_verdict_flags_an_instant_nonzero_exit(self, tmp_path):
         supervisor = _idle_supervisor()
         run = _LaneRun(lane=Lane(core_id=0, cpus=(0,), work_dir=tmp_path))
         run.proc = SimpleNamespace(returncode=4)
-        verdict = supervisor._final_verdict(run, elapsed=0.5, interrupted=False)
+        verdict = supervisor._classify_completed(run, elapsed=0.5, interrupted=False)
         assert verdict is not None and verdict.error_type == "startup"
 
     def test_final_verdict_prefers_the_live_error_file(self, tmp_path):
@@ -325,7 +299,7 @@ class TestSupervisorInternalsEdges:
         run = _LaneRun(lane=Lane(core_id=0, cpus=(0,), work_dir=tmp_path))
         run.proc = SimpleNamespace(returncode=0)
 
-        verdict = supervisor._final_verdict(run, elapsed=5.0, interrupted=False)
+        verdict = supervisor._classify_completed(run, elapsed=5.0, interrupted=False)
         assert verdict is not None and "SUMOUT" in verdict.error_message
 
     def test_classify_names_a_timeout(self):
@@ -468,35 +442,6 @@ class TestSchedulerHookGlue:
 
 
 class TestRemainingLoopEdges:
-    def test_a_lone_nameless_hwmon_node_reads_as_no_sensor(self, tmp_path):
-        (tmp_path / "hwmon0").mkdir()
-        with patch.object(execution, "Path", lambda _p: tmp_path):
-            assert execution.read_cpu_temperature() is None
-
-    def test_a_lone_unreadable_name_reads_as_no_sensor(self, tmp_path):
-        node = tmp_path / "hwmon0"
-        node.mkdir()
-        (node / "name").mkdir()
-        with patch.object(execution, "Path", lambda _p: tmp_path):
-            assert execution.read_cpu_temperature() is None
-
-    def test_a_lone_foreign_sensor_reads_as_no_cpu_sensor(self, tmp_path):
-        node = tmp_path / "hwmon0"
-        node.mkdir()
-        (node / "name").write_text("nvme\n")
-        (node / "temp1_input").write_text("99000\n")
-        with patch.object(execution, "Path", lambda _p: tmp_path):
-            assert execution.read_cpu_temperature() is None
-
-    def test_reap_leaves_a_live_child_alone(self):
-        proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(20)"])
-        try:
-            execution.reap_zombies()
-            assert proc.poll() is None
-        finally:
-            proc.kill()
-            proc.wait(timeout=5)
-
     def test_the_in_loop_error_poll_fails_the_lane_mid_run(self, tmp_path):
         from test_execution import FakeBackend
 
@@ -516,7 +461,8 @@ class TestRemainingLoopEdges:
         decided = _LaneRun(lane=Lane(core_id=0, cpus=(0,), work_dir=tmp_path))
         decided.verdict = StressResult(core_id=0, passed=True, duration_seconds=0.1)
         unstarted = _LaneRun(lane=Lane(core_id=1, cpus=(1,), work_dir=tmp_path))
-        assert supervisor._poll_exits_stalls_watchdog([decided, unstarted], time.monotonic()) is False
+        start = time.monotonic()
+        assert supervisor._poll_exits([decided, unstarted], start, start) is False
 
     def test_final_verdict_attributes_a_parse_failure(self, tmp_path):
         from test_execution import FakeBackend
@@ -524,6 +470,6 @@ class TestRemainingLoopEdges:
         supervisor = _idle_supervisor(backend=FakeBackend(parse=(False, "fake error: BAD")))
         run = _LaneRun(lane=Lane(core_id=0, cpus=(0,), work_dir=tmp_path))
         run.proc = SimpleNamespace(returncode=0)
-        verdict = supervisor._final_verdict(run, elapsed=5.0, interrupted=False)
+        verdict = supervisor._classify_completed(run, elapsed=5.0, interrupted=False)
         assert verdict is not None and not verdict.passed
         assert "BAD" in verdict.error_message

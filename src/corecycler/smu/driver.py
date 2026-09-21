@@ -39,10 +39,8 @@ SYSFS_BASE = Path("/sys/kernel/ryzen_smu_drv")
 _PBO_LIMIT_MIN: int = 1
 _PBO_LIMIT_MAX: int = 2000
 
-# Physical core slots per CCD on every CO-capable generation this tool models
-# (Zen 3/4/5 classic layouts: one 8-core CCX per CCD). Dense-CCX APU dies
-# (Zen 4c/5c, >8 cores per L3 group) fall outside this model and keep the
-# legacy core_id-derived addressing.
+# Physical core slots per CCD on every uniform layout this driver models.
+# A denser L3 group is outside that verified model and blocks per-core CO.
 _SLOTS_PER_CCD: int = 8
 
 # CCD stride inside the core-disable fuse address space: CCD n's fuse sits at
@@ -146,11 +144,10 @@ class RyzenSMU:
         self.sysfs = sysfs_path
         self.dry_run = dry_run
         self._smu_lock = threading.Lock()
-        self._backup: dict[int, int] | None = None
-        # Legacy CCD map {core_id: ccd_index} from L3 topology, used only when
-        # no discovered core map exists (set_topology never called, or a dense
-        # layout outside the 8-slot-per-CCD model). The full addressing truth
-        # lives in _core_map.
+        self._backup: dict[int, int | None] | None = None
+        # Legacy CCD map {core_id: ccd_index} from L3 topology. Uniform
+        # eight-slot generations replace it with the verified _core_map.
+        # Unmodelled generations retain legacy core-id-derived addressing.
         self._topology_ccd: dict[int, int] | None = None
         # Discovered addressing map {core_id: (ccd_index, physical_slot)} and
         # its fail-closed error state. See set_topology.
@@ -193,11 +190,9 @@ class RyzenSMU:
             a concurrent reader refuses rather than falling open to legacy
             addressing.
 
-        The whole discovery is gated on the generation's declared
-        ``uniform_8core_ccds`` (classic 8-slot CCD/CCX layout, verified): a
-        generation without it, and any L3 group larger than 8 cores (dense
-        Zen 4c/5c CCX dies), keeps the legacy core_id-derived addressing
-        bit-for-bit.
+        Discovery runs only for generations declaring ``uniform_8core_ccds``
+        and refuses an L3 group larger than the verified eight-slot layout.
+        Generations without that declaration retain legacy core-id addressing.
         """
         self._topology_ccd = {}
         for core_id, core_info in topology.cores.items():
@@ -210,19 +205,25 @@ class RyzenSMU:
         if not ids or not self.commands.has_co or not self.commands.uniform_8core_ccds:
             self._core_map_error = None
             return
-        groups = self._group_cores(topology, ids)
-        if groups is None:
-            self._core_map_error = None
+        if getattr(topology, "ccd_layout_known", True) is False:
+            self._core_map_error = "CCD layout is unproven; per-core CO stays disabled"
             return
-        fully_online = getattr(topology, "cpus_all_online", True) is not False
-        if not fully_online:
-            self._core_map_error = "some present CPUs are offline; online all cores before CO tuning"
+        try:
+            groups = self._group_cores(topology, ids)
+        except CoreMapError as exc:
+            self._core_map_error = str(exc)
+            log.error("SMU core mapping unavailable: %s", exc)
+            return
+        online_state = getattr(topology, "cpus_all_online", None)
+        if online_state is not True:
+            state = "some CPUs are offline" if online_state is False else "online CPU state is unproven"
+            self._core_map_error = f"{state}; online all cores before CO tuning"
             return
         core_map: dict[int, tuple[int, int]] = {}
         try:
             for encode_ccd in sorted(groups):
                 group_ids = groups[encode_ccd]
-                slots = self._derive_group_slots(group_ids, fully_online)
+                slots = self._derive_group_slots(group_ids, True)
                 if slots is None:
                     slots = self._fuse_group_slots(encode_ccd, len(group_ids))
                 core_map.update((cid, (encode_ccd, slot)) for cid, slot in zip(group_ids, slots, strict=True))
@@ -253,20 +254,19 @@ class RyzenSMU:
         return rel if holes_trusted else None
 
     @staticmethod
-    def _group_cores(topology, ids: list[int]) -> dict[int, list[int]] | None:
-        """Group core ids by encode-CCD index; None for unmodeled dense layouts.
-
-        L3-detected CCDs are used when every core has one (the CCD index the CO
-        argument encodes); otherwise the ``core_id // 8`` window. Ids stay
-        ascending within each group.
-        """
+    def _group_cores(topology, ids: list[int]) -> dict[int, list[int]]:
+        """Group core ids by encode-CCD index and reject unmodelled layouts."""
         by_l3 = all(topology.cores[cid].ccd is not None for cid in ids)
         groups: dict[int, list[int]] = {}
         for cid in ids:
             key = topology.cores[cid].ccd if by_l3 else cid // _SLOTS_PER_CCD
             groups.setdefault(key, []).append(cid)
-        if any(len(members) > _SLOTS_PER_CCD for members in groups.values()):
-            return None
+        largest = max(len(members) for members in groups.values())
+        if largest > _SLOTS_PER_CCD:
+            raise CoreMapError(
+                f"detected L3 group contains {largest} cores, exceeding the verified eight-slot CCD layout; "
+                "per-core CO stays disabled"
+            )
         return groups
 
     def check_smn_readable(self) -> tuple[bool, str]:
@@ -288,18 +288,17 @@ class RyzenSMU:
         return True, "OK"
 
     def read_smn(self, address: int) -> int | None:
-        """Read one 32-bit SMN register, or None if the read did not happen.
-
-        The ryzen_smu ``smn`` node takes the address as a 4-byte write and
-        hands the value back on the next read. A failed read leaves the
-        driver's result register untouched, so a failure here must never
-        decay into the previous read's value: it returns None.
-        """
+        """Read one 32-bit SMN register, or None unless the transfer is exact."""
         path = self.sysfs / "smn"
+        request = struct.pack("<I", address)
         with self._smu_lock:
             try:
-                path.write_bytes(struct.pack("<I", address))
-                return struct.unpack("<I", path.read_bytes()[:4])[0]
+                if path.write_bytes(request) != len(request):
+                    raise OSError("truncated SMN address write")
+                reply = path.read_bytes()
+                if len(reply) != 4:
+                    raise OSError("invalid SMN response length")
+                return struct.unpack("<I", reply)[0]
             except (OSError, struct.error) as exc:
                 log.debug("SMN read of %#010x failed: %s", address, exc)
                 return None
@@ -396,34 +395,23 @@ class RyzenSMU:
     # ------------------------------------------------------------------
 
     def backup_co_offsets(self, num_cores: int) -> dict[int, int]:
-        """Save current CO offsets for all cores before modification.
-
-        The backup is stored internally and can be restored with
-        ``restore_co_offsets()``.  The dict is also returned for the caller
-        to persist (e.g. write to a JSON file) if desired.
-
-        Note: CO values are VOLATILE — they reset on reboot regardless.
-        This backup guards against accidental *within-session* mistakes only.
-        """
+        """Save current CO offsets for all cores before modification."""
         offsets = self.get_all_co_offsets(num_cores)
-        # Only store successfully-read values
-        self._backup = {k: v for k, v in offsets.items() if v is not None}
-        log.info("Backed up CO offsets for %d cores: %s", len(self._backup), self._backup)
-        return dict(self._backup)
+        self._backup = dict(offsets)
+        readable = {core_id: value for core_id, value in offsets.items() if value is not None}
+        log.info("Backed up CO offsets for %d cores: %s", len(readable), readable)
+        return readable
 
     def restore_co_offsets(self) -> tuple[bool, list[int]]:
-        """Restore previously backed-up CO offsets.
-
-        Returns (all_ok, list_of_failed_core_ids).
-        """
+        """Restore captured offsets and report every core that could not be restored."""
         if self._backup is None:
             log.warning("restore_co_offsets called with no backup available")
             return False, []
         failed: list[int] = []
         for core_id, value in self._backup.items():
-            if not self.set_co_offset(core_id, value):
+            if value is None or not self.set_co_offset(core_id, value):
                 failed.append(core_id)
-        ok = len(failed) == 0
+        ok = not failed
         if ok:
             log.info("Restored CO offsets from backup successfully")
         else:
@@ -431,8 +419,8 @@ class RyzenSMU:
         return ok, failed
 
     def has_backup(self) -> bool:
-        """Return True if a backup has been taken this session."""
-        return self._backup is not None
+        """Return whether every requested core has a captured offset."""
+        return self._backup is not None and all(value is not None for value in self._backup.values())
 
     # ------------------------------------------------------------------
     # Low-level SMU communication
@@ -459,60 +447,34 @@ class RyzenSMU:
         return self.sysfs / self._get_cmd_filename()
 
     def _send_command(self, cmd: int, args: tuple[int, ...] = (0, 0, 0, 0, 0, 0)) -> SMUResponse:
-        """Send an SMU command and read the response."""
+        """Send a command through the generation's default mailbox."""
+        return self._mailbox_transaction(self._get_cmd_path(), cmd, args)
+
+    def _mailbox_transaction(self, cmd_path: Path, cmd: int, args: tuple[int, ...]) -> SMUResponse:
         with self._smu_lock:
             args_path = self.sysfs / "smu_args"
-            cmd_path = self._get_cmd_path()
-
-            # pack 6 x uint32 arguments
-            if len(args) < 6:
-                args = args + (0,) * (6 - len(args))
-            # Fail closed: an out-of-range arg, a permission error, or a truncated
-            # sysfs response must return a failed SMUResponse, never raise or write a
-            # coerced wrong value. A failed pack means we never write at all.
+            padded_args = (args + (0,) * 6)[:6]
             try:
-                packed_args = struct.pack("<6I", *args[:6])
-                args_path.write_bytes(packed_args)
-                cmd_path.write_bytes(struct.pack("<I", cmd))
+                packed_args = struct.pack("<6I", *padded_args)
+                packed_cmd = struct.pack("<I", cmd)
+                if args_path.write_bytes(packed_args) != len(packed_args):
+                    raise OSError("truncated SMU argument write")
+                if cmd_path.write_bytes(packed_cmd) != len(packed_cmd):
+                    raise OSError("truncated SMU command write")
                 resp_cmd = cmd_path.read_bytes()
                 resp_args_raw = args_path.read_bytes()
-                status = struct.unpack("<I", resp_cmd[:4])[0]
-                resp_args = struct.unpack("<6I", resp_args_raw[:24])
+                if len(resp_cmd) != 4 or len(resp_args_raw) != 24:
+                    raise OSError("invalid SMU response length")
+                status = struct.unpack("<I", resp_cmd)[0]
+                resp_args = struct.unpack("<6I", resp_args_raw)
             except (OSError, struct.error) as exc:
-                log.debug("SMU command %#x failed: %s", cmd, exc)
+                log.debug("SMU command %#x via %s failed: %s", cmd, cmd_path.name, exc)
                 return SMUResponse(success=False, args=(0,) * 6, raw=b"")
-
-            return SMUResponse(
-                success=(status == 1),
-                args=resp_args,
-                raw=resp_args_raw,
-            )
+            return SMUResponse(success=status == 1, args=resp_args, raw=resp_args_raw)
 
     def _send_rsmu_command(self, cmd: int, args: tuple[int, ...] = (0, 0, 0, 0, 0, 0)) -> SMUResponse:
-        """Send an RSMU command regardless of the default mailbox.
-
-        PBO limit commands use RSMU even on Zen 3 (which defaults to MP1 for CO).
-        """
-        with self._smu_lock:
-            args_path = self.sysfs / "smu_args"
-            cmd_path = self.sysfs / "rsmu_cmd"
-
-            if len(args) < 6:
-                args = args + (0,) * (6 - len(args))
-            # Fail closed on a bad arg / permission error / truncated response.
-            try:
-                packed_args = struct.pack("<6I", *args[:6])
-                args_path.write_bytes(packed_args)
-                cmd_path.write_bytes(struct.pack("<I", cmd))
-                resp_cmd = cmd_path.read_bytes()
-                resp_args_raw = args_path.read_bytes()
-                status = struct.unpack("<I", resp_cmd[:4])[0]
-                resp_args = struct.unpack("<6I", resp_args_raw[:24])
-            except (OSError, struct.error) as exc:
-                log.debug("RSMU command %#x failed: %s", cmd, exc)
-                return SMUResponse(success=False, args=(0,) * 6, raw=b"")
-
-            return SMUResponse(success=(status == 1), args=resp_args, raw=resp_args_raw)
+        """Send an RSMU command regardless of the default mailbox."""
+        return self._mailbox_transaction(self.sysfs / "rsmu_cmd", cmd, args)
 
     # ------------------------------------------------------------------
     # CO offset read/write

@@ -17,6 +17,8 @@ only the fuse can.
 from __future__ import annotations
 
 import logging
+import struct
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -39,6 +41,8 @@ _SMN_DENIED = "no write permission on /sys/kernel/ryzen_smu_drv/smn — root-onl
 def _topo(cores: dict[int, int]) -> MagicMock:
     topo = MagicMock()
     topo.cores = {cid: MagicMock(ccd=ccd) for cid, ccd in cores.items()}
+    topo.cpus_all_online = True
+    topo.ccd_layout_known = True
     return topo
 
 
@@ -258,6 +262,29 @@ class TestSmnNodeIO:
         assert not ok
         assert "root-only" in msg and "corecycler group" in msg
 
+    def test_short_address_write_refuses_stale_fuse_data(self, tmp_path, monkeypatch):
+        smn = tmp_path / "smn"
+        smn.write_bytes(struct.pack("<I", 0x0C))
+        original = Path.write_bytes
+
+        def short_write(path, data):
+            if path == smn:
+                return 3
+            return original(path, data)
+
+        monkeypatch.setattr(Path, "write_bytes", short_write)
+        smu = RyzenSMU(VERMEER, tmp_path)
+        smu.set_topology(_topo({core: 0 for core in range(6)}))
+        assert smu.core_map is None
+        assert "fuse read failed" in smu.core_map_error
+
+    @pytest.mark.parametrize("reply", [b"\x00" * 3, b"\x00" * 5])
+    def test_non_exact_smn_reply_fails(self, tmp_path, monkeypatch, reply):
+        smn = tmp_path / "smn"
+        smn.write_bytes(b"\x00" * 4)
+        monkeypatch.setattr(Path, "read_bytes", lambda _path: reply)
+        assert RyzenSMU(VERMEER, tmp_path).read_smn(0x30081D98) is None
+
 
 class TestCoreMapBlockedHelper:
     def test_none_smu_is_not_blocked(self):
@@ -297,13 +324,18 @@ class TestGenerationGating:
         assert smu.core_map_error is None
         assert smu.get_co_offset(0) is None
 
-    def test_dense_l3_group_falls_back_to_legacy(self):
+    def test_oversized_l3_group_blocks_reads_and_writes(self):
         smu = RyzenSMU(ZEN5, MagicMock())
         silicon = _FakeSilicon(smu, ZEN5, {0: set(range(8))})
-        smu.set_topology(_topo({c: 0 for c in range(12)}))
+        smu.set_topology(_topo({c: 0 for c in range(16)}))
         assert silicon.fuse_reads == []
         assert smu.core_map is None
-        assert smu.core_map_error is None
+        assert "16 cores" in smu.core_map_error
+        assert "eight-slot" in smu.core_map_error
+        assert smu.get_co_offset(8) is None
+        assert smu.set_co_offset(8, -10) is False
+        assert silicon.get_calls == []
+        assert silicon.writes == []
 
     def test_the_verified_generation_set_is_deliberate(self):
         mapped = {g for g, c in COMMAND_SETS.items() if c.uniform_8core_ccds}
@@ -392,27 +424,31 @@ class TestTunerRefusesUnmappedSMU:
 
     def test_start_refuses_with_the_map_error(self):
         smu, _silicon = _mapped_smu(VERMEER, {c: 0 for c in range(6)}, {0: set(range(8))})
+        reason = smu.core_map_error
+        assert reason is not None
         engine, db = self._engine(smu)
         messages: list[str] = []
         engine.log_message.connect(messages.append)
         engine.start()
         db.close()
-        assert engine._session_id is None
-        assert any("Cannot start" in m and "disagrees with the OS" in m for m in messages)
+        assert engine.status != "running"
+        assert any(reason in message for message in messages)
 
     def test_resume_refuses_with_the_map_error(self):
         smu, _silicon = _mapped_smu(VERMEER, {c: 0 for c in range(6)}, {0: set(range(8))})
+        reason = smu.core_map_error
+        assert reason is not None
         engine, db = self._engine(smu)
-        from corecycler.tuner import persistence as tp
         from corecycler.tuner.config import TunerConfig
 
-        session_id = tp.create_session(db, TunerConfig(), "bios-1.0", "Test", None)
+        config = TunerConfig(cores_to_test=[0, 1], inherit_current=False, max_offset=-30)
+        session_id = db.create_tuner_session(config.to_json(), "bios-1.0", "Test")
         messages: list[str] = []
         engine.log_message.connect(messages.append)
         engine.resume(session_id)
         db.close()
-        assert engine._status != "running"
-        assert any("Cannot resume" in m for m in messages)
+        assert engine.status != "running"
+        assert any(reason in message for message in messages)
 
 
 class TestNoL3Grouping:
@@ -421,6 +457,7 @@ class TestNoL3Grouping:
         silicon = _FakeSilicon(smu, VERMEER, {0: REPORTED_5600X_LIVE_SLOTS})
         topo = MagicMock()
         topo.cores = {c: MagicMock(ccd=None) for c in range(6)}
+        topo.cpus_all_online = True
         smu.set_topology(topo)
         assert smu.core_map_error is None
         assert smu.core_map == {0: (0, 0), 1: (0, 1), 2: (0, 4), 3: (0, 5), 4: (0, 6), 5: (0, 7)}
@@ -449,8 +486,10 @@ class TestCliRefusal:
             lambda self: (False, _SMN_DENIED),
         )
         topo = CPUTopology(model_name="AMD Ryzen 5 5600X 6-Core Processor", family=25, model=0x21)
+        topo.cpus_all_online = True
+        topo.ccd_layout_known = True
         for cid in range(6):
-            topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, ccx=None, logical_cpus=(cid,))
+            topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, logical_cpus=(cid,))
         assert cli._build_smu(topo) is None
         assert "per-core CO disabled" in capsys.readouterr().err
 
@@ -466,6 +505,7 @@ class TestTunerEndToEndOnRenumbered:
         topo = MagicMock()
         topo.cores = {c: MagicMock(ccd=0, logical_cpus=(c,)) for c in range(6)}
         topo.model_name = "AMD Ryzen 5 5600X 6-Core Processor"
+        topo.ccds = 1
         db = HistoryDB(":memory:")
         backend = MagicMock()
         backend.name = "mprime"
@@ -483,9 +523,9 @@ class TestTunerEndToEndOnRenumbered:
         assert engine._session_id is not None
         assert (0, 4) in silicon.get_calls
         assert (0, 5) in silicon.get_calls
-        assert engine._apply_co(2, -5) is True
+        assert engine._write_co_verified(2, -5) is True
         assert silicon.writes[-1] == (0, 4, -5)
-        assert engine._apply_co(3, -5) is True
+        assert engine._write_co_verified(3, -5) is True
         assert silicon.writes[-1] == (0, 5, -5)
         engine.abort()
         db.close()
@@ -501,6 +541,26 @@ class TestOfflineCpusDisableGapProof:
         smu.set_topology(topo)
         assert smu.core_map_error is not None
         assert "offline" in smu.core_map_error
+        assert silicon.writes == []
+
+    def test_unproven_online_state_refuses_core_writes(self):
+        smu = RyzenSMU(ZEN5, MagicMock())
+        silicon = _FakeSilicon(smu, ZEN5, {0: set(range(8))})
+        topo = _topo({c: 0 for c in range(8)})
+        topo.cpus_all_online = None
+        smu.set_topology(topo)
+        assert "unproven" in smu.core_map_error
+        assert smu.set_co_offset(0, -10) is False
+        assert silicon.writes == []
+
+    def test_unproven_ccd_layout_refuses_core_writes(self):
+        smu = RyzenSMU(ZEN5, MagicMock())
+        silicon = _FakeSilicon(smu, ZEN5, {0: set(range(8))})
+        topo = _topo({c: 0 for c in range(8)})
+        topo.ccd_layout_known = False
+        smu.set_topology(topo)
+        assert "CCD layout is unproven" in smu.core_map_error
+        assert smu.set_co_offset(0, -10) is False
         assert silicon.writes == []
 
     def test_offline_whole_ccd_cannot_be_relabelled_as_ccd_zero(self):
@@ -553,6 +613,8 @@ class TestValidateProfileRefusesUnmappedSMU:
         from corecycler.tuner.engine import TunerEngine
 
         smu, _silicon = _mapped_smu(VERMEER, {c: 0 for c in range(6)}, {0: set(range(8))})
+        reason = smu.core_map_error
+        assert reason is not None
         topo = MagicMock()
         topo.cores = {c: MagicMock(ccd=0, logical_cpus=(c,)) for c in range(4)}
         topo.model_name = "Test"
@@ -568,5 +630,5 @@ class TestValidateProfileRefusesUnmappedSMU:
         engine.log_message.connect(messages.append)
         engine.validate_profile(1)
         db.close()
-        assert engine._status != "running"
-        assert any("Cannot validate" in m for m in messages)
+        assert engine.status != "running"
+        assert any(reason in message for message in messages)

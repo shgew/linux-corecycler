@@ -21,6 +21,7 @@ class FakeLibc:
 
     def __init__(self, *, effective: int = 0, prctl_rc: int = 0, capget_rc: int = 0, capset_rc: int = 0) -> None:
         self.effective = effective
+        self.inheritable = effective
         self.prctl_rc = prctl_rc
         self.capget_rc = capget_rc
         self.capset_rc = capset_rc
@@ -35,26 +36,33 @@ class FakeLibc:
         if self.capget_rc == 0:
             data[0].effective = self.effective
             data[0].permitted = self.effective
-            data[0].inheritable = self.effective
+            data[0].inheritable = self.inheritable
         return self.capget_rc
 
     def capset(self, _header, data) -> int:
         self.capset_calls.append([(w.effective, w.permitted, w.inheritable) for w in data])
+        if self.capset_rc == 0:
+            self.effective = data[0].effective
+            self.inheritable = data[0].inheritable
         return self.capset_rc
 
 
-def _confine_with(libc: FakeLibc) -> bool:
-    with patch.object(capabilities, "_libc", return_value=libc):
+def _confine_with(libc: FakeLibc) -> capabilities.ConfinementResult:
+    with (
+        patch.object(capabilities, "_libc", return_value=libc),
+        patch.object(capabilities, "_status_result", return_value=None),
+    ):
         return capabilities.confine()
 
 
 class TestConfine:
-    def test_reports_the_capability_the_launcher_handed_over(self):
-        libc = FakeLibc(effective=_RAWIO_BIT)
-        assert _confine_with(libc) is True
+    def test_reports_safe_confinement_with_the_launcher_capability(self):
+        result = _confine_with(FakeLibc(effective=_RAWIO_BIT))
+        assert result == capabilities.ConfinementResult(safe=True, has_rawio=True)
 
-    def test_reports_nothing_when_launched_without_the_capability(self):
-        assert _confine_with(FakeLibc()) is False
+    def test_reports_safe_confinement_without_the_capability(self):
+        result = _confine_with(FakeLibc())
+        assert result == capabilities.ConfinementResult(safe=True, has_rawio=False)
 
     def test_empties_the_ambient_set_so_no_payload_inherits_raw_io(self):
         libc = FakeLibc(effective=_RAWIO_BIT)
@@ -69,31 +77,93 @@ class TestConfine:
     def test_unclearable_ambient_set_gives_the_capability_up_entirely(self, caplog):
         libc = FakeLibc(effective=_RAWIO_BIT, prctl_rc=-1)
         with caplog.at_level(logging.ERROR):
-            assert _confine_with(libc) is False
+            result = _confine_with(libc)
+        assert result == capabilities.ConfinementResult(safe=True, has_rawio=False)
         assert libc.capset_calls == [[(0, 0, 0), (0, 0, 0)]]
         assert "dropping every capability" in caplog.text
 
     def test_reports_the_leak_when_neither_clearing_nor_dropping_works(self, caplog):
         libc = FakeLibc(effective=_RAWIO_BIT, prctl_rc=-1, capset_rc=-1)
         with caplog.at_level(logging.ERROR):
-            assert _confine_with(libc) is False
+            result = _confine_with(libc)
+        assert result == capabilities.ConfinementResult(safe=False, has_rawio=True)
         assert "may inherit CAP_SYS_RAWIO" in caplog.text
 
-    def test_unreadable_capabilities_report_none_after_the_ambient_set_is_cleared(self):
+    def test_unreadable_capabilities_are_unsafe_when_proc_is_unavailable(self):
         libc = FakeLibc(effective=_RAWIO_BIT, capget_rc=-1)
-        assert _confine_with(libc) is False
-        assert libc.prctl_calls  # inheritance was severed before giving up
+        assert _confine_with(libc).safe is False
+        assert libc.prctl_calls
         assert libc.capset_calls == []
 
-    def test_a_refused_inheritable_clear_does_not_hide_the_capability(self, caplog):
+    def test_a_refused_inheritable_clear_is_unsafe(self, caplog):
         libc = FakeLibc(effective=_RAWIO_BIT, capset_rc=-1)
         with caplog.at_level(logging.WARNING):
-            assert _confine_with(libc) is True
+            result = _confine_with(libc)
+        assert result == capabilities.ConfinementResult(safe=False, has_rawio=True)
         assert "inheritable capability set" in caplog.text
 
-    def test_a_libc_without_the_syscalls_confines_nothing(self):
-        with patch.object(capabilities, "_libc", return_value=None):
-            assert capabilities.confine() is False
+    def test_a_libc_without_syscalls_uses_proc_status(self):
+        fallback = capabilities.ConfinementResult(safe=True, has_rawio=False)
+        with (
+            patch.object(capabilities, "_libc", return_value=None),
+            patch.object(capabilities, "_status_result", return_value=fallback),
+        ):
+            assert capabilities.confine() == fallback
+
+    def test_unverifiable_inheritable_clear_is_unsafe(self, caplog):
+        libc = FakeLibc(effective=_RAWIO_BIT)
+
+        def ignore_clear(_header, data):
+            libc.capset_calls.append([(word.effective, word.permitted, word.inheritable) for word in data])
+            return 0
+
+        libc.capset = ignore_clear
+        with caplog.at_level(logging.ERROR):
+            result = _confine_with(libc)
+
+        assert result == capabilities.ConfinementResult(safe=False, has_rawio=True)
+        assert "could not verify an empty inheritable set" in caplog.text
+
+    def test_proc_status_can_verify_an_inheritable_clear(self):
+        libc = FakeLibc(effective=_RAWIO_BIT)
+
+        def ignore_clear(_header, data):
+            libc.capset_calls.append([(word.effective, word.permitted, word.inheritable) for word in data])
+            return 0
+
+        libc.capset = ignore_clear
+        fallback = capabilities.ConfinementResult(safe=True, has_rawio=True)
+        with (
+            patch.object(capabilities, "_libc", return_value=libc),
+            patch.object(capabilities, "_status_result", return_value=fallback),
+        ):
+            result = capabilities.confine()
+
+        assert result == capabilities.ConfinementResult(safe=True, has_rawio=True)
+
+
+class TestStatusResult:
+    def test_reports_capability_bits_from_proc_status(self, tmp_path):
+        status = tmp_path / "status"
+        status.write_text(f"Name:\tpython\nCapInh:\t0\nCapEff:\t{_RAWIO_BIT:x}\nCapAmb:\t0\n")
+
+        assert capabilities._status_result(status) == capabilities.ConfinementResult(safe=True, has_rawio=True)
+
+    def test_reports_inheritable_or_ambient_capabilities_as_unsafe(self, tmp_path):
+        status = tmp_path / "status"
+        status.write_text("CapInh:\t1\nCapEff:\t0\nCapAmb:\t2\n")
+
+        assert capabilities._status_result(status) == capabilities.ConfinementResult(safe=False, has_rawio=False)
+
+    def test_unreadable_malformed_or_incomplete_status_is_unavailable(self, tmp_path):
+        malformed = tmp_path / "malformed"
+        malformed.write_text("CapInh:\tnot-hex\nCapEff:\t0\nCapAmb:\t0\n")
+        incomplete = tmp_path / "incomplete"
+        incomplete.write_text("CapInh:\t0\nCapEff:\t0\n")
+
+        assert capabilities._status_result(tmp_path / "missing") is None
+        assert capabilities._status_result(malformed) is None
+        assert capabilities._status_result(incomplete) is None
 
 
 class TestLibc:

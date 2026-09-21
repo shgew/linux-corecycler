@@ -1,4 +1,4 @@
-# Tuner core state machine — transition specification
+# Tuner core state machine - transition specification
 
 This document is the normative transition contract for one tuner core.
 `tests/test_state_transition_spec.py` executes the real `_advance_core`,
@@ -37,9 +37,9 @@ instead of stepping past it, and its `baseline_offset` stays at the configured
 A state-machine PASS means that the current offset passed **every regime**
 required for that slot, not merely one workload:
 
-1. `_slot_regimes` uses the configured `coarse_regimes` during
-   `COARSE_SEARCH`. From `FINE_SEARCH` onward it uses every regime represented
-   in the configured battery. Regimes absent from the battery are omitted.
+1. `_slot_regimes` uses the validated `coarse_regimes` subset during
+   `COARSE_SEARCH`. From `FINE_SEARCH` onward the configured battery must cover
+   all four regimes: boost, current, transient, and coupled.
 2. Within that set, regimes are ordered by observed failure yield, subject to
    the configured floor that prevents a regime with no failures from being
    starved.
@@ -114,13 +114,17 @@ stock floor.
   rejects corrupt states at the database boundary.
 - A completed verdict is processed before the per-core time budget can pause
   an unfinished search.
+- Every non-confirmed outcome is persisted before any signal is emitted or the
+  next action begins. Stock restoration must be read back; any core that cannot
+  be verified at CO=0 transitions the session to `profile_quarantined`.
 
 ## Verdicts that do not enter this relation
 
 - `thermal`: cool down and retry the same slot; heat is not an offset verdict.
-- `startup`, `stall`, `killed`, or another apparatus fault: no stability
-  verdict is manufactured. Restore the applicable baseline and retry or pause
-  according to the instrument-failure breaker.
+- `startup`, `stall`, `killed`, an unknown worker outcome, or another
+  apparatus fault: no stability verdict is manufactured. Restore the
+  applicable baseline and retry or pause according to the instrument-failure
+  breaker.
 - A worker result containing an unattributed machine check does not advance a
   loaded core merely because it was loaded; it enters crash attribution.
 
@@ -137,14 +141,21 @@ penalty. Attribution uses this strict priority:
    that core at its journaled resident offset. Evidence naming an unknown or
    stock core is an instrument/evidence inconsistency, never permission to
    blame a different core.
-3. **A persisted hunt slot** (`hunting_core`) attributes the crash to that slot.
-4. **The only core away from stock** is attributable when exactly one
+3. **The only core away from stock** is attributable when exactly one
    journaled resident offset is non-zero.
-5. **Otherwise start or resume the attribution hunt.** It runs repeated stock
-   control probes with every core at CO=0, group-bisects the live-offset mask,
-   performs leave-one-out confirmation, and uses the persisted suspicion model
-   as the statistical fallback when deterministic isolation does not identify
-   one core.
+4. **Otherwise start or resume the attribution hunt.** An aggregate validation
+   failure with no per-core verdict starts a hunt using the exact failed
+   workload; it never guesses the most-aggressive core. `CONTROL` applies
+   stock CO=0 to every physical core. `PROBE` applies the persisted in-flight
+   group from `HuntState`. `CONFIRM` replays the persisted original live
+   candidate universe with the suspect removed and confirms that suspect only
+   when the failure disappears. Confirmed culprits do not terminate a hunt
+   while known guilty pending sets remain.
+
+The persisted hunt workload records the concrete worker kind (`solo`,
+`parallel`, `rapid_transition`, or `soak`), duration, backend, stress mode,
+FFT preset, threads, profile, and test list. Resume therefore replays the same
+experiment instead of reconstructing or substituting a workload.
 
 A stability ambiguity never pauses the crash-attribution engine and never
 causes a guessed penalty: it becomes another hunt probe. This path pauses only

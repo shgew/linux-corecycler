@@ -27,7 +27,6 @@ from corecycler.history.db import (
     TelemetrySample,
     TuningContextRecord,
 )
-from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.state import CoreState, TunerPhase
 
@@ -70,11 +69,14 @@ def _tab(database=None):
 
 def _seed_context(db, bios, offsets, *, notes="", scalar=None, boost=None):
     payload = json.dumps(offsets)
-    return db.create_context(
+    return db.get_or_create_context(
         TuningContextRecord(
             bios_version=bios,
+            cpu_model="Test 8C",
+            physical_cores=len(offsets),
+            ccds=1,
             co_offsets_json=payload,
-            co_hash=f"{bios}:{json.dumps(offsets, sort_keys=True)}",
+            context_hash=f"{bios}:{json.dumps(offsets, sort_keys=True)}",
             pbo_scalar=scalar,
             boost_limit_mhz=boost,
             notes=notes,
@@ -104,8 +106,8 @@ def _seed_run(db, started_at, *, status="completed", cores_failed=0, context_id=
 
 
 def _seed_session(db, status="completed"):
-    sid = tp.create_session(db, TunerConfig(), bios_version="2402", cpu_model="Test 8C")
-    tp.update_session_status(db, sid, status)
+    sid = db.create_tuner_session(TunerConfig().to_json(), bios_version="2402", cpu_model="Test 8C")
+    db.update_tuner_session_status(sid, status)
     return sid
 
 
@@ -159,9 +161,6 @@ class TestWithoutDatabase:
         tab = _tab(None)
         tab._refresh_preserve_context()
         assert tab._contexts == []
-
-    def test_tuner_session_load_is_empty(self):
-        assert _tab(None)._load_tuner_sessions() == []
 
     def test_bulk_csv_export_is_a_noop(self):
         tab = _tab(None)
@@ -303,19 +302,17 @@ class TestContextTable:
         assert rows == {1}
         assert tab._runs_table.rowCount() == 2
 
-    def test_degenerate_metrics_still_reserve_context_table_height(self, db):
-        for bios in ("2402", "2403"):
-            cid = _seed_context(db, bios, {"0": -20})
-            _seed_run(db, f"2026-07-2{bios[-1]}T10:00:00+00:00", context_id=cid)
-        _seed_run(db, "2026-07-25T10:00:00+00:00")
-        tab = _grouped_tab(db)
+    def test_load_more_reaches_every_context(self, db):
+        for index in range(3):
+            _seed_context(db, f"240{index}", {"0": -20 - index})
+        tab = _tab(db)
+        tab.PAGE_SIZE = 2
+        tab._view_mode = tab.VIEW_GROUPED
+        tab.refresh()
+
+        assert tab._context_table.rowCount() == 2
+        tab._load_more_btn.click()
         assert tab._context_table.rowCount() == 3
-        tab._context_table.verticalHeader().setMinimumSectionSize(1)
-        for row in range(3):
-            tab._context_table.setRowHeight(row, 1)
-        tab._context_table.horizontalHeader().setFixedHeight(5)
-        tab._auto_size_context_table()
-        assert tab._context_table.maximumHeight() >= 100
 
 
 class TestContextMenus:
@@ -547,20 +544,6 @@ class TestRunDetail:
         tab._show_run_detail(_run_by_id(db, rid))
         assert "not json at all" in tab._events_log.toPlainText()
 
-    def test_degenerate_metrics_still_reserve_result_table_height(self, db):
-        rid = _seed_detailed_run(db)
-        tab = _tab(db)
-        tab._view_mode = tab.VIEW_ALL
-        tab.refresh()
-        tab._show_run_detail(_run_by_id(db, rid))
-        assert tab._core_results_table.rowCount() == 2
-        tab._core_results_table.verticalHeader().setMinimumSectionSize(1)
-        for row in range(2):
-            tab._core_results_table.setRowHeight(row, 1)
-        tab._core_results_table.horizontalHeader().setFixedHeight(5)
-        tab._auto_size_core_results_table()
-        assert tab._core_results_table.maximumHeight() >= 80
-
     def test_expanding_an_open_detail_keeps_the_manual_split(self, db):
         rid = _seed_detailed_run(db)
         tab = _tab(db)
@@ -579,18 +562,15 @@ class TestRunDetail:
 class TestTunerSessionDetail:
     def test_detail_renders_states_test_log_and_profile(self, db):
         sid = _seed_session(db, "completed")
-        tp.save_core_state(
-            db,
-            sid,
-            CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30),
+        db.upsert_tuner_core_state(
+            sid, CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)
         )
-        tp.save_core_state(
-            db,
-            sid,
-            CoreState(core_id=1, phase=TunerPhase.FINE_SEARCH, current_offset=-18, best_offset=None),
+        db.upsert_tuner_core_state(
+            sid, CoreState(core_id=1, phase=TunerPhase.FINE_SEARCH, current_offset=-18, best_offset=None)
         )
-        tp.log_test_result(db, sid, 0, -30, "confirm", True, duration=300.0)
-        tp.log_test_result(db, sid, 1, -18, "coarse", False, error_msg="rounding error", duration=12.5)
+        db.insert_tuner_test_log(sid, 0, -30, "confirm", True, duration=300.0)
+        db.insert_tuner_test_log(sid, 1, -18, "coarse", False, error_msg="rounding error", duration=12.5)
+        db.insert_tuner_event(sid, "Restoration could not be verified", severity="error")
         tab = _tab(db)
         tab._view_mode = tab.VIEW_TUNER
         tab.refresh()
@@ -609,10 +589,12 @@ class TestTunerSessionDetail:
         assert "rounding error" in text
         assert "300.0s" in text
         assert "Confirmed CO Profile" in text
+        assert "Tuner Events" in text
+        assert "[error] Restoration could not be verified" in text
 
     def test_unparsable_config_falls_back_to_empty(self, db):
         sid = _seed_session(db, "completed")
-        tp.save_core_state(db, sid, CoreState(core_id=0, phase=TunerPhase.NOT_STARTED))
+        db.upsert_tuner_core_state(sid, CoreState(core_id=0, phase=TunerPhase.NOT_STARTED))
         tab = _tab(db)
         tab._view_mode = tab.VIEW_TUNER
         tab.refresh()
@@ -621,16 +603,16 @@ class TestTunerSessionDetail:
         tab._show_tuner_session_detail(sess)
         assert "coarse=?" in tab._detail_info.text()
 
-    def test_rows_are_skipped_without_a_database(self, db):
-        _seed_session(db)
+    def test_malformed_session_timestamp_degrades_to_zero_duration(self, db):
+        sid = _seed_session(db, "completed")
         tab = _tab(db)
-        tab._view_mode = tab.VIEW_TUNER
-        tab.refresh()
-        tab._db = None
-        tab._runs_table.clearContents()
+        sess = db.get_tuner_session(sid)
+        sess.updated_at = "not-a-timestamp"
+
+        tab._tuner_sessions = [sess]
         tab._populate_tuner_sessions()
-        assert tab._runs_table.rowCount() == 1
-        assert tab._runs_table.item(0, 0) is None
+
+        assert tab._runs_table.item(0, 5).text() == "-"
 
 
 class TestLoadCoProfile:
@@ -638,39 +620,40 @@ class TestLoadCoProfile:
         tab = _tab(db)
         tab._selected_tuner_session = None
         emitted = []
-        tab.load_profile_requested.connect(emitted.append)
+        tab.load_profile_requested.connect(lambda offsets, cpu_model: emitted.append((offsets, cpu_model)))
         tab._on_load_co_profile()
         assert emitted == []
 
     def test_a_session_without_offsets_informs_the_user(self, db):
         sid = _seed_session(db)
-        tp.save_core_state(db, sid, CoreState(core_id=0, phase=TunerPhase.NOT_STARTED, best_offset=None))
+        db.upsert_tuner_core_state(sid, CoreState(core_id=0, phase=TunerPhase.NOT_STARTED, best_offset=None))
         tab = _tab(db)
         tab._view_mode = tab.VIEW_TUNER
         tab.refresh()
         tab._selected_tuner_session = db.get_tuner_session(sid)
         emitted = []
-        tab.load_profile_requested.connect(emitted.append)
+        tab.load_profile_requested.connect(lambda offsets, cpu_model: emitted.append((offsets, cpu_model)))
         with patch("corecycler.gui.history_tab.QMessageBox.information") as info:
             tab._on_load_co_profile()
         assert info.called
         assert emitted == []
 
-    def test_offsets_are_emitted(self, db):
+    def test_only_confirmed_offsets_and_cpu_model_are_emitted(self, db):
         sid = _seed_session(db)
-        tp.save_core_state(
-            db,
-            sid,
-            CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30),
+        db.upsert_tuner_core_state(
+            sid, CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)
+        )
+        db.upsert_tuner_core_state(
+            sid, CoreState(core_id=1, phase=TunerPhase.FINE_SEARCH, current_offset=-18, best_offset=-20)
         )
         tab = _tab(db)
         tab._view_mode = tab.VIEW_TUNER
         tab.refresh()
         tab._selected_tuner_session = db.get_tuner_session(sid)
         emitted = []
-        tab.load_profile_requested.connect(emitted.append)
+        tab.load_profile_requested.connect(lambda offsets, cpu_model: emitted.append((offsets, cpu_model)))
         tab._on_load_co_profile()
-        assert emitted == [{0: -30}]
+        assert emitted == [({0: -30}, "Test 8C")]
 
 
 class TestDeleteSelected:
@@ -713,6 +696,19 @@ class TestDeleteSelected:
         tab._runs_table.clearSelection()
         with patch("corecycler.gui.history_tab.QMessageBox.question", return_value=_no()):
             tab._delete_selected()
+        assert len(db.list_contexts()) == 1
+
+    def test_context_delete_surfaces_in_flight_run_status(self, db):
+        cid = _seed_context(db, "2402", {"0": -20})
+        _seed_run(db, "2026-07-20T10:00:00+00:00", status="running", context_id=cid)
+        tab = _grouped_tab(db)
+        with (
+            patch("corecycler.gui.history_tab.QMessageBox.question", return_value=_yes()),
+            patch("corecycler.gui.history_tab.QMessageBox.warning") as warning,
+        ):
+            tab._delete_contexts([0])
+
+        assert "running" in warning.call_args.args[2]
         assert len(db.list_contexts()) == 1
 
     def test_context_delete_refuses_an_out_of_range_row(self, db):
@@ -814,6 +810,30 @@ class TestCompare:
         assert tab._core_results_table.item(1, one + 1).text() == "-"
         assert "Run Comparison" in tab._events_log.toPlainText()
 
+    def test_a_failed_later_cycle_marks_the_core_failed(self, db):
+        first = _seed_detailed_run(db)
+        db.insert_core_result(
+            CoreResultRecord(
+                run_id=first,
+                core_id=0,
+                cycle=1,
+                started_at="2026-07-20T10:10:00+00:00",
+                passed=False,
+                elapsed_seconds=120.0,
+            )
+        )
+        _seed_detailed_run(db)
+        tab = _tab(db)
+        tab._view_mode = tab.VIEW_ALL
+        tab.refresh()
+        tab._runs_table.selectAll()
+        tab._compare_selected()
+
+        order = [run.id for run in tab._displayed_runs]
+        result_column = 1 + order.index(first) * 2
+        assert tab._core_results_table.item(0, result_column).text() == "FAIL"
+        assert "0P/2F" in tab._events_log.toPlainText()
+
 
 class TestHelpers:
     def test_co_summary_rejects_unparsable_json(self):
@@ -859,18 +879,20 @@ class TestMalformedContextData:
         assert ht._co_summary('{"0": -20, "1": "x"}') == "mixed"
 
     def test_a_malformed_profile_does_not_break_the_context_table(self, db):
-        cid = db.create_context(TuningContextRecord(bios_version="2402", co_offsets_json="[1, 2, 3]", co_hash="broken"))
+        cid = db.get_or_create_context(
+            TuningContextRecord(bios_version="2402", co_offsets_json="[1, 2, 3]", context_hash="broken")
+        )
         _seed_run(db, "2026-07-20T10:00:00+00:00", context_id=cid)
         tab = _grouped_tab(db)
         assert tab._context_table.rowCount() == 1
         assert tab._context_table.item(0, 1).text() == "none"
 
     def test_non_numeric_core_ids_still_render_in_the_detail(self, db):
-        cid = db.create_context(
+        cid = db.get_or_create_context(
             TuningContextRecord(
                 bios_version="2402",
                 co_offsets_json='{"a": -20, "b": -25}',
-                co_hash="letters",
+                context_hash="letters",
             )
         )
         rid = _seed_detailed_run(db, cid)

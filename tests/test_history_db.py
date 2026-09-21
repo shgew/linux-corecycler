@@ -1,4 +1,4 @@
-"""Tests for history.db — HistoryDB with in-memory SQLite."""
+"""Tests for history.db - HistoryDB with in-memory SQLite."""
 
 from __future__ import annotations
 
@@ -101,7 +101,7 @@ class TestRuns:
         assert len(page) == 2
 
     def test_delete_run_cascades(self, db):
-        run_id = db.create_run(RunRecord(cpu_model="test"))
+        run_id = db.create_run(RunRecord(cpu_model="test", status="completed"))
         db.insert_core_result(CoreResultRecord(run_id=run_id, core_id=0))
         db.insert_event(EventRecord(run_id=run_id, event_type="test", message="hi"))
         db.insert_telemetry_batch([TelemetrySample(run_id=run_id, core_id=0, freq_mhz=5000)])
@@ -318,9 +318,10 @@ class TestTunerSessionMethods:
         assert len(sessions) == 3
 
     def test_delete_context_cascade(self, db):
-        ctx_id = db.create_context(TuningContextRecord(bios_version="v1"))
-        db.create_run(RunRecord(cpu_model="test", context_id=ctx_id))
+        ctx_id = db.get_or_create_context(TuningContextRecord(bios_version="v1"))
+        db.create_run(RunRecord(cpu_model="test", context_id=ctx_id, status="completed"))
         sid = db.create_tuner_session("{}", "v1", "test", context_id=ctx_id)
+        db.update_tuner_session_status(sid, "completed")
 
         db.delete_context_cascade(ctx_id)
 
@@ -330,8 +331,8 @@ class TestTunerSessionMethods:
         assert db.get_context(ctx_id) is None
 
     def test_regime_evidence_isolated_by_complete_context(self, db):
-        ctx_a = db.create_context(TuningContextRecord(bios_version="A", co_hash="same"))
-        ctx_b = db.create_context(TuningContextRecord(bios_version="B", co_hash="same"))
+        ctx_a = db.get_or_create_context(TuningContextRecord(bios_version="A", context_hash="same"))
+        ctx_b = db.get_or_create_context(TuningContextRecord(bios_version="B", context_hash="same"))
         db.bank_regime_time(ctx_a, 3, "boost", -25, 1800.0)
         db.bank_regime_time(ctx_a, 3, "boost", -25, 900.0)
         db.bank_regime_time(ctx_b, 3, "boost", -25, 120.0)
@@ -392,18 +393,18 @@ class TestTuningContexts:
         ctx = TuningContextRecord(
             bios_version="2101",
             co_offsets_json='{"0":-30,"1":-20}',
-            co_hash="abc123",
+            context_hash="abc123",
             pbo_scalar=1.0,
             boost_limit_mhz=5700,
         )
-        ctx_id = db.create_context(ctx)
+        ctx_id = db.get_or_create_context(ctx)
         assert ctx_id > 0
         assert ctx.id == ctx_id
 
         fetched = db.get_context(ctx_id)
         assert fetched is not None
         assert fetched.bios_version == "2101"
-        assert fetched.co_hash == "abc123"
+        assert fetched.context_hash == "abc123"
         assert fetched.pbo_scalar == 1.0
         assert fetched.boost_limit_mhz == 5700
         assert fetched.created_at != ""
@@ -412,20 +413,20 @@ class TestTuningContexts:
         assert db.get_context(9999) is None
 
     def test_get_by_hash(self, db):
-        db.create_context(TuningContextRecord(bios_version="2101", co_hash="hash1"))
-        db.create_context(TuningContextRecord(bios_version="2201", co_hash="hash2"))
+        db.get_or_create_context(TuningContextRecord(bios_version="2101", context_hash="hash1"))
+        db.get_or_create_context(TuningContextRecord(bios_version="2201", context_hash="hash2"))
 
         found = db.get_context_by_hash("hash1", "2101")
         assert found is not None
-        assert found.co_hash == "hash1"
+        assert found.context_hash == "hash1"
 
         assert db.get_context_by_hash("hash1", "2201") is None
         assert db.get_context_by_hash("missing", "2101") is None
 
     def test_list_contexts_ordering(self, db):
-        db.create_context(TuningContextRecord(bios_version="first"))
-        db.create_context(TuningContextRecord(bios_version="second"))
-        db.create_context(TuningContextRecord(bios_version="third"))
+        db.get_or_create_context(TuningContextRecord(bios_version="first"))
+        db.get_or_create_context(TuningContextRecord(bios_version="second"))
+        db.get_or_create_context(TuningContextRecord(bios_version="third"))
 
         contexts = db.list_contexts()
         assert len(contexts) == 3
@@ -433,14 +434,14 @@ class TestTuningContexts:
         assert contexts[2].bios_version == "first"
 
     def test_update_notes(self, db):
-        ctx_id = db.create_context(TuningContextRecord(bios_version="2101"))
+        ctx_id = db.get_or_create_context(TuningContextRecord(bios_version="2101"))
         db.update_context_notes(ctx_id, "trying aggressive CO")
 
         fetched = db.get_context(ctx_id)
         assert fetched.notes == "trying aggressive CO"
 
     def test_run_with_context(self, db):
-        ctx_id = db.create_context(TuningContextRecord(bios_version="2101"))
+        ctx_id = db.get_or_create_context(TuningContextRecord(bios_version="2101"))
         run_id = db.create_run(RunRecord(cpu_model="test", context_id=ctx_id, bios_version="2101"))
 
         fetched = db.get_run(run_id)
@@ -448,8 +449,8 @@ class TestTuningContexts:
         assert fetched.bios_version == "2101"
 
     def test_list_runs_for_context(self, db):
-        ctx1 = db.create_context(TuningContextRecord(bios_version="2101"))
-        ctx2 = db.create_context(TuningContextRecord(bios_version="2201"))
+        ctx1 = db.get_or_create_context(TuningContextRecord(bios_version="2101"))
+        ctx2 = db.get_or_create_context(TuningContextRecord(bios_version="2201"))
 
         db.create_run(RunRecord(cpu_model="a", context_id=ctx1))
         db.create_run(RunRecord(cpu_model="b", context_id=ctx1))
@@ -550,7 +551,7 @@ CREATE TABLE telemetry_samples (
 
 class TestMigrationV1ToV2:
     def test_migration(self):
-        """Create a v1 database, then open with v2 code — migration should run."""
+        """Create a v1 database, then open with v2 code - migration should run."""
         import sqlite3
 
         db_path = ":memory:"
@@ -595,7 +596,7 @@ class TestMigrationV1ToV2:
             assert runs[0].bios_version == ""
 
             # Can create new runs with context
-            ctx_id = db.create_context(TuningContextRecord(bios_version="2101"))
+            ctx_id = db.get_or_create_context(TuningContextRecord(bios_version="2101"))
             run_id = db.create_run(RunRecord(cpu_model="new-cpu", context_id=ctx_id, bios_version="2101"))
             fetched = db.get_run(run_id)
             assert fetched.context_id == ctx_id
@@ -606,22 +607,46 @@ class TestMigrationV1ToV2:
 
 
 class TestFreshEqualsMigrated:
-    """Future-proofing invariant: a database created fresh at the current
-    schema version must be COLUMN-IDENTICAL to a v1 database walked through
-    every migration. If a schema change touches _DDL_FRESH but not a
-    migration (or vice versa), sudo/non-sudo or old/new installs would
-    diverge structurally — this test makes that impossible to ship."""
+    @staticmethod
+    def _schema_map(db) -> dict[str, object]:
+        rows = db._execute_raw(
+            "SELECT type, name, tbl_name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+        ).fetchall()
+        schema = {
+            (row["type"], row["name"], row["tbl_name"]): (
+                "" if row["type"] == "table" else " ".join((row["sql"] or "").split())
+            )
+            for row in rows
+        }
+        tables = [row["name"] for row in rows if row["type"] == "table"]
+        table_details = {}
+        for table in tables:
+            columns = sorted(
+                (row["name"], row["type"].upper(), row["notnull"], row["dflt_value"], row["pk"])
+                for row in db._execute_raw(f"PRAGMA table_info({table})").fetchall()
+            )
+            foreign_keys = sorted(
+                tuple(row)[2:] for row in db._execute_raw(f"PRAGMA foreign_key_list({table})").fetchall()
+            )
+            indexes = {}
+            for row in db._execute_raw(f"PRAGMA index_list({table})").fetchall():
+                indexes[row["name"]] = {
+                    "metadata": (row["unique"], row["origin"], row["partial"]),
+                    "columns": sorted(
+                        item["name"] for item in db._execute_raw(f"PRAGMA index_info({row['name']})").fetchall()
+                    ),
+                }
+            table_details[table] = {"columns": columns, "foreign_keys": foreign_keys, "indexes": indexes}
+        return {"schema": schema, "tables": table_details}
 
     @staticmethod
-    def _schema_map(db) -> dict[str, list[tuple]]:
-        tables = db._execute_raw(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-        ).fetchall()
-        out = {}
-        for t in tables:
-            cols = db._execute_raw(f"PRAGMA table_info({t['name']})").fetchall()
-            out[t["name"]] = sorted((c["name"], c["type"].upper(), c["notnull"]) for c in cols)
-        return out
+    def _index_columns(db, table: str) -> set[tuple[str, ...]]:
+        result = set()
+        for row in db._execute_raw(f"PRAGMA index_list({table})").fetchall():
+            if row["unique"]:
+                columns = db._execute_raw(f"PRAGMA index_info({row['name']})").fetchall()
+                result.add(tuple(column["name"] for column in columns))
+        return result
 
     def test_fresh_schema_equals_v1_plus_migrations(self, tmp_path):
         import sqlite3
@@ -635,6 +660,16 @@ class TestFreshEqualsMigrated:
         fresh = HistoryDB(tmp_path / "fresh.db")
         try:
             assert self._schema_map(fresh) == self._schema_map(migrated)
+            assert ("context_hash", "bios_version") in self._index_columns(fresh, "tuning_contexts")
+            assert ("context_id", "core_id", "regime", "offset_value") in self._index_columns(
+                fresh, "tuner_regime_banks"
+            )
+            run_fks = [tuple(row) for row in fresh._execute_raw("PRAGMA foreign_key_list(runs)").fetchall()]
+            assert any(row[2:7] == ("tuning_contexts", "context_id", "id", "NO ACTION", "NO ACTION") for row in run_fks)
+            bank_fks = [
+                tuple(row) for row in fresh._execute_raw("PRAGMA foreign_key_list(tuner_regime_banks)").fetchall()
+            ]
+            assert any(row[2:7] == ("tuning_contexts", "context_id", "id", "NO ACTION", "CASCADE") for row in bank_fks)
         finally:
             fresh.close()
             migrated.close()
@@ -649,8 +684,8 @@ class TestMergeFrom:
         dst = HistoryDB(tmp_path / "dst.db")
 
         # identical context on both sides -> must deduplicate on merge
-        src_ctx = src.create_context(TuningContextRecord(bios_version="2401", co_hash="h1"))
-        dst_ctx = dst.create_context(TuningContextRecord(bios_version="2401", co_hash="h1"))
+        src_ctx = src.get_or_create_context(TuningContextRecord(bios_version="2401", context_hash="h1"))
+        dst_ctx = dst.get_or_create_context(TuningContextRecord(bios_version="2401", context_hash="h1"))
         # a run with children in the source
         rid = src.create_run(
             RunRecord(
@@ -700,6 +735,7 @@ SELECT 'h1', core_id, regime, offset_value, clean_seconds, updated_at
 FROM tuner_regime_banks_v20;
 DROP TABLE tuner_regime_banks_v20;
 CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_hash, core_id);
+ALTER TABLE tuning_contexts RENAME COLUMN context_hash TO co_hash;
 UPDATE schema_version SET version=19;
 COMMIT;
 """
@@ -738,9 +774,9 @@ COMMIT;
 
         src_path = tmp_path / "src-orphan.db"
         src = HistoryDB(src_path)
-        first = src.create_context(TuningContextRecord(bios_version="A", co_hash="first"))
-        orphan = src.create_context(TuningContextRecord(bios_version="B", co_hash="orphan"))
-        last = src.create_context(TuningContextRecord(bios_version="C", co_hash="last"))
+        first = src.get_or_create_context(TuningContextRecord(bios_version="A", context_hash="first"))
+        orphan = src.get_or_create_context(TuningContextRecord(bios_version="B", context_hash="orphan"))
+        last = src.get_or_create_context(TuningContextRecord(bios_version="C", context_hash="last"))
         src.bank_regime_time(first, 0, "boost", -20, 10.0)
         src.bank_regime_time(last, 2, "boost", -30, 30.0)
         src._execute_raw("DELETE FROM tuning_contexts WHERE id=?", (orphan,))
@@ -757,8 +793,8 @@ COMMIT;
         conn.close()
 
         dst = HistoryDB(tmp_path / "dst-orphan.db")
-        dst_first = dst.create_context(TuningContextRecord(bios_version="A", co_hash="first"))
-        dst_last = dst.create_context(TuningContextRecord(bios_version="C", co_hash="last"))
+        dst_first = dst.get_or_create_context(TuningContextRecord(bios_version="A", context_hash="first"))
+        dst_last = dst.get_or_create_context(TuningContextRecord(bios_version="C", context_hash="last"))
         try:
             dst.merge_from(src_path)
 
@@ -812,8 +848,8 @@ class TestMigrationCrashSafety:
 
         path = tmp_path / "history.db"
         db = HistoryDB(path)
-        ctx_a = db.create_context(TuningContextRecord(bios_version="A", co_hash="same"))
-        ctx_b = db.create_context(TuningContextRecord(bios_version="B", co_hash="same"))
+        ctx_a = db.get_or_create_context(TuningContextRecord(bios_version="A", context_hash="same"))
+        ctx_b = db.get_or_create_context(TuningContextRecord(bios_version="B", context_hash="same"))
         db.close()
 
         conn = sqlite3.connect(path, isolation_level=None)
@@ -833,6 +869,7 @@ CREATE TABLE tuner_regime_banks (
 INSERT INTO tuner_regime_banks VALUES ('same', 0, 'boost', -20, 3600.0, 'now');
 DROP TABLE tuner_regime_banks_v20;
 CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_hash, core_id);
+ALTER TABLE tuning_contexts RENAME COLUMN context_hash TO co_hash;
 UPDATE schema_version SET version=19;
 COMMIT;
 """
@@ -980,12 +1017,12 @@ class TestRecoverableSessions:
         return sid
 
     def test_in_flight_sessions_are_resumable_and_recoverable(self, db):
-        ids = [self._session(db, s) for s in ("running", "paused", "validating")]
+        ids = [self._session(db, s) for s in ("running", "paused", "validating", "hunting")]
         assert sorted(s.id for s in db.list_resumable_tuner_sessions()) == sorted(ids)
         assert sorted(s.id for s in db.list_recoverable_tuner_sessions()) == sorted(ids)
 
     def test_a_stopped_session_is_recoverable_but_never_automatic(self, db):
-        ids = [self._session(db, s) for s in ("quarantined", "aborted")]
+        ids = [self._session(db, s) for s in ("profile_quarantined", "aborted")]
         assert db.list_resumable_tuner_sessions() == []
         assert sorted(s.id for s in db.list_recoverable_tuner_sessions()) == sorted(ids)
 
@@ -995,6 +1032,6 @@ class TestRecoverableSessions:
         assert db.list_recoverable_tuner_sessions() == []
 
     def test_newest_first(self, db):
-        first = self._session(db, "quarantined")
+        first = self._session(db, "profile_quarantined")
         second = self._session(db, "running")
         assert [s.id for s in db.list_recoverable_tuner_sessions()] == [second, first]

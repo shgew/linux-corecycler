@@ -6,10 +6,12 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from corecycler.monitor import frequency as freqmod
-from corecycler.monitor.cpu_usage import CPUUsageReader
+from corecycler.monitor.cpu_usage import CPUUsageReader, read_cpu_times
 from corecycler.monitor.hwmon import HWMonReader
 from corecycler.monitor.power import PowerMonitor
 
@@ -19,6 +21,11 @@ class TestCPUUsageReaderEdges:
         reader = CPUUsageReader()
         with patch("pathlib.Path.read_text", side_effect=OSError):
             assert reader.read() == {}
+
+    def test_snapshot_exposes_idle_and_total_ticks(self, tmp_path):
+        proc_stat = tmp_path / "stat"
+        proc_stat.write_text("cpu0 100 2 30 400 5 6 7 8 9 10\n")
+        assert read_cpu_times(proc_stat) == {0: (405, 558)}
 
 
 class TestPowerMonitorEdges:
@@ -53,6 +60,7 @@ class TestPowerMonitorEdges:
     def test_read_rapl_unreadable_returns_none(self, tmp_path):
         mon = PowerMonitor.__new__(PowerMonitor)
         mon._package_path = tmp_path / "gone" / "energy_uj"
+        mon._max_energy_range_uj = None
         mon._last_energy_uj = None
         mon._last_time = None
         assert mon._read_rapl() is None
@@ -62,8 +70,51 @@ class TestPowerMonitorEdges:
         mon._hwmon_power_path = tmp_path / "gone" / "power1_input"
         assert mon._read_hwmon_power() is None
 
+    def test_absent_power_sources_return_none(self):
+        mon = PowerMonitor.__new__(PowerMonitor)
+        mon._package_path = None
+        mon._hwmon_power_path = None
+        assert mon._read_rapl() is None
+        assert mon._read_hwmon_power() is None
+
+    def test_rapl_enumeration_failure_is_contained(self, tmp_path):
+        rapl_base = self._powercap(tmp_path)
+        with (
+            patch("corecycler.monitor.power.RAPL_BASE", rapl_base),
+            patch("corecycler.monitor.power.HWMON_BASE", tmp_path / "missing"),
+            patch.object(Path, "glob", side_effect=OSError("removed")),
+        ):
+            assert PowerMonitor().is_available() is False
+
+    def test_hwmon_enumeration_failure_is_contained(self, tmp_path):
+        hwmon_base = tmp_path / "hwmon"
+        hwmon_base.mkdir()
+        with (
+            patch("corecycler.monitor.power.RAPL_BASE", tmp_path / "missing"),
+            patch("corecycler.monitor.power.HWMON_BASE", hwmon_base),
+            patch.object(Path, "iterdir", side_effect=OSError("removed")),
+        ):
+            assert PowerMonitor().is_available() is False
+
 
 class TestHWMonReaderEdges:
+    def test_device_enumeration_failure_is_contained(self, tmp_path):
+        base = tmp_path / "hwmon"
+        base.mkdir()
+        with (
+            patch("corecycler.monitor.hwmon.HWMON_BASE", base),
+            patch.object(Path, "iterdir", side_effect=OSError("removed")),
+        ):
+            assert HWMonReader().is_available() is False
+
+    def test_sensor_enumeration_failure_is_contained(self, tmp_path):
+        reader = HWMonReader.__new__(HWMonReader)
+        reader._hwmon_path = tmp_path
+        reader._superio_path = None
+        with patch.object(Path, "glob", side_effect=OSError("removed")):
+            assert reader.read().tctl_c is None
+            assert reader.max_cpu_temp() is None
+
     def test_name_unreadable_is_skipped(self, tmp_path):
         base = tmp_path / "hwmon"
         d = base / "hwmon0"
@@ -101,10 +152,15 @@ class TestFrequencyEdges:
             out = freqmod.read_core_frequencies()
         assert out == {7: 1.0}
 
-    def test_read_from_proc_malformed_processor_line(self):
-        fake = "processor\t: notanum\ncpu MHz\t: 3000.0\n"
-        with patch("pathlib.Path.exists", return_value=True), patch("pathlib.Path.read_text", return_value=fake):
-            assert freqmod._read_from_proc() == {}
+    def test_read_from_proc_malformed_processor_line(self, tmp_path):
+        proc_cpuinfo = tmp_path / "cpuinfo"
+        proc_cpuinfo.write_text("processor\t: notanum\ncpu MHz\t: 3000.0\n")
+        assert freqmod._read_from_proc(proc_cpuinfo) == {}
+
+    def test_read_from_proc_malformed_frequency_is_skipped(self, tmp_path):
+        proc_cpuinfo = tmp_path / "cpuinfo"
+        proc_cpuinfo.write_text("processor: 0\ncpu MHz: invalid\n")
+        assert freqmod._read_from_proc(proc_cpuinfo) == {}
 
     def test_dual_returns_empty_when_cpufreq_absent(self, tmp_path):
         with patch("corecycler.monitor.frequency.CPUFREQ_BASE", tmp_path / "absent"):
@@ -133,6 +189,27 @@ class TestFrequencyEdges:
         (cf / "cpuinfo_min_freq").write_text("garbage\n")
         with patch("corecycler.monitor.frequency.CPUFREQ_BASE", base):
             assert freqmod.read_min_frequency(0) is None
+
+    def test_cpufreq_enumeration_failure_falls_back_to_proc(self, tmp_path):
+        base = tmp_path / "cpu"
+        base.mkdir()
+        proc_cpuinfo = tmp_path / "cpuinfo"
+        proc_cpuinfo.write_text("processor: 0\ncpu MHz: 3200.0\n")
+        with (
+            patch("corecycler.monitor.frequency.CPUFREQ_BASE", base),
+            patch("corecycler.monitor.frequency.PROC_CPUINFO", proc_cpuinfo),
+            patch.object(Path, "iterdir", side_effect=OSError("removed")),
+        ):
+            assert freqmod.read_core_frequencies() == {0: 3200.0}
+
+    def test_dual_cpufreq_enumeration_failure_returns_empty(self, tmp_path):
+        base = tmp_path / "cpu"
+        base.mkdir()
+        with (
+            patch("corecycler.monitor.frequency.CPUFREQ_BASE", base),
+            patch.object(Path, "iterdir", side_effect=OSError("removed")),
+        ):
+            assert freqmod.read_core_frequencies_dual() == {}
 
 
 class TestCpufreqSysfsReaders:
@@ -230,6 +307,8 @@ class TestRaplPowerReader:
         for name, files in domains.items():
             node = root / name
             node.mkdir(exist_ok=True, parents=True)
+            if "energy_uj" in files and "max_energy_range_uj" not in files:
+                (node / "max_energy_range_uj").write_text("1000000000000\n")
             for fname, text in files.items():
                 (node / fname).write_text(text)
         monkeypatch.setattr(pw, "RAPL_BASE", base)
@@ -279,13 +358,19 @@ class TestRaplPowerReader:
         assert watts is not None
         assert 0.0 < watts < 10.0
 
-    def test_a_wrapped_counter_stays_positive(self, tmp_path, monkeypatch):
-        pw = self._rapl(tmp_path, monkeypatch, {"intel-rapl:0": {"energy_uj": "10\n"}})
+    def test_a_wrapped_counter_uses_the_advertised_modulus(self, tmp_path, monkeypatch):
+        pw = self._rapl(
+            tmp_path,
+            monkeypatch,
+            {"intel-rapl:0": {"energy_uj": "10\n", "max_energy_range_uj": "1000000\n"}},
+        )
         reader = pw.PowerMonitor()
         reader._read_rapl()
-        reader._last_energy_uj = 2**32 - 1000
+        reader._last_energy_uj = 999_000
         reader._last_time -= 1.0
-        assert reader._read_rapl() > 0
+        watts = reader._read_rapl()
+        assert watts is not None
+        assert watts == pytest.approx(0.00101, rel=0.05)
 
     def test_an_unreadable_counter_reads_as_unknown(self, tmp_path, monkeypatch):
         pw = self._rapl(tmp_path, monkeypatch, {"intel-rapl:0": {"energy_uj": "junk\n"}})
@@ -293,6 +378,18 @@ class TestRaplPowerReader:
         assert reader._package_path is None
         reader._package_path = tmp_path / "powercap" / "intel-rapl" / "intel-rapl:0" / "energy_uj"
         assert reader._read_rapl() is None
+
+    def test_an_unreadable_energy_range_resets_the_baseline(self, tmp_path, monkeypatch):
+        pw = self._rapl(
+            tmp_path,
+            monkeypatch,
+            {"intel-rapl:0": {"energy_uj": "10\n", "max_energy_range_uj": "junk\n"}},
+        )
+        reader = pw.PowerMonitor()
+        reader._last_energy_uj = 5
+        reader._last_time = 1.0
+        assert reader._read_rapl() is None
+        assert reader._last_energy_uj == 10
 
 
 class TestHwmonPowerFallback:

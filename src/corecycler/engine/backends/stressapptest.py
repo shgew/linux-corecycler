@@ -1,4 +1,4 @@
-"""stressapptest stress backend — Google's memory stress testing tool.
+"""stressapptest stress backend, Google's memory stress testing tool.
 
 Note: Like all backends, stressapptest runs indefinitely and the
 CoreScheduler handles timing by killing the process after
@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING
 
 from corecycler.engine.backends import register_backend
 
-from .base import CRASH_SIGNALS, KILLED_BY_US_CODES, StressBackend, StressConfig, StressMode
+from .base import StressBackend, StressConfig, StressMode
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -39,13 +39,16 @@ def available_memory_mb() -> int | None:
 
 
 def default_memory_mb(lanes: int = 1) -> int:
-    """Per-process -M size: 75% of MemAvailable shared equally across ``lanes``
-    concurrent processes (never below MIN_MEMORY_MB), so a batch of them
-    together stays clear of the OOM killer. Falls back to a fixed total when
-    /proc/meminfo is unreadable."""
+    """Return a safe per-lane share of the batch memory budget."""
+    lanes = max(1, lanes)
     available = available_memory_mb()
     total = int(available * MEMORY_SHARE) if available else FALLBACK_MEMORY_MB
-    return max(MIN_MEMORY_MB, total // max(1, lanes))
+    if total < MIN_MEMORY_MB * lanes:
+        raise RuntimeError(
+            f"cannot fit {lanes} concurrent stressapptest lanes: "
+            f"{total} MiB budget is below the {MIN_MEMORY_MB} MiB per-lane minimum"
+        )
+    return total // lanes
 
 
 @register_backend("stressapptest")
@@ -66,32 +69,20 @@ class StressapptestBackend(StressBackend):
         ]
 
     def parse_output(self, stdout: str, stderr: str, returncode: int) -> tuple[bool, str | None]:
-        # The scheduler kills stressapptest (a 24h run) before its final
-        # "Status: PASS/FAIL" summary line, so detect the memory-error signatures it
-        # logs DURING the run. Checking only the final summary meant a killed run
-        # that had already found memory errors was reported as passed (false stable).
         lowered = (stdout + "\n" + stderr).lower()
         for signature in ("miscompare", "hardware error", "hardware incident", "status: fail"):
             if signature in lowered:
-                return False, f"stressapptest: '{signature}' — memory errors detected"
-        # A crash signal always wins, even over a final "Status: PASS": a clean run
-        # exits 0 or is killed by the scheduler, never with a crash code, so a crash
-        # exit is unambiguous instability and must never be masked by a printed PASS.
-        if returncode in CRASH_SIGNALS:
-            return False, f"stressapptest crashed with {CRASH_SIGNALS[returncode]} (exit {returncode})"
-        if "Status: PASS" in stdout:
-            return True, None
-        if returncode in KILLED_BY_US_CODES:
-            return True, None
-        if returncode != 0:
-            return False, f"stressapptest exited with code {returncode}"
-        return True, None
+                return False, f"stressapptest: '{signature}' - memory errors detected"
+        return self.indefinite_exit_verdict(returncode)
 
     def get_supported_modes(self) -> list[StressMode]:
         return [StressMode.SSE]
 
+    def workload(self, config: StressConfig) -> tuple[str, ...]:
+        return ("memory",)
+
+    def default_memory_mb(self, lanes: int = 1) -> int:
+        return default_memory_mb(lanes)
+
     def prepare(self, work_dir: Path, config: StressConfig) -> None:
         work_dir.mkdir(parents=True, exist_ok=True)
-
-    def cleanup(self, work_dir: Path, *, preserve_on_error: bool = False) -> None:
-        pass

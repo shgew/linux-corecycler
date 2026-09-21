@@ -1,7 +1,8 @@
-"""Headless commands — tune, resume and inspect sessions without a display."""
+"""Headless commands - tune, resume and inspect sessions without a display."""
 
 from __future__ import annotations
 
+import argparse
 import os
 import signal
 import sys
@@ -13,6 +14,9 @@ from corecycler.config import tools
 from corecycler.config.settings import load_settings
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from typing import Any
+
     from corecycler.config.tools import Resolution
 
 EXIT_COMPLETED = 0
@@ -21,8 +25,8 @@ EXIT_QUARANTINED = 4
 EXIT_REFUSED = 5
 EXIT_ENGINE_ABORTED = 6
 EXIT_LOCKED = 7
+EXIT_HISTORY = 8
 EXIT_SIGNAL = 130
-
 # How often the paused engine is checked for a still-running test, and how
 # often the Qt loop yields to Python so a pending signal handler can run.
 SETTLE_POLL_MS = 500
@@ -39,76 +43,91 @@ SEARCH_DEFINING_FIELDS = (
     "inherit_current",
 )
 
-USAGE = """\
-corecycler headless commands:
 
-  corecycler --version            print the installed build and exit
-  corecycler doctor               report every external tool and where it resolved
-  corecycler status               list tuner sessions; newest one with per-core offsets and live-evidence hours
-  corecycler report [SESSION_ID] [--json]
-                                  per-core offsets with the banked evidence behind each
-  corecycler tune [--config F] [--seed-from SESSION_ID]
-                                  start a NEW tuning session and run to the end; --seed-from
-                                  begins each core at what that session learned, retested first
-  corecycler resume [SESSION_ID [--config F]]
-                                  resume a session (newest if omitted); --config replaces its
-                                  saved settings (search fields must match)
+class _ParseRefusal(ValueError):
+    pass
 
-Exit codes: 0 completed, 3 paused (needs attention), 4 quarantined,
-5 refused (bad config/environment), 6 engine aborted, 7 already running,
-130 aborted by SIGINT (offsets reverted to baseline).
-SIGTERM pauses after the current test and exits 3.
 
-Running the binary with no command opens the GUI.
-"""
+class _ParserExit(Exception):
+    def __init__(self, status: int) -> None:
+        self.status = status
+
+
+class _CliParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise _ParseRefusal(message)
+
+    def exit(self, status: int = 0, message: str | None = None) -> None:
+        raise _ParserExit(status)
+
+
+def _build_parser() -> tuple[_CliParser, argparse._SubParsersAction]:
+    parser = _CliParser(prog="corecycler", description="Per-core CPU stability tester and Curve Optimizer tuner")
+    parser.add_argument("-V", "--version", action="version", version=f"corecycler {__version__}")
+    commands = parser.add_subparsers(dest="command", metavar="COMMAND")
+    commands.add_parser("doctor", help="check required and optional external tools")
+    commands.add_parser("status", help="show tuner sessions and evidence")
+    report = commands.add_parser("report", help="render a durable tuner report")
+    report.add_argument("session_id", nargs="?", type=int)
+    report.add_argument("--json", action="store_true", dest="as_json")
+    tune = commands.add_parser("tune", help="start a new headless tuning session")
+    tune.add_argument("--config", action="append", dest="config_paths")
+    tune.add_argument("--seed-from", action="append", dest="seed_sources", type=int)
+    resume = commands.add_parser("resume", help="resume a saved tuning session")
+    resume.add_argument("session_id", nargs="?", type=int)
+    resume.add_argument("--config", action="append", dest="config_paths")
+    return parser, commands
+
+
+_PARSER, _SUBPARSERS = _build_parser()
+CLI_COMMANDS = frozenset(_SUBPARSERS.choices)
+USAGE = _PARSER.format_help()
+
+
+def invocation_is_cli(argv: list[str]) -> bool:
+    if not argv:
+        return False
+    return not argv[0].startswith("-") or argv[0] in {"-h", "--help", "-V", "--version"}
+
+
+def command_requires_confinement(argv: list[str]) -> bool:
+    return bool(argv and argv[0] in {"tune", "resume"})
+
+
+def _refuse(message: str, *, command: str | None = None) -> int:
+    prefix = f"corecycler {command}" if command else "corecycler"
+    print(f"{prefix}: {message}", file=sys.stderr)
+    return EXIT_REFUSED
 
 
 def cli_main(argv: list[str]) -> int:
-    if argv in (["--version"], ["-V"]):
-        print(f"corecycler {__version__}")
-        return EXIT_COMPLETED
-    if argv in (["--help"], ["-h"]) or (
-        len(argv) == 2 and argv[0] in ("doctor", "status", "report", "tune", "resume") and argv[1] in ("--help", "-h")
-    ):
-        print(USAGE)
-        return EXIT_COMPLETED
-    if not argv:
-        print(USAGE, file=sys.stderr)
-        return EXIT_REFUSED
-    command = argv[0]
-    args = argv[1:]
-    if command in ("doctor", "status") and args:
-        print(f"corecycler {command}: unexpected arguments", file=sys.stderr)
-        return EXIT_REFUSED
-    if command == "report":
-        return _dispatch_report(args)
-    if command == "doctor":
+    try:
+        args = _PARSER.parse_args(argv)
+    except _ParserExit as exc:
+        return EXIT_COMPLETED if exc.status == 0 else EXIT_REFUSED
+    except _ParseRefusal as exc:
+        return _refuse(str(exc))
+    if args.command is None:
+        return _refuse("a command is required")
+    if args.command == "doctor":
         return cmd_doctor()
-    if command == "status":
+    if args.command == "status":
         return cmd_status()
-    if command == "tune":
-        return _dispatch_tune(args)
-    if command == "resume":
-        if not args:
-            return cmd_run(config_path=None, resume_id=None, auto_resume=True)
-        bad_shape = len(args) not in (1, 3) or args[0].startswith("-")
-        if not bad_shape and len(args) == 3:
-            bad_shape = args[1] != "--config" or args[2].startswith("-")
-        if bad_shape:
-            print("corecycler resume: expected SESSION_ID [--config FILE] or no arguments", file=sys.stderr)
-            return EXIT_REFUSED
-        try:
-            session_id = int(args[0])
-        except ValueError:
-            print(f"corecycler resume: invalid session id {args[0]!r}", file=sys.stderr)
-            return EXIT_REFUSED
-        return cmd_run(
-            config_path=args[2] if len(args) == 3 else None,
-            resume_id=session_id,
-            auto_resume=False,
-        )
-    print(USAGE, file=sys.stderr)
-    return EXIT_REFUSED
+    if args.command == "report":
+        return cmd_report(session_id=args.session_id, as_json=args.as_json)
+    config_paths = getattr(args, "config_paths", None) or []
+    if len(config_paths) > 1:
+        return _refuse("--config may be specified only once", command=args.command)
+    config_path = config_paths[0] if config_paths else None
+    if args.command == "resume":
+        if config_path is not None and args.session_id is None:
+            return _refuse("--config requires an explicit SESSION_ID", command="resume")
+        return cmd_run(config_path=config_path, resume_id=args.session_id, auto_resume=args.session_id is None)
+    seed_sources = args.seed_sources or []
+    if len(seed_sources) > 1:
+        return _refuse("--seed-from may be specified only once", command="tune")
+    seed_from = seed_sources[0] if seed_sources else None
+    return cmd_run(config_path=config_path, resume_id=None, auto_resume=False, seed_from=seed_from)
 
 
 def doctor_lines(resolutions: list[Resolution], unmet: list[str]) -> list[str]:
@@ -141,52 +160,16 @@ def cmd_doctor() -> int:
 
 
 def _dispatch_report(args: list[str]) -> int:
-    """Parse ``report [SESSION_ID] [--json]``; an unreadable shape refuses."""
-    as_json = "--json" in args
-    rest = [a for a in args if a != "--json"]
-    if len(rest) > 1 or (rest and rest[0].startswith("-")):
-        print("corecycler report: expected [SESSION_ID] [--json]", file=sys.stderr)
-        return EXIT_REFUSED
-    session_id = None
-    if rest:
-        try:
-            session_id = int(rest[0])
-        except ValueError:
-            print(f"corecycler report: invalid session id {rest[0]!r}", file=sys.stderr)
-            return EXIT_REFUSED
-    return cmd_report(session_id=session_id, as_json=as_json)
+    return cli_main(["report", *args])
 
 
-_TUNE_SHAPE = "corecycler tune: expected [--config FILE] [--seed-from SESSION_ID]"
-
-
-def _dispatch_tune(args: list[str]) -> int:
-    """Parse ``tune [--config FILE] [--seed-from SESSION_ID]``.
-
-    A repeated flag is a refusal rather than a last-one-wins: an operator who
-    named two configs does not know which search is about to run.
-    """
-    values: dict[str, str] = {}
-    rest = list(args)
-    while rest:
-        flag = rest.pop(0)
-        if flag in values or flag not in ("--config", "--seed-from") or not rest or rest[0].startswith("-"):
-            print(_TUNE_SHAPE, file=sys.stderr)
-            return EXIT_REFUSED
-        values[flag] = rest.pop(0)
-    seed_from = None
-    if "--seed-from" in values:
-        try:
-            seed_from = int(values["--seed-from"])
-        except ValueError:
-            print(f"corecycler tune: invalid session id {values['--seed-from']!r}", file=sys.stderr)
-            return EXIT_REFUSED
-    return cmd_run(
-        config_path=values.get("--config"),
-        resume_id=None,
-        auto_resume=False,
-        seed_from=seed_from,
-    )
+def _history_read(command: str, operation: Callable[[], Any]) -> tuple[bool, Any]:
+    try:
+        return True, operation()
+    except Exception as error:
+        detail = str(error) or type(error).__name__
+        print(f"corecycler {command}: cannot read tuner history: {detail}", file=sys.stderr)
+        return False, None
 
 
 def cmd_report(session_id: int | None = None, as_json: bool = False, db=None) -> int:
@@ -195,6 +178,7 @@ def cmd_report(session_id: int | None = None, as_json: bool = False, db=None) ->
 
     own_db = db is None
     error: Exception | None = None
+    missing_session = False
     output = ""
     try:
         if db is None:
@@ -206,8 +190,11 @@ def cmd_report(session_id: int | None = None, as_json: bool = False, db=None) ->
             else:
                 session_id = sessions[0].id
         if session_id is not None:
-            data = tuner_report.build(db, session_id)
-            output = tuner_report.to_json(data) if as_json else "\n".join(tuner_report.render(data))
+            if db.get_tuner_session(session_id) is None:
+                missing_session = True
+            else:
+                data = tuner_report.build(db, session_id)
+                output = tuner_report.to_json(data) if as_json else "\n".join(tuner_report.render(data))
     except Exception as e:
         error = e
 
@@ -218,57 +205,77 @@ def cmd_report(session_id: int | None = None, as_json: bool = False, db=None) ->
             if error is None:
                 error = e
 
+    if missing_session:
+        print(f"corecycler report: no tuner session {session_id}", file=sys.stderr)
+        return EXIT_REFUSED
     if error is not None:
         detail = str(error) or type(error).__name__
         print(f"corecycler report: cannot read tuner history: {detail}", file=sys.stderr)
-        return EXIT_REFUSED
+        return EXIT_HISTORY
     print(output)
     return EXIT_COMPLETED
 
 
 def cmd_status(db=None) -> int:
     from corecycler.history.db import HistoryDB
+
+    own_db = db is None
+    error: Exception | None = None
+    result = EXIT_COMPLETED
+    try:
+        if db is None:
+            db = HistoryDB()
+        result = _render_status(db)
+    except Exception as exc:
+        error = exc
+    if own_db and db is not None:
+        try:
+            db.close()
+        except Exception as exc:
+            if error is None:
+                error = exc
+    if error is not None:
+        detail = str(error) or type(error).__name__
+        print(f"corecycler status: cannot read tuner history: {detail}", file=sys.stderr)
+        return EXIT_HISTORY
+    return result
+
+
+def _render_status(db) -> int:
     from corecycler.tuner import persistence as tp
     from corecycler.tuner.config import TunerConfig
 
-    own_db = db is None
-    if db is None:
-        db = HistoryDB()
-    try:
-        sessions = db.list_tuner_sessions(limit=50)
-        if not sessions:
-            print("no tuner sessions")
-            return EXIT_COMPLETED
-        latest_states = {}
-        for index, sess in enumerate(sessions):
-            states = tp.load_core_states(db, sess.id)
-            if index == 0:
-                latest_states = states
-            done = sum(1 for cs in states.values() if cs.phase == "confirmed")
-            print(
-                f"#{sess.id}  {sess.status:<12} {done}/{len(states)} cores done  "
-                f"created {sess.created_at[:19]} by {sess.app_version or 'unknown'}  {sess.cpu_model or ''}"
-            )
-        latest = sessions[0]
-        try:
-            config = TunerConfig.from_json(latest.config_json)
-        except ValueError:
-            print("  (config unreadable; no evidence summary)")
-            return EXIT_COMPLETED
-        if latest.validation_stage == 9:
-            print(
-                f"  endurance round {latest.endurance_round}, workload "
-                f"{latest.endurance_workload + 1}/{len(config.endurance_workloads)}, "
-                f"slot {latest.endurance_index}"
-            )
-        summary = tp.evidence_summary(db, latest.id, latest_states, config.direction)
-        for core_id in sorted(latest_states):
-            cs = latest_states[core_id]
-            print("  " + tp.format_evidence_line(core_id, cs.best_offset, summary.get(core_id, {})))
+    sessions = db.list_tuner_sessions(limit=50)
+    if not sessions:
+        print("no tuner sessions")
         return EXIT_COMPLETED
-    finally:
-        if own_db:
-            db.close()
+    latest_states = {}
+    for index, sess in enumerate(sessions):
+        states = db.get_tuner_core_states(sess.id)
+        if index == 0:
+            latest_states = states
+        done = sum(1 for cs in states.values() if cs.phase == "confirmed")
+        print(
+            f"#{sess.id}  {sess.status:<12} {done}/{len(states)} cores done  "
+            f"created {sess.created_at[:19]} by {sess.app_version or 'unknown'}  {sess.cpu_model or ''}"
+        )
+    latest = sessions[0]
+    try:
+        config = TunerConfig.from_json(latest.config_json)
+    except ValueError:
+        print("  (config unreadable; no evidence summary)")
+        return EXIT_COMPLETED
+    if latest.validation_stage == 9:
+        print(
+            f"  endurance round {latest.endurance_round}, workload "
+            f"{latest.endurance_workload + 1}/{len(config.endurance_workloads)}, "
+            f"slot {latest.endurance_index}"
+        )
+    summary = tp.evidence_summary(db, latest.id, latest_states, config.direction)
+    for core_id in sorted(latest_states):
+        cs = latest_states[core_id]
+        print("  " + tp.format_evidence_line(core_id, cs.best_offset, summary.get(core_id, {})))
+    return EXIT_COMPLETED
 
 
 def _build_smu(topology):
@@ -296,68 +303,115 @@ def cmd_run(
     engine_factory=None,
     db=None,
 ) -> int:
+    from corecycler.history.db import HistoryDB
+
+    own_db = db is None
+    if own_db:
+        command = "resume" if resume_id is not None or auto_resume else "tune"
+        ok, db = _history_read(command, HistoryDB)
+        if not ok:
+            return EXIT_HISTORY
+    try:
+        result = _cmd_run(
+            config_path, resume_id, auto_resume, seed_from=seed_from, engine_factory=engine_factory, db=db
+        )
+    except BaseException:
+        if own_db:
+            try:
+                db.close()
+            except Exception as error:
+                print(f"corecycler: cannot close tuner history: {error}", file=sys.stderr)
+        raise
+    if own_db:
+        try:
+            db.close()
+        except Exception as error:
+            print(f"corecycler: cannot close tuner history: {error}", file=sys.stderr)
+            return EXIT_HISTORY
+    return result
+
+
+def _cmd_run(
+    config_path: str | None,
+    resume_id: int | None,
+    auto_resume: bool,
+    *,
+    seed_from: int | None = None,
+    engine_factory=None,
+    db=None,
+) -> int:
     from PySide6.QtCore import QCoreApplication, QLockFile, QTimer
 
-    from corecycler.config.paths import user_home
+    from corecycler.config.paths import ensure_state_directory
 
     app = QCoreApplication.instance() or QCoreApplication(sys.argv[:1])
 
-    lock_dir = user_home() / ".local" / "share" / "corecycler"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    instance_lock = QLockFile(str(lock_dir / "corecycler.lock"))
+    instance_lock = QLockFile(str(ensure_state_directory()))
     if not instance_lock.tryLock(0):
         print("corecycler: another instance is already running.", file=sys.stderr)
         return EXIT_LOCKED
 
     from corecycler.engine.backends import get_backend, load_all
     from corecycler.engine.topology import detect_topology
-    from corecycler.history.db import HistoryDB
-    from corecycler.tuner import persistence as tp
     from corecycler.tuner.config import TunerConfig
     from corecycler.tuner.engine import TunerEngine
 
     load_all()
     tools.load_configured_paths()
-    if db is None:
-        db = HistoryDB()
+    command = "resume" if resume_id is not None or auto_resume else "tune"
+
     session = None
     if resume_id is not None:
-        session = tp.get_session(db, resume_id)
+        ok, session = _history_read(command, lambda: db.get_tuner_session(resume_id))
+        if not ok:
+            return EXIT_HISTORY
     elif auto_resume:
-        session = tp.pick_auto_resume_session(db)
-        if session is None:
-            sessions = db.list_resumable_tuner_sessions()
-            session = sessions[0] if sessions else None
+        ok, sessions = _history_read(command, db.list_resumable_tuner_sessions)
+        if not ok:
+            return EXIT_HISTORY
+        session = sessions[0] if sessions else None
     if (resume_id is not None or auto_resume) and session is None:
         print("corecycler: no resumable session", file=sys.stderr)
         return EXIT_REFUSED
+    if session is not None and session.status == "completed":
+        print(f"corecycler: session {session.id} is completed and cannot be resumed", file=sys.stderr)
+        return EXIT_REFUSED
     seeds: dict[int, int] | None = None
     if seed_from is not None:
-        source = tp.get_session(db, seed_from)
+        ok, source = _history_read(command, lambda: db.get_tuner_session(seed_from))
+        if not ok:
+            return EXIT_HISTORY
         if source is None:
-            print(f"corecycler: no session {seed_from} to seed from", file=sys.stderr)
+            print(f"corecycler: session {seed_from} not found", file=sys.stderr)
             return EXIT_REFUSED
         if source.status == "quarantined":
-            print(f"corecycler: session {seed_from} is quarantined and cannot seed a new search", file=sys.stderr)
+            print(
+                f"corecycler: session {seed_from} is quarantined and cannot seed a new search",
+                file=sys.stderr,
+            )
             return EXIT_REFUSED
         unresolved = None
         if source.resume_crash_streak:
             unresolved = "crash recovery"
         elif source.unattributed_crashes:
             unresolved = "unattributed crash evidence"
-        elif source.hunting_core is not None:
-            unresolved = "isolated hunt"
         elif source.hunt_state:
             unresolved = "crash hunt"
-        elif tp.journal_suspects(db, seed_from):
-            unresolved = "crash evidence"
+        else:
+            ok, suspects = _history_read(command, lambda: db.journal_suspects(seed_from))
+            if not ok:
+                return EXIT_HISTORY
+            if suspects:
+                unresolved = "unapplied journal"
         if unresolved is not None:
             print(
                 f"corecycler: session {seed_from} has unresolved {unresolved} and cannot seed a new search",
                 file=sys.stderr,
             )
             return EXIT_REFUSED
-        seeds = tp.get_session_offsets(db, seed_from)
+        ok, seeds = _history_read(command, lambda: db.get_tuner_session_offsets(seed_from))
+        if not ok:
+            return EXIT_HISTORY
         if not seeds:
             print(f"corecycler: session {seed_from} learned no offsets to seed from", file=sys.stderr)
             return EXIT_REFUSED
@@ -390,6 +444,20 @@ def cmd_run(
             return EXIT_REFUSED
 
         config = override
+    if seeds is not None:
+        selected = set(config.cores_to_test) if config.cores_to_test is not None else set(seeds)
+        seeds = {
+            core_id: offset
+            for core_id, offset in seeds.items()
+            if core_id in selected
+            and (
+                (config.direction < 0 and offset < config.start_offset)
+                or (config.direction > 0 and offset > config.start_offset)
+            )
+        }
+        if not seeds:
+            print(f"corecycler: session {seed_from} has no offsets applicable to this search", file=sys.stderr)
+            return EXIT_REFUSED
 
     if engine_factory is not None:
         engine = engine_factory(db, config)
@@ -401,11 +469,15 @@ def cmd_run(
         smu = _build_smu(topology)
         if smu is None:
             print(
-                "corecycler: per-core SMU access is unavailable — the tuner "
+                "corecycler: per-core SMU access is unavailable - the tuner "
                 "needs it (any refusal reason is printed above; otherwise "
                 "check modprobe ryzen_smu and device permissions).",
                 file=sys.stderr,
             )
+            return EXIT_REFUSED
+        validation = config.validate(smu.commands.co_range)
+        if validation:
+            print("corecycler: invalid tuner config: " + "; ".join(validation), file=sys.stderr)
             return EXIT_REFUSED
         try:
             backend = get_backend(config.backend)
@@ -424,7 +496,7 @@ def cmd_run(
         engine = TunerEngine(db=db, topology=topology, smu=smu, backend=backend, config=config)
 
     if override is not None:
-        tp.update_session_config(db, session.id, override.to_json())
+        db.update_tuner_session_config(session.id, override.to_json())
         print(f"corecycler: session {session.id} config replaced from {config_path}")
 
     outcome: dict[str, int] = {}
@@ -458,13 +530,13 @@ def cmd_run(
     engine.status_changed.connect(on_status)
 
     def on_interrupt(signum, _frame) -> None:
-        print(f"corecycler: signal {signum} — aborting (offsets revert)", flush=True)
+        print(f"corecycler: signal {signum} - aborting (offsets revert)", flush=True)
         outcome["exit"] = EXIT_SIGNAL
         engine.abort()
         app.quit()
 
     def on_terminate(_signum, _frame) -> None:
-        print("corecycler: SIGTERM — pausing after the current test", flush=True)
+        print("corecycler: SIGTERM - pausing after the current test", flush=True)
         engine.pause()
 
     signal.signal(signal.SIGINT, on_interrupt)
@@ -485,7 +557,7 @@ def cmd_run(
         return outcome["exit"]
     if engine.status not in ("running", "validating", "hunting"):
         print(
-            f"corecycler: engine did not start (status {engine.status}) — see log",
+            f"corecycler: engine did not start (status {engine.status}) - see log",
             file=sys.stderr,
         )
         return EXIT_REFUSED
@@ -498,9 +570,9 @@ def cmd_run(
 
 _OUTCOME_NOTES = {
     EXIT_COMPLETED: ("Tuning complete", "The session finished and confirmed a profile.", "normal"),
-    EXIT_PAUSED: ("Tuning paused", "The tuner stopped for attention — check the log.", "critical"),
+    EXIT_PAUSED: ("Tuning paused", "The tuner stopped for attention - check the log.", "critical"),
     EXIT_QUARANTINED: ("Tuning quarantined", "The profile is unsafe; cores forced to stock.", "critical"),
-    EXIT_ENGINE_ABORTED: ("Tuning aborted", "The engine stopped itself — check the log.", "critical"),
+    EXIT_ENGINE_ABORTED: ("Tuning aborted", "The engine stopped itself - check the log.", "critical"),
 }
 
 

@@ -1,51 +1,141 @@
-"""Filesystem identity for persistent state — always the INVOKING user.
-
-Under ``sudo corecycler``, ``Path.home()`` is ``/root``, which silently splits
-the history database and settings into a second root-owned tree (sudo and
-non-sudo runs then see different data). All persistent app state resolves
-through :func:`user_home`, and :func:`fix_sudo_ownership` hands root-created
-files back to the user so a later non-sudo run can still write them.
-"""
+"""Filesystem identity and secure persistent state paths."""
 
 from __future__ import annotations
 
 import contextlib
 import os
+import pwd
+import secrets
+import stat
 from pathlib import Path
+
+_CREATED_INODES: dict[Path, tuple[int, int]] = {}
 
 
 def user_home() -> Path:
-    """Home directory of the invoking user — SUDO_USER-aware under sudo."""
+    """Return the home directory of the invoking user."""
     if os.geteuid() == 0:
+        sudo_uid = os.environ.get("SUDO_UID", "")
+        if sudo_uid.isdigit() and int(sudo_uid) != 0:
+            with contextlib.suppress(KeyError):
+                return Path(pwd.getpwuid(int(sudo_uid)).pw_dir)
         sudo_user = os.environ.get("SUDO_USER")
         if sudo_user and sudo_user != "root":
-            import pwd
-
             with contextlib.suppress(KeyError):
                 return Path(pwd.getpwnam(sudo_user).pw_dir)
     return Path.home()
 
 
-def atomic_write(path: Path, content: str, *, durable: bool = False) -> None:
-    """Atomically replace a file, optionally syncing its data and directory entry."""
-    tmp = path.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as stream:
-        stream.write(content)
-        if durable:
-            stream.flush()
-            os.fsync(stream.fileno())
-    tmp.replace(path)
-    fix_sudo_ownership(path.parent, path)
-    if durable:
-        directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+def _key(path: Path) -> Path:
+    return path.absolute()
+
+
+def _record_created(path: Path, details: os.stat_result | None = None) -> None:
+    details = details or path.lstat()
+    _CREATED_INODES[_key(path)] = (details.st_dev, details.st_ino)
+
+
+def _validate_no_symlinks(path: Path) -> None:
+    if os.geteuid() != 0 or not os.environ.get("SUDO_UID", "").isdigit():
+        return
+    current = Path(path.anchor)
+    for part in path.absolute().parts[1:]:
+        current /= part
         try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+            details = current.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(details.st_mode):
+            raise OSError(f"refusing symlink in application path: {current}")
+
+
+def ensure_directory(path: Path) -> Path:
+    """Create a directory tree and repair only the directories created here."""
+    path = path.absolute()
+    _validate_no_symlinks(path)
+    missing: list[Path] = []
+    current = path
+    while True:
+        try:
+            details = current.lstat()
+        except FileNotFoundError:
+            missing.append(current)
+            current = current.parent
+            continue
+        if not stat.S_ISDIR(details.st_mode):
+            raise NotADirectoryError(current)
+        break
+
+    created: list[Path] = []
+    for directory in reversed(missing):
+        try:
+            os.mkdir(directory)
+        except FileExistsError:
+            details = directory.lstat()
+            if not stat.S_ISDIR(details.st_mode):
+                raise NotADirectoryError(directory) from None
+        else:
+            _record_created(directory)
+            created.append(directory)
+    fix_sudo_ownership(*created)
+    return path
+
+
+def ensure_state_directory() -> Path:
+    """Create the application state directory and return its instance lock path."""
+    state_dir = ensure_directory(user_home() / ".local" / "share" / "corecycler")
+    return state_dir / "corecycler.lock"
+
+
+def atomic_write(path: Path, content: str, *, durable: bool = False) -> None:
+    """Atomically replace a file through an exclusive, non-following temporary file."""
+    path = path.absolute()
+    ensure_directory(path.parent)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    temporary: Path | None = None
+    fd = -1
+    try:
+        for _ in range(128):
+            candidate = path.parent / f".{path.name}.{secrets.token_hex(16)}.tmp"
+            try:
+                fd = os.open(candidate, flags, 0o600)
+            except FileExistsError:
+                continue
+            temporary = candidate
+            break
+        if temporary is None:
+            raise FileExistsError(f"cannot create a temporary file for {path}")
+
+        with os.fdopen(fd, "w", encoding="utf-8", closefd=False) as stream:
+            stream.write(content)
+            if durable:
+                stream.flush()
+                os.fsync(fd)
+
+        opened = os.fstat(fd)
+        on_disk = temporary.lstat()
+        if (opened.st_dev, opened.st_ino) != (on_disk.st_dev, on_disk.st_ino) or stat.S_ISLNK(on_disk.st_mode):
+            raise OSError(f"temporary file changed before replacement: {temporary}")
+        os.replace(temporary, path)
+        temporary = None
+        _record_created(path, opened)
+        fix_sudo_ownership(path)
+        if durable:
+            directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        if temporary is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(temporary)
 
 
 def invoking_uid() -> int:
-    """Uid of the user who started the run — SUDO_UID-aware under sudo."""
+    """Return the uid of the user who started the run."""
     if os.geteuid() == 0:
         sudo_uid = os.environ.get("SUDO_UID", "")
         if sudo_uid.isdigit():
@@ -54,14 +144,7 @@ def invoking_uid() -> int:
 
 
 def resolve_work_dir(configured: str = "") -> Path:
-    """The stress work root: configured path, else a per-user default.
-
-    The default is never a shared world-writable location — a root-owned
-    /tmp/corecycler left by one sudo run made every later plain run unable to
-    write its backend config. The runtime directory is used only when it belongs
-    to the INVOKING user, like every other path here: under sudo it is root's
-    own private one, which is Qt's to keep its runtime files in, not a work root
-    the user could reach afterwards."""
+    """Return the configured stress work root or a per-user default."""
     if configured:
         return Path(configured)
     runtime = os.environ.get("XDG_RUNTIME_DIR", "")
@@ -74,26 +157,25 @@ def resolve_work_dir(configured: str = "") -> Path:
 
 
 def ensure_work_dir(configured: str = "") -> Path:
-    work = resolve_work_dir(configured)
-    work.mkdir(parents=True, exist_ok=True)
-    fix_sudo_ownership(work.parent, work)
-    return work
+    return ensure_directory(resolve_work_dir(configured))
 
 
 def fix_sudo_ownership(*paths: Path) -> None:
-    """chown root-created state files/dirs back to the invoking user.
-
-    No-op unless running as root under sudo. Never raises: ownership repair
-    must not break the write that just succeeded — a root-owned file is
-    strictly less bad than losing the data.
-    """
+    """Repair ownership only for inode identities created by this module."""
     if os.geteuid() != 0:
         return
     uid = os.environ.get("SUDO_UID", "")
     gid = os.environ.get("SUDO_GID", "")
     if not (uid.isdigit() and gid.isdigit()):
         return
-    for p in paths:
-        with contextlib.suppress(OSError):
-            if p.exists():
-                os.chown(p, int(uid), int(gid))
+    for path in paths:
+        expected = _CREATED_INODES.get(_key(path))
+        if expected is None:
+            continue
+        try:
+            details = path.lstat()
+            if stat.S_ISLNK(details.st_mode) or (details.st_dev, details.st_ino) != expected:
+                continue
+            os.chown(path, int(uid), int(gid), follow_symlinks=False)
+        except OSError:
+            continue

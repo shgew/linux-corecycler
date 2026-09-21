@@ -17,7 +17,14 @@ dependencies = ["PySide6>=6.7"]
 corecycler = "corecycler.main:main"
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0", "ruff>=0.8", "hypothesis>=6.100"]
+dev = [
+  "hypothesis>=6.100",
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "pytest-timeout>=2.3",
+  "pytest-xdist>=3.6",
+  "ruff>=0.8",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]

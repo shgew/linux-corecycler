@@ -37,16 +37,17 @@ class TestConfigJsonFailsClosed:
         coarse=st.integers(1, 15),
         fine=st.integers(1, 5),
         direction=st.sampled_from([-1, 1]),
-        start=st.integers(-60, 30),
-        max_off=st.integers(-60, 30),
+        start=st.integers(-30, 0),
+        distance=st.integers(1, 30),
         inherit=st.booleans(),
         auto_validate=st.booleans(),
         order=st.sampled_from(["sequential", "round_robin", "weakest_first", "ccd_alternating", "ccd_round_robin"]),
         stretch=st.floats(0.0, 20.0, allow_nan=False, allow_infinity=False),
     )
     def test_to_from_json_round_trips(
-        self, coarse, fine, direction, start, max_off, inherit, auto_validate, order, stretch
+        self, coarse, fine, direction, start, distance, inherit, auto_validate, order, stretch
     ):
+        max_off = start + direction * distance
         cfg = TunerConfig(
             coarse_step=coarse,
             fine_step=min(fine, coarse),
@@ -70,6 +71,7 @@ def _core_state(data) -> CoreState:
         phase=data.draw(st.sampled_from(list(TunerPhase))),
         current_offset=data.draw(st.integers(-70, 30)),
         best_offset=data.draw(opt_int),
+        proven_offset=data.draw(opt_int),
         coarse_fail_offset=data.draw(opt_int),
         confirm_attempts=data.draw(st.integers(0, 9)),
         baseline_offset=data.draw(st.integers(-70, 30)),

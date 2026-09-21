@@ -29,7 +29,7 @@ a paused tuner retains ownership until resumed or aborted, including on window c
 ```text
 src/corecycler/
   main.py            Entry point, Qt setup, sudo session handshake
-  cli.py             Headless doctor/status/tune/resume commands (no display needed)
+  cli.py             Headless doctor/status/report/tune/resume commands (no display needed)
   notify.py          Desktop notifications via notify-send, best-effort
   inhibit.py         logind sleep+idle lock held while a run is in flight, best-effort
   engine/            Stress execution

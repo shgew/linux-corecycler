@@ -1,14 +1,14 @@
-"""Stress test backend registry — auto-discovers available backends."""
+"""Stress test backend registry."""
 
 from __future__ import annotations
 
+import importlib
+import pkgutil
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from corecycler.engine.backends.base import StressBackend
 
-# Registry: display_name -> backend class
-# Populated by register_backend() calls in each backend module.
 BACKEND_REGISTRY: dict[str, type[StressBackend]] = {}
 
 
@@ -29,12 +29,14 @@ def get_backend(name: str) -> StressBackend:
 
 def available_backends() -> list[str]:
     """Return display names of all registered backends."""
-    return list(BACKEND_REGISTRY.keys())
+    return list(BACKEND_REGISTRY)
 
 
 def load_all() -> None:
-    """Import all backend modules to trigger registration."""
-    import corecycler.engine.backends.mprime  # noqa: F401
-    import corecycler.engine.backends.stress_ng  # noqa: F401
-    import corecycler.engine.backends.stressapptest  # noqa: F401
-    import corecycler.engine.backends.ycruncher  # noqa: F401
+    """Discover backend modules; their decorators populate the registry."""
+    for module in pkgutil.iter_modules(__path__):
+        if module.name != "base" and not module.name.startswith("_"):
+            importlib.import_module(f"{__name__}.{module.name}")
+
+
+load_all()

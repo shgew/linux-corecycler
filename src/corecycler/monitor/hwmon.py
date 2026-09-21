@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-import contextlib
+import logging
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from corecycler.monitor.files import read_int_optional, read_text_optional
+
+log = logging.getLogger(__name__)
 
 HWMON_BASE = Path("/sys/class/hwmon")
 
@@ -41,49 +45,61 @@ _SUPERIO_CHIPS = (
 )
 
 
+def _normalized_label(label: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", label.lower())
+
+
 @dataclass(slots=True)
 class HWMonData:
     tctl_c: float | None = None
     tdie_c: float | None = None
-    tccd_temps: dict[int, float] = field(default_factory=dict)  # CCD index -> temp
+    ccd_temperatures_c: dict[int, float] = field(default_factory=dict)
     vcore_v: float | None = None
     vsoc_v: float | None = None
 
 
 class HWMonReader:
-    """Read CPU temperatures and voltages from hwmon (k10temp/zenpower/coretemp)."""
+    """Read CPU temperatures and voltages from hwmon."""
 
-    # Prefer AMD-specific drivers (richer data) over generic coretemp
     _PREFERRED = ("zenpower", "zenpower3", "zenpower5", "k10temp")
     _FALLBACK = ("coretemp",)
+    _VCORE_LABELS = {"vcore", "cpuvcore", "svi2vdd", "svi3vdd", "vddcrcpu"}
+    _VSOC_LABELS = {"vsoc", "svi2vddnb", "svi3vddnb", "vddcrsoc"}
 
     def __init__(self) -> None:
         self._hwmon_path: Path | None = None
-        self._superio_path: Path | None = None  # fallback voltage from Super I/O
+        self._superio_path: Path | None = None
         self._find_device()
 
+    @staticmethod
+    def _glob(path: Path, pattern: str) -> list[Path]:
+        try:
+            return sorted(path.glob(pattern))
+        except OSError:
+            log.debug("Unable to enumerate hwmon files below %s", path, exc_info=True)
+            return []
+
     def _find_device(self) -> None:
-        """Find a supported CPU hwmon device (prefer AMD drivers over coretemp)."""
         if not HWMON_BASE.exists():
+            return
+        try:
+            devices = sorted(HWMON_BASE.iterdir())
+        except OSError:
+            log.debug("Unable to enumerate hwmon devices", exc_info=True)
             return
 
         fallback: Path | None = None
-        for hwmon_dir in sorted(HWMON_BASE.iterdir()):
-            name_file = hwmon_dir / "name"
-            if name_file.exists():
-                try:
-                    name = name_file.read_text().strip()
-                except OSError:
-                    continue
-                if name in self._PREFERRED:
-                    self._hwmon_path = hwmon_dir
-                elif name in self._FALLBACK and fallback is None:
-                    fallback = hwmon_dir
-                elif any(name.startswith(c) for c in _SUPERIO_CHIPS):
-                    # Super I/O chip — use as voltage fallback (in0 = Vcore on most boards)
-                    self._superio_path = hwmon_dir
-
-        if self._hwmon_path is None and fallback is not None:
+        for hwmon_dir in devices:
+            name = read_text_optional(hwmon_dir / "name")
+            if name is None:
+                continue
+            if name in self._PREFERRED:
+                self._hwmon_path = hwmon_dir
+            elif name in self._FALLBACK and fallback is None:
+                fallback = hwmon_dir
+            elif any(name.startswith(chip) for chip in _SUPERIO_CHIPS):
+                self._superio_path = hwmon_dir
+        if self._hwmon_path is None:
             self._hwmon_path = fallback
 
     def is_available(self) -> bool:
@@ -91,69 +107,57 @@ class HWMonReader:
 
     def read(self) -> HWMonData:
         data = HWMonData()
-        if not self._hwmon_path:
+        if self._hwmon_path is None:
             return data
 
-        # read all temp inputs and their labels
-        for temp_file in sorted(self._hwmon_path.glob("temp*_input")):
-            try:
-                temp_c = int(temp_file.read_text().strip()) / 1000.0
-            except (ValueError, OSError):
+        for temp_file in self._glob(self._hwmon_path, "temp*_input"):
+            raw = read_int_optional(temp_file)
+            if raw is None:
                 continue
+            temperature = raw / 1000.0
+            label = read_text_optional(temp_file.with_name(temp_file.name.replace("_input", "_label"))) or ""
+            normalized = _normalized_label(label)
+            if "tctl" in normalized:
+                data.tctl_c = temperature
+            elif "tdie" in normalized:
+                data.tdie_c = temperature
+            elif match := re.search(r"tccd(\d+)", normalized):
+                ccd_index = int(match.group(1)) - 1
+                if ccd_index >= 0:
+                    data.ccd_temperatures_c[ccd_index] = temperature
+            elif data.tctl_c is None:
+                data.tctl_c = temperature
 
-            label_file = temp_file.parent / temp_file.name.replace("_input", "_label")
-            label = ""
-            if label_file.exists():
-                with contextlib.suppress(OSError):
-                    label = label_file.read_text().strip().lower()
-
-            if "tctl" in label:
-                data.tctl_c = temp_c
-            elif "tdie" in label:
-                data.tdie_c = temp_c
-            elif "tccd" in label:
-                # extract CCD number from label like "Tccd1", "Tccd2"
-                m = re.search(r"tccd(\d+)", label)
-                if m:
-                    data.tccd_temps[int(m.group(1))] = temp_c
-            elif not data.tctl_c:
-                # fallback: first unlabeled temp is likely Tctl
-                data.tctl_c = temp_c
-
-        # read voltage inputs (SVI2) from CPU driver
-        for in_file in sorted(self._hwmon_path.glob("in*_input")):
-            try:
-                mv = int(in_file.read_text().strip())
-                voltage = mv / 1000.0
-            except (ValueError, OSError):
+        for input_file in self._glob(self._hwmon_path, "in*_input"):
+            raw = read_int_optional(input_file)
+            if raw is None:
                 continue
+            label = read_text_optional(input_file.with_name(input_file.name.replace("_input", "_label"))) or ""
+            normalized = _normalized_label(label)
+            if normalized in self._VSOC_LABELS:
+                data.vsoc_v = raw / 1000.0
+            elif normalized in self._VCORE_LABELS:
+                data.vcore_v = raw / 1000.0
 
-            label_file = in_file.parent / in_file.name.replace("_input", "_label")
-            label = ""
-            if label_file.exists():
-                with contextlib.suppress(OSError):
-                    label = label_file.read_text().strip().lower()
-
-            if "vsoc" in label or "svi2_vddnb" in label:
-                data.vsoc_v = voltage
-            elif "vcore" in label or "svi2_vdd" in label:
-                data.vcore_v = voltage
-
-        # Fallback: read Vcore from Super I/O chip
-        # Needed for Zen 5 which uses SVI3 — not yet supported by CPU drivers
-        # Scan labels to find the correct input (e.g. nct6687 uses in4, not in0)
         if data.vcore_v is None and self._superio_path is not None:
-            vcore_input = None
-            for label_file in sorted(self._superio_path.glob("in*_label")):
-                with contextlib.suppress(ValueError, OSError):
-                    label = label_file.read_text().strip().lower()
-                    if "vcore" in label:
-                        vcore_input = label_file.with_name(label_file.name.replace("_label", "_input"))
-                        break
-            if vcore_input is None:
-                vcore_input = self._superio_path / "in0_input"
-            if vcore_input.exists():
-                with contextlib.suppress(ValueError, OSError):
-                    data.vcore_v = int(vcore_input.read_text().strip()) / 1000.0
+            for label_file in self._glob(self._superio_path, "in*_label"):
+                label = read_text_optional(label_file)
+                if label is None or _normalized_label(label) not in self._VCORE_LABELS:
+                    continue
+                raw = read_int_optional(label_file.with_name(label_file.name.replace("_label", "_input")))
+                if raw is not None:
+                    data.vcore_v = raw / 1000.0
+                break
 
         return data
+
+    def max_cpu_temp(self) -> float | None:
+        """Return the hottest readable CPU temperature, including coretemp cores."""
+        if self._hwmon_path is None:
+            return None
+        temperatures = [
+            raw / 1000.0
+            for temp_file in self._glob(self._hwmon_path, "temp*_input")
+            if (raw := read_int_optional(temp_file)) is not None
+        ]
+        return max(temperatures) if temperatures else None

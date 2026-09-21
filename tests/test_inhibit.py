@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import subprocess
 import sys as _sys
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -16,10 +18,16 @@ from corecycler import inhibit
 _real_spawn = inhibit._spawn
 
 
-def _fake_proc() -> MagicMock:
+def _fake_proc(*, wait_for_release: bool = False) -> MagicMock:
     proc = MagicMock(spec=subprocess.Popen)
     proc.pid = 4242
     proc.stdin = MagicMock()
+    if wait_for_release:
+        released = threading.Event()
+        proc.stdin.close.side_effect = released.set
+        proc.wait.side_effect = lambda timeout=None: (
+            0 if released.wait(timeout) else (_ for _ in ()).throw(subprocess.TimeoutExpired("fake", timeout))
+        )
     return proc
 
 
@@ -87,9 +95,43 @@ class TestTerminate:
 
 
 class TestSharedLock:
-    def test_second_owner_reuses_the_one_process(self):
+    def test_reaps_an_inhibitor_that_exits_before_release(self):
         shared = inhibit._SharedLock()
         proc = _fake_proc()
+        proc.wait.return_value = 7
+        with patch("corecycler.inhibit._spawn", return_value=proc):
+            shared.claim("rejected")
+
+        deadline = time.monotonic() + 5
+        while shared.held and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert not shared.held
+        proc.wait.assert_called_once_with()
+        shared.drop()
+
+    def test_watcher_failure_leaves_the_inhibitor_for_release_to_reap(self, caplog):
+        shared = inhibit._SharedLock()
+        proc = _fake_proc()
+        proc.wait.side_effect = [OSError("wait failed"), None]
+        with patch("corecycler.inhibit._spawn", return_value=proc), caplog.at_level("DEBUG"):
+            shared.claim("rejected")
+            deadline = time.monotonic() + 5
+            while "watcher failed: wait failed" not in caplog.text and time.monotonic() < deadline:
+                time.sleep(0.01)
+
+        assert shared.held
+        assert "watcher failed: wait failed" in caplog.text
+
+        shared.drop()
+
+        assert not shared.held
+        proc.stdin.close.assert_called_once()
+        assert proc.wait.call_count == 2
+
+    def test_second_owner_reuses_the_one_process(self):
+        shared = inhibit._SharedLock()
+        proc = _fake_proc(wait_for_release=True)
         with patch("corecycler.inhibit._spawn", return_value=proc) as spawn:
             shared.claim("first")
             shared.claim("second")
@@ -98,7 +140,7 @@ class TestSharedLock:
 
     def test_the_lock_outlives_every_owner_but_the_last(self):
         shared = inhibit._SharedLock()
-        proc = _fake_proc()
+        proc = _fake_proc(wait_for_release=True)
         with patch("corecycler.inhibit._spawn", return_value=proc):
             shared.claim("first")
             shared.claim("second")
@@ -120,7 +162,7 @@ class TestSharedLock:
 class TestSleepInhibitor:
     def test_holding_twice_claims_once(self):
         shared = inhibit._SharedLock()
-        proc = _fake_proc()
+        proc = _fake_proc(wait_for_release=True)
         with (
             patch("corecycler.inhibit._shared", shared),
             patch("corecycler.inhibit._spawn", return_value=proc) as spawn,
@@ -140,7 +182,7 @@ class TestSleepInhibitor:
 
     def test_the_context_manager_releases_on_error(self):
         shared = inhibit._SharedLock()
-        proc = _fake_proc()
+        proc = _fake_proc(wait_for_release=True)
         with (
             patch("corecycler.inhibit._shared", shared),
             patch("corecycler.inhibit._spawn", return_value=proc),

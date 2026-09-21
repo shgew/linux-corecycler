@@ -2,135 +2,113 @@
 
 from __future__ import annotations
 
-import contextlib
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 
+from corecycler.monitor.files import read_int_optional, read_text_optional
+
+log = logging.getLogger(__name__)
+
 CPUFREQ_BASE = Path("/sys/devices/system/cpu")
+PROC_CPUINFO = Path("/proc/cpuinfo")
+
+
+def _cpu_directories() -> list[Path] | None:
+    try:
+        return sorted(CPUFREQ_BASE.iterdir())
+    except OSError:
+        log.debug("Unable to enumerate CPU frequency sysfs", exc_info=True)
+        return None
 
 
 def read_core_frequencies() -> dict[int, float]:
-    """Read current frequency (MHz) for each logical CPU.
-
-    Prefers ``cpuinfo_cur_freq`` (actual hardware frequency reported by the
-    driver) over ``scaling_cur_freq`` (governor *target* frequency).  On
-    amd_pstate active, scaling_cur_freq is the EPP target which can be lower
-    than the actual boost clock the CPU is running at.  Falls back to
-    /proc/cpuinfo ``cpu MHz`` which also reflects actual frequency.
-    """
-    freqs: dict[int, float] = {}
-
+    """Read current frequency (MHz) for each logical CPU."""
     if not CPUFREQ_BASE.exists():
         return _read_from_proc()
+    cpu_directories = _cpu_directories()
+    if cpu_directories is None:
+        return _read_from_proc()
 
-    for cpu_dir in sorted(CPUFREQ_BASE.iterdir()):
+    frequencies: dict[int, float] = {}
+    for cpu_dir in cpu_directories:
         if not cpu_dir.name.startswith("cpu") or not cpu_dir.name[3:].isdigit():
             continue
         cpu_id = int(cpu_dir.name[3:])
-
-        # Prefer cpuinfo_cur_freq (actual HW frequency) over scaling_cur_freq (target)
-        freq_file = cpu_dir / "cpufreq" / "cpuinfo_cur_freq"
-        if not freq_file.exists():
-            freq_file = cpu_dir / "cpufreq" / "scaling_cur_freq"
-        if not freq_file.exists():
-            continue
-
-        try:
-            khz = int(freq_file.read_text().strip())
-            freqs[cpu_id] = khz / 1000.0  # MHz
-        except (ValueError, OSError):
-            continue
-
-    return freqs if freqs else _read_from_proc()
+        cpufreq = cpu_dir / "cpufreq"
+        for name in ("cpuinfo_cur_freq", "scaling_cur_freq"):
+            khz = read_int_optional(cpufreq / name)
+            if khz is not None:
+                frequencies[cpu_id] = khz / 1000.0
+                break
+    return frequencies if frequencies else _read_from_proc()
 
 
-def _read_from_proc() -> dict[int, float]:
-    """Fallback: read frequencies from /proc/cpuinfo."""
-    freqs: dict[int, float] = {}
-    proc_cpuinfo = Path("/proc/cpuinfo")
-    if not proc_cpuinfo.exists():
-        return freqs
+def _read_from_proc(path: Path | None = None) -> dict[int, float]:
+    """Read fallback frequencies from procfs."""
+    text = read_text_optional(PROC_CPUINFO if path is None else path)
+    if text is None:
+        return {}
 
+    frequencies: dict[int, float] = {}
     current_cpu = -1
-    for line in proc_cpuinfo.read_text().splitlines():
+    for line in text.splitlines():
         if line.startswith("processor"):
             try:
                 current_cpu = int(line.split(":", 1)[1].strip())
             except (ValueError, IndexError):
                 current_cpu = -1
         elif line.startswith("cpu MHz") and current_cpu >= 0:
-            with contextlib.suppress(ValueError):
-                freqs[current_cpu] = float(line.split(":")[1].strip())
-
-    return freqs
+            try:
+                frequencies[current_cpu] = float(line.split(":", 1)[1].strip())
+            except (ValueError, IndexError):
+                continue
+    return frequencies
 
 
 @dataclass(slots=True)
 class CoreFreqReading:
-    """Per-core frequency reading with actual vs effective max for stretch detection."""
+    """A logical CPU's actual frequency and configured boost ceiling."""
 
-    actual_mhz: float  # current APERF/MPERF-derived frequency
-    effective_max_mhz: float  # scaling_max_freq — what this core *should* reach under load
+    actual_mhz: float
+    effective_max_mhz: float
 
 
 def read_core_frequencies_dual() -> dict[int, CoreFreqReading]:
-    """Read actual frequency and effective max for each logical CPU.
-
-    On amd_pstate active, both scaling_cur_freq and cpuinfo_avg_freq reflect
-    APERF/MPERF-derived actual frequency (they're identical).  The
-    ``scaling_max_freq`` is the per-core boost ceiling.
-
-    During a stress test, if actual << effective_max, the core is clock
-    stretching — a sign of CO instability or power/thermal limiting.
-    """
-    result: dict[int, CoreFreqReading] = {}
-
+    """Read actual frequency and effective maximum for each logical CPU."""
     if not CPUFREQ_BASE.exists():
-        return result
+        return {}
+    cpu_directories = _cpu_directories()
+    if cpu_directories is None:
+        return {}
 
-    for cpu_dir in sorted(CPUFREQ_BASE.iterdir()):
+    result: dict[int, CoreFreqReading] = {}
+    for cpu_dir in cpu_directories:
         if not cpu_dir.name.startswith("cpu") or not cpu_dir.name[3:].isdigit():
             continue
         cpu_id = int(cpu_dir.name[3:])
         cpufreq = cpu_dir / "cpufreq"
-
-        # Actual frequency (prefer cpuinfo_cur_freq → cpuinfo_avg_freq → scaling_cur_freq)
-        actual = None
-        for fname in ("cpuinfo_cur_freq", "cpuinfo_avg_freq", "scaling_cur_freq"):
-            f = cpufreq / fname
-            if f.exists():
-                try:
-                    actual = int(f.read_text().strip()) / 1000.0
-                    break
-                except (ValueError, OSError):
-                    continue
-
-        # Effective max (scaling_max_freq — boost ceiling for this core)
-        eff_max = None
-        max_file = cpufreq / "scaling_max_freq"
-        if max_file.exists():
-            with contextlib.suppress(ValueError, OSError):
-                eff_max = int(max_file.read_text().strip()) / 1000.0
-
-        if actual is not None and eff_max is not None:
-            result[cpu_id] = CoreFreqReading(actual_mhz=actual, effective_max_mhz=eff_max)
-
+        actual_khz = None
+        for name in ("cpuinfo_cur_freq", "cpuinfo_avg_freq", "scaling_cur_freq"):
+            actual_khz = read_int_optional(cpufreq / name)
+            if actual_khz is not None:
+                break
+        maximum_khz = read_int_optional(cpufreq / "scaling_max_freq")
+        if actual_khz is not None and maximum_khz is not None:
+            result[cpu_id] = CoreFreqReading(
+                actual_mhz=actual_khz / 1000.0,
+                effective_max_mhz=maximum_khz / 1000.0,
+            )
     return result
 
 
 def read_max_frequency(cpu_id: int = 0) -> float | None:
     """Read the maximum boost frequency for a CPU (MHz)."""
-    path = CPUFREQ_BASE / f"cpu{cpu_id}" / "cpufreq" / "cpuinfo_max_freq"
-    if path.exists():
-        with contextlib.suppress(ValueError, OSError):
-            return int(path.read_text().strip()) / 1000.0
-    return None
+    khz = read_int_optional(CPUFREQ_BASE / f"cpu{cpu_id}" / "cpufreq" / "cpuinfo_max_freq")
+    return None if khz is None else khz / 1000.0
 
 
 def read_min_frequency(cpu_id: int = 0) -> float | None:
     """Read the minimum frequency for a CPU (MHz)."""
-    path = CPUFREQ_BASE / f"cpu{cpu_id}" / "cpufreq" / "cpuinfo_min_freq"
-    if path.exists():
-        with contextlib.suppress(ValueError, OSError):
-            return int(path.read_text().strip()) / 1000.0
-    return None
+    khz = read_int_optional(CPUFREQ_BASE / f"cpu{cpu_id}" / "cpufreq" / "cpuinfo_min_freq")
+    return None if khz is None else khz / 1000.0

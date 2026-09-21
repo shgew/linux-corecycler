@@ -99,7 +99,7 @@ class LiveChart(QWidget):
         series_color = QColor(getattr(theme, self.series))
         painter.setPen(QPen(series_color, 2))
         if n == 1:
-            # single point — draw a visible dot
+            # Draw a visible dot for a single point.
             painter.drawEllipse(path.currentPosition(), 3, 3)
         else:
             painter.drawPath(path)

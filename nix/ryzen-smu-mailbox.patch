@@ -1,0 +1,27 @@
+diff --git a/smu.c b/smu.c
+--- a/smu.c
++++ b/smu.c
+@@ -210,7 +210,7 @@ enum smu_return_val smu_send_command(struct pci_dev *dev, u32 op,
+   // Step 6: If the Response register contains OK, then SMU has finished
+   // processing
+   //  the message.
+-  if (tmp != SMU_Return_OK && !retries) {
++  if (tmp != SMU_Return_OK) {
+     mutex_unlock(&amd_smu_mutex);
+ 
+     // The RSP register is still 0, the SMU is still processing the request or
+diff --git a/drv.c b/drv.c
+--- a/drv.c
++++ b/drv.c
+@@ -244,8 +244,10 @@ size_t count) {
+             // One word written means we read this address at buff[0]
+             address = *(u32*)buff;
+ 
+-            if (smu_read_address(g_driver.device, address, &g_driver.smn_result) != SMU_Return_OK)
++            if (smu_read_address(g_driver.device, address, &g_driver.smn_result) != SMU_Return_OK) {
+                 pr_debug("Failed to read SMN address 0x%x\n", address);
++                return -EIO;
++            }
+             break;
+         case (sizeof(u32) * 2):
+             // Two words written means we write the second word to the address of the first word

@@ -23,6 +23,9 @@ class RecordingBackend:
     def cleanup(self, work_dir, *, preserve_on_error: bool = False) -> None:
         self.cleaned.append((Path(work_dir), preserve_on_error))
 
+    def default_memory_mb(self, lanes: int = 1) -> int | None:
+        return None
+
 
 class ScriptedSupervisor:
     script: ClassVar[list] = []
@@ -51,7 +54,7 @@ def scripted(monkeypatch):
 def make_topo(cores: dict[int, tuple[int, ...]] | None = None) -> CPUTopology:
     topo = CPUTopology()
     for core_id, cpus in (cores or {0: (16, 0), 1: (1, 17)}).items():
-        topo.cores[core_id] = PhysicalCore(core_id=core_id, ccd=0, ccx=None, logical_cpus=cpus)
+        topo.cores[core_id] = PhysicalCore(core_id=core_id, ccd=0, logical_cpus=cpus)
     return topo
 
 
@@ -80,6 +83,51 @@ def bad(core_id: int) -> StressResult:
 
 
 class TestLaneBuilding:
+    def test_explicit_empty_core_selection_runs_no_lanes(self, tmp_path):
+        runner = make_parallel(tmp_path, cores=[])
+        assert runner.run() == {}
+        assert ScriptedSupervisor.created == []
+
+    def test_one_thread_lanes_retain_all_siblings_for_mce_attribution(self, tmp_path):
+        runner = make_parallel(tmp_path, cores=[1])
+        seen: list[tuple[int, ...]] = []
+
+        def inspect(sup, lanes, config_for, duration):
+            seen.append(lanes[0].sibling_cpus)
+            return {1: ok(1)}
+
+        ScriptedSupervisor.script = [inspect]
+        runner.run()
+        assert seen == [(1, 17)]
+
+    def test_lanes_share_one_backend_memory_budget(self, tmp_path):
+        class MemoryBackend(RecordingBackend):
+            def default_memory_mb(self, lanes: int = 1) -> int | None:
+                assert lanes == 2
+                return 512 // lanes
+
+        runner = make_parallel(tmp_path, backend=MemoryBackend())
+        seen: list[int | None] = []
+
+        def inspect(sup, lanes, config_for, duration):
+            seen.extend(config_for(one).memory_mb for one in lanes)
+            return {one.core_id: ok(one.core_id) for one in lanes}
+
+        ScriptedSupervisor.script = [inspect]
+        runner.run()
+        assert seen == [256, 256]
+
+    def test_memory_budget_too_small_for_every_lane_is_an_apparatus_failure(self, tmp_path):
+        runner = make_parallel(tmp_path)
+        runner.stress_config.memory_mb = 1
+
+        results = runner.run()
+
+        assert ScriptedSupervisor.created == []
+        assert set(results) == {0, 1}
+        assert all(result.error_type == "startup" for result in results.values())
+        assert all("memory budget is too small" in (result.error_message or "") for result in results.values())
+
     def test_lanes_cover_every_core_with_sorted_cpus(self, tmp_path):
         runner = make_parallel(tmp_path)
         runner.stress_config.threads = 2

@@ -162,7 +162,7 @@ def test_co_read_answers_on_every_slot_so_it_cannot_find_fused_off_cores():
     require(commands.uniform_8core_ccds, "requires a classic 8-slot-per-CCD die")
     require(RyzenSMU.is_available(), "requires the ryzen_smu module")
     smu = RyzenSMU(commands)
-    require(smu.check_writable()[0], "requires ryzen_smu mailbox access")
+    require_privileged(smu.check_writable()[0], "requires ryzen_smu mailbox access")
     ccds = {c.ccd for c in detect_topology().cores.values() if c.ccd is not None}
     require(bool(ccds), "requires L3-detected CCDs")
     for ccd in sorted(ccds):
@@ -170,3 +170,85 @@ def test_co_read_answers_on_every_slot_so_it_cannot_find_fused_off_cores():
             slot for slot in range(8) if smu._send_get_co(encode_co_arg(0, 0, generation, ccd=ccd, slot=slot)).success
         ]
         assert answered == list(range(8)), (ccd, answered)
+
+
+def _l3_size_kib(logical_cpu: int) -> int:
+    cache_dir = Path(f"/sys/devices/system/cpu/cpu{logical_cpu}/cache")
+    for index in cache_dir.glob("index*"):
+        if (index / "level").read_text().strip() != "3":
+            continue
+        raw = (index / "size").read_text().strip().upper()
+        multiplier = {"K": 1, "M": 1024, "G": 1024 * 1024}[raw[-1]]
+        return int(raw[:-1]) * multiplier
+    raise AssertionError(f"no L3 cache for logical CPU {logical_cpu}")
+
+
+def test_9950x3d2_dual_vcache_layout():
+    info = _read_cpuinfo()
+    require(info is not None and "9950X3D2" in info[2], "requires a Ryzen 9 9950X3D2")
+    assert info is not None
+    assert info[:2] == (0x1A, 0x44)
+
+    from corecycler.engine.topology import detect_topology
+
+    topology = detect_topology()
+    assert topology.physical_cores == 16
+    assert topology.logical_cpus_count == 32
+    assert topology.ccds == 2
+    assert topology.is_x3d
+    per_ccd = {ccd: [core for core in topology.cores.values() if core.ccd == ccd] for ccd in range(2)}
+    assert {ccd: len(cores) for ccd, cores in per_ccd.items()} == {0: 8, 1: 8}
+    assert all(core.has_vcache for cores in per_ccd.values() for core in cores)
+    l3_sizes = {
+        ccd: _l3_size_kib(min(cores, key=lambda core: core.core_id).logical_cpus[0]) for ccd, cores in per_ccd.items()
+    }
+    assert l3_sizes == {0: 96 * 1024, 1: 96 * 1024}
+
+
+def test_ryzen_smu_sysfs_exposes_required_nodes():
+    info = _read_cpuinfo()
+    require(info is not None and _is_amd_zen(), "requires a real AMD Zen CPU")
+    assert info is not None
+    commands = get_commands(detect_generation(*info))
+    require(commands is not None, "requires a supported ryzen_smu generation")
+
+    from corecycler.smu.driver import SYSFS_BASE
+
+    require(SYSFS_BASE.is_dir(), "requires the ryzen_smu module")
+    nodes = {path.name for path in SYSFS_BASE.iterdir()}
+    command_node = "mp1_smu_cmd" if commands.mailbox == "mp1" else "rsmu_cmd"
+    required_nodes = {"smu_args", "smn", command_node}
+    if commands.get_co_mailbox == "rsmu":
+        required_nodes.add("rsmu_cmd")
+    assert required_nodes <= nodes
+    pm_nodes = {"pm_table", "pm_table_version", "pm_table_size"}
+    present_pm_nodes = pm_nodes & nodes
+    assert not present_pm_nodes or present_pm_nodes == pm_nodes
+
+
+def test_granite_ridge_core_disable_fuse_matches_live_slots():
+    info = _read_cpuinfo()
+    require(info is not None and info[:2] == (0x1A, 0x44), "requires Granite Ridge family 0x1A model 0x44")
+    assert info is not None
+    commands = get_commands(CPUGeneration.ZEN5_GRANITE_RIDGE)
+    assert commands is not None and commands.core_fuse_addr == 0x304A03DC
+
+    from corecycler.engine.topology import detect_topology
+    from corecycler.smu.driver import RyzenSMU
+
+    require(RyzenSMU.is_available(), "requires the ryzen_smu module")
+    smu = RyzenSMU(commands)
+    smn_ok, smn_message = smu.check_smn_readable()
+    require_privileged(smn_ok, f"requires SMN access: {smn_message}")
+    topology = detect_topology()
+    assert topology.physical_cores == 16 and topology.ccds == 2
+    smu.set_topology(topology)
+    assert smu.core_map_error is None
+    per_ccd: dict[int, list[int]] = {0: [], 1: []}
+    for ccd, slot in smu.core_map.values():
+        per_ccd[ccd].append(slot)
+    for ccd in (0, 1):
+        fuse = smu.read_smn(0x304A03DC + (ccd << 25))
+        assert fuse is not None
+        live_slots = [slot for slot in range(8) if not (fuse >> slot) & 1]
+        assert sorted(per_ccd[ccd]) == live_slots

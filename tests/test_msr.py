@@ -163,7 +163,7 @@ class TestCorePower:
         assert result == {}
 
     def test_clock_stretch_does_not_affect_power(self):
-        """Verify separated snapshot state — clock stretch reads don't corrupt power reads."""
+        """Verify separated state: clock stretch reads do not corrupt power reads."""
         reader = self._make_reader()
 
         # Seed perf snapshot (clock stretch baseline)
@@ -172,14 +172,14 @@ class TestCorePower:
         # Seed energy snapshot (power baseline)
         reader._energy_prev[0] = _EnergySnapshot(energy_raw=1000000, timestamp=100.0)
 
-        # Read clock stretch — should NOT touch energy state
+        # Read clock stretch without touching energy state.
         with patch.object(reader, "_read_msr", side_effect=[2000, 2000]):
             reader.read_clock_stretch([0])
 
         # Energy snapshot should be untouched
         assert reader._energy_prev[0].energy_raw == 1000000
 
-        # Read power — should compute correct watts from energy snapshot
+        # Read power and compute correct watts from the energy snapshot.
         with (
             patch.object(reader, "_read_msr", return_value=1000000 + 163840),
             patch("time.monotonic", return_value=101.0),

@@ -9,18 +9,21 @@ import re
 import signal
 import subprocess
 import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import TYPE_CHECKING
 
+from corecycler.config import tools
 from corecycler.engine import containment
 from corecycler.engine.backends.base import KILLED_BY_US_CODES, StressResult
 from corecycler.engine.duty import DutyCycleDriver
+from corecycler.monitor.cpu_usage import read_cpu_times
+from corecycler.monitor.hwmon import HWMonReader
 
 if TYPE_CHECKING:
-    import threading
     from collections.abc import Callable
+    from pathlib import Path
     from typing import TextIO
 
     from corecycler.engine.backends.base import StressBackend, StressConfig
@@ -40,10 +43,15 @@ class Lane:
     core_id: int
     cpus: tuple[int, ...]
     work_dir: Path
+    sibling_cpus: tuple[int, ...] = ()
 
     @property
     def cpu_list(self) -> str:
         return containment.cpu_list(self.cpus)
+
+    @property
+    def mce_cpus(self) -> tuple[int, ...]:
+        return self.sibling_cpus or self.cpus
 
 
 @dataclass(slots=True)
@@ -60,17 +68,28 @@ class _LaneRun:
     inactive_runnable_seconds: float = 0.0
     unit: str | None = None
     cgroup: str | None = None
+    pgid: int | None = None
     stdout: str = ""
     stderr: str = ""
-
-    we_killed: bool = False
     stdout_file: TextIO | None = None
     stderr_file: TextIO | None = None
     duty_driver: DutyCycleDriver | None = None
+    termination: TerminationOutcome | None = None
 
     @property
     def running(self) -> bool:
         return self.verdict is None and self.proc is not None and self.proc.returncode is None
+
+
+@dataclass(frozen=True, slots=True)
+class TerminationOutcome:
+    sent_signals: tuple[int, ...] = ()
+    group_gone: bool = True
+    scope_gone: bool = True
+
+    @property
+    def all_gone(self) -> bool:
+        return self.group_gone and self.scope_gone
 
 
 @dataclass(slots=True)
@@ -107,7 +126,7 @@ class ThermalWatch:
         temp = self._read()
         self.last_temperature = temp
         if temp is None:
-            return not self.require_sensor
+            return not self.require_sensor and not self.tripped
         limit = self.max_temperature
         if temp >= limit:
             if temp >= limit + self.hard_margin:
@@ -132,43 +151,7 @@ class ThermalWatch:
 
 
 def read_cpu_temperature() -> float | None:
-    hwmon_base = Path("/sys/class/hwmon")
-    if not hwmon_base.exists():
-        return None
-    with contextlib.suppress(OSError):
-        for hwmon_dir in hwmon_base.iterdir():
-            name_file = hwmon_dir / "name"
-            if not name_file.exists():
-                continue
-            try:
-                name = name_file.read_text().strip()
-            except OSError:
-                continue
-            if name not in ("k10temp", "coretemp", "zenpower", "zenpower3"):
-                continue
-            max_temp = 0.0
-            for temp_input in sorted(hwmon_dir.glob("temp*_input")):
-                try:
-                    temp_c = int(temp_input.read_text().strip()) / 1000.0
-                except (ValueError, OSError):
-                    continue
-                max_temp = max(max_temp, temp_c)
-            if max_temp > 0:
-                return max_temp
-    return None
-
-
-def make_preexec():
-    def _preexec():
-        os.setsid()
-        import ctypes
-        import ctypes.util
-
-        libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
-        PR_SET_PDEATHSIG = 1
-        libc.prctl(PR_SET_PDEATHSIG, signal.SIGKILL)
-
-    return _preexec
+    return HWMonReader().max_cpu_temp()
 
 
 def _exited_without_reaping(proc: subprocess.Popen) -> bool:
@@ -197,52 +180,93 @@ def _wait_for_exit_without_reaping(proc: subprocess.Popen, timeout: float) -> bo
         time.sleep(min(0.05, remaining))
 
 
-def kill_process_group(proc: subprocess.Popen) -> None:
+def _process_group_gone(pgid: int) -> bool:
     try:
-        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, 0)
     except ProcessLookupError:
-        pgid = None
-    if pgid is not None:
-        if pgid != proc.pid:
-            raise RuntimeError("Refusing to signal an unowned process group")
+        return True
+    except PermissionError:
+        return False
+    return False
+
+
+def _wait_for_group_exit(pgid: int, timeout: float) -> bool:
+    deadline = time.monotonic() + timeout
+    while not _process_group_gone(pgid):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(0.05, remaining))
+    return True
+
+
+def kill_process_group(proc: subprocess.Popen, pgid: int | None = None) -> TerminationOutcome:
+    if pgid is None:
+        try:
+            pgid = os.getpgid(proc.pid)
+        except ProcessLookupError:
+            pgid = proc.pid
+    if pgid != proc.pid:
+        raise RuntimeError("Refusing to signal an unowned process group")
+    sent: list[int] = []
+    if not _process_group_gone(pgid):
         with contextlib.suppress(ProcessLookupError):
             os.killpg(pgid, signal.SIGTERM)
-        observed_exit = _wait_for_exit_without_reaping(proc, 3)
-        if observed_exit is None:
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                with contextlib.suppress(ProcessLookupError):
-                    os.killpg(pgid, signal.SIGKILL)
-                with contextlib.suppress(subprocess.TimeoutExpired):
-                    proc.wait(timeout=2)
-        else:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(pgid, signal.SIGKILL)
-            with contextlib.suppress(subprocess.TimeoutExpired):
-                proc.wait(timeout=2)
+            sent.append(signal.SIGTERM)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=3.0)
+    group_gone = _wait_for_group_exit(pgid, 3.0)
+    if not group_gone:
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(pgid, signal.SIGKILL)
+            sent.append(signal.SIGKILL)
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=2.0)
+        group_gone = _wait_for_group_exit(pgid, 2.0)
     for stream in (proc.stdout, proc.stderr):
         if stream:
             with contextlib.suppress(OSError):
                 stream.close()
+    return TerminationOutcome(tuple(sent), group_gone=group_gone)
 
 
-def reap_zombies() -> None:
-    with contextlib.suppress(ChildProcessError):
-        while True:
-            pid, _ = os.waitpid(-1, os.WNOHANG)
-            if pid == 0:
-                break
-
-
-def cpu_times(cpu_id: int) -> tuple[int, int] | None:
-    with contextlib.suppress(OSError, ValueError, IndexError), open("/proc/stat") as f:
-        prefix = f"cpu{cpu_id} "
-        for line in f:
-            if line.startswith(prefix):
-                vals = [int(x) for x in line.split()[1:]]
-                return vals[3] + vals[4], sum(vals)
-    return None
+def _kill_scope(unit: str) -> bool:
+    resolution = tools.resolve("systemctl")
+    if resolution.path is None:
+        return False
+    command = [str(resolution.path)]
+    if os.geteuid() != 0:
+        command.append("--user")
+    scope = f"{unit}.scope"
+    try:
+        result = subprocess.run(
+            command + ["kill", "--kill-whom=all", "--signal=SIGKILL", scope],
+            capture_output=True,
+            text=True,
+            timeout=5.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return "not loaded" in result.stderr.lower()
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        try:
+            state = subprocess.run(
+                command + ["show", "--property=ActiveState", "--value", scope],
+                capture_output=True,
+                text=True,
+                timeout=max(0.1, deadline - time.monotonic()),
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if state.returncode != 0:
+            missing = state.stderr.lower()
+            return "not found" in missing or "not loaded" in missing
+        if state.stdout.strip() in {"inactive", "failed"}:
+            return True
+        time.sleep(0.05)
+    return False
 
 
 def busy_fraction(prev: tuple[int, int] | None, now: tuple[int, int] | None) -> float | None:
@@ -275,6 +299,7 @@ class Supervisor:
         phase: str = "stress",
         hooks: SuperviseHooks | None = None,
         containment_for: Callable[[tuple[int, ...]], containment.Containment | None] | None = None,
+        scope_terminator: Callable[[str], bool] | None = None,
     ) -> None:
         self.backend = backend
         self.detector = detector
@@ -287,6 +312,10 @@ class Supervisor:
         self.phase = phase
         self.hooks = hooks or SuperviseHooks()
         self._containment_for = containment_for or containment.contain
+        self._runs_lock = threading.Lock()
+        self._teardown_lock = threading.Lock()
+        self._scope_terminator = scope_terminator or _kill_scope
+        self._active_runs: list[_LaneRun] = []
 
     def run(
         self,
@@ -296,27 +325,39 @@ class Supervisor:
     ) -> dict[int, StressResult | None]:
         runs = [_LaneRun(lane=lane) for lane in lanes]
         start = time.monotonic()
+        with self._runs_lock:
+            if self._active_runs:
+                raise RuntimeError("supervisor is already running")
+            self._active_runs = runs
 
-        with contextlib.ExitStack() as resources:
-            try:
-                for run in runs:
-                    try:
-                        run.stdout_file = resources.enter_context(
-                            tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
-                        )
-                        run.stderr_file = resources.enter_context(
-                            tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
-                        )
-                    except OSError as exc:
-                        self._fail(run, f"Failed to start stress output capture: {exc}", start, error_type="startup")
-                        break
-                    if not self._launch(run, config_for(run.lane), start):
-                        break
-                if any(run.running for run in runs):
-                    self._poll_until_done(runs, start, duration)
-            finally:
-                self._finish(runs, start, duration)
-        return {run.lane.core_id: run.verdict for run in runs}
+        try:
+            if self._thermal_failed(runs, start, startup=True):
+                return {run.lane.core_id: run.verdict for run in runs}
+            with contextlib.ExitStack() as resources:
+                try:
+                    for run in runs:
+                        try:
+                            run.stdout_file = resources.enter_context(
+                                tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
+                            )
+                            run.stderr_file = resources.enter_context(
+                                tempfile.TemporaryFile(mode="w+t", encoding="utf-8", errors="replace")
+                            )
+                        except OSError as exc:
+                            self._fail(
+                                run, f"Failed to start stress output capture: {exc}", start, error_type="startup"
+                            )
+                            break
+                        if not self._launch(run, config_for(run.lane), start):
+                            break
+                    if any(run.running for run in runs):
+                        self._poll_until_done(runs, start, duration)
+                finally:
+                    self._finish(runs, start, duration)
+            return {run.lane.core_id: run.verdict for run in runs}
+        finally:
+            with self._runs_lock:
+                self._active_runs = []
 
     def _launch(self, run: _LaneRun, cfg: StressConfig, batch_start: float) -> bool:
         lane = run.lane
@@ -324,7 +365,7 @@ class Supervisor:
             self.backend.prepare(lane.work_dir, cfg)
             self.backend.assert_prepared(lane.work_dir)
             contained = self._containment_for(lane.cpus)
-            prefix = contained.prefix if contained is not None else []
+            prefix = list(contained.prefix) if contained is not None else []
             run.unit = contained.unit if contained is not None else None
             cmd = prefix + self.backend.get_command(cfg, lane.work_dir)
         except (OSError, RuntimeError) as exc:
@@ -332,17 +373,21 @@ class Supervisor:
             self._fail(run, f"Failed to start stress test: {exc}", batch_start, error_type="startup")
             return False
         try:
-            run.proc = subprocess.Popen(
-                cmd,
-                stdout=run.stdout_file,
-                stderr=run.stderr_file,
-                text=True,
-                cwd=str(lane.work_dir),
-                preexec_fn=make_preexec(),
-            )
-            if cfg.duty_cycle is not None:
-                run.duty_driver = DutyCycleDriver(cfg.duty_cycle, run.proc.pid)
-                run.duty_driver.start()
+            with self._teardown_lock:
+                if self.stop_event.is_set():
+                    return False
+                run.proc = subprocess.Popen(
+                    cmd,
+                    stdout=run.stdout_file,
+                    stderr=run.stderr_file,
+                    text=True,
+                    cwd=str(lane.work_dir),
+                    start_new_session=True,
+                )
+                run.pgid = run.proc.pid
+                if cfg.duty_cycle is not None:
+                    run.duty_driver = DutyCycleDriver(cfg.duty_cycle, run.pgid)
+                    run.duty_driver.start()
         except (OSError, RuntimeError, TypeError) as exc:
             log.error("core %d: stress process failed to start: %s", lane.core_id, exc)
             self._fail(run, f"Failed to start stress test: {exc}", batch_start, error_type="startup")
@@ -356,24 +401,9 @@ class Supervisor:
 
     def _poll_until_done(self, runs: list[_LaneRun], start: float, duration: float) -> None:
         deadline = start + duration
-        last_error_poll = start
-        while not self.stop_event.is_set() and time.monotonic() < deadline:
-            if self._poll_exits_stalls_watchdog(runs, start):
-                break
-            if not any(run.running for run in runs):
-                break
-            if not self.thermal.safe():
-                temp = self.thermal.last_temperature
-                if self.hooks.on_thermal and temp is not None:
-                    self.hooks.on_thermal(temp)
-                first = min((r for r in runs if r.verdict is None), default=None, key=lambda r: r.lane.core_id)
-                if first is not None:
-                    self._fail(
-                        first,
-                        f"CPU temperature exceeded {self.thermal.max_temperature} C safety limit during {self.phase}",
-                        start,
-                    )
-                self.stop_event.set()
+        last_error_poll = start - ERROR_POLL_INTERVAL
+        while not self.stop_event.is_set():
+            if self._thermal_failed(runs, start):
                 break
             if self._apply_mce_events(runs, start):
                 break
@@ -382,10 +412,42 @@ class Supervisor:
                 last_error_poll = now
                 if self._poll_backend_errors(runs, start):
                     break
+            if self._poll_exits(runs, start, now):
+                break
+            if not any(run.running for run in runs):
+                break
+            if self._poll_containment(runs, start, now):
+                break
+            snapshot = read_cpu_times()
+            if self._poll_stalls(runs, start, now, snapshot):
+                break
+            if now >= deadline:
+                break
             for run in runs:
                 if run.running and self.hooks.on_status:
                     self.hooks.on_status(run.lane.core_id, now - start)
-            self.stop_event.wait(self.poll_interval)
+            self.stop_event.wait(min(self.poll_interval, max(0.0, deadline - now)))
+
+    def _thermal_failed(self, runs: list[_LaneRun], start: float, *, startup: bool = False) -> bool:
+        if self.thermal.safe():
+            return False
+        temp = self.thermal.last_temperature
+        if self.hooks.on_thermal and temp is not None:
+            self.hooks.on_thermal(temp)
+        first = min((run for run in runs if run.verdict is None), default=None, key=lambda run: run.lane.core_id)
+        if first is not None:
+            if temp is None and startup:
+                message = f"Required CPU temperature sensor unavailable before {self.phase} launch"
+                error_type = "startup"
+            elif temp is None:
+                message = f"CPU temperature sensor disappeared after a thermal trip during {self.phase}"
+                error_type = "thermal"
+            else:
+                message = f"CPU temperature exceeded {self.thermal.max_temperature} C safety limit during {self.phase}"
+                error_type = "thermal"
+            self._fail(first, message, start, error_type=error_type)
+        self.stop_event.set()
+        return True
 
     def _apply_mce_events(self, runs: list[_LaneRun], start: float, *, force: bool = False) -> bool:
         try:
@@ -397,18 +459,25 @@ class Supervisor:
             self.stop_event.set()
             return True
         self.observed.extend(events)
-        cpu_to_run = {cpu: run for run in runs for cpu in run.lane.cpus}
+        cpu_to_run = {cpu: run for run in runs for cpu in run.lane.mce_cpus}
         hit = False
         for event in events:
             if event.cpu == -1:
                 run = min(
-                    (r for r in runs if r.verdict is None or r.verdict.passed),
+                    (candidate for candidate in runs if candidate.verdict is None or candidate.verdict.passed),
                     default=None,
-                    key=lambda r: r.lane.core_id,
+                    key=lambda candidate: candidate.lane.core_id,
                 )
             else:
                 run = cpu_to_run.get(event.cpu)
-            if run is not None and (run.verdict is None or run.verdict.passed):
+            can_override = (
+                force
+                and event.cpu != -1
+                and run is not None
+                and run.verdict is not None
+                and run.verdict.error_type in {"startup", "stall", "killed", "timeout"}
+            )
+            if run is not None and (run.verdict is None or run.verdict.passed or can_override):
                 error_type = "mce_unattributed" if event.cpu == -1 else "mce"
                 self._fail(run, f"MCE during {self.phase}: {event.message}", start, error_type=error_type)
                 hit = True
@@ -426,79 +495,54 @@ class Supervisor:
                 return self.stop_on_first_failure
         return False
 
-    def _poll_exits_stalls_watchdog(self, runs: list[_LaneRun], start: float) -> bool:
-        now = time.monotonic()
+    def _poll_exits(self, runs: list[_LaneRun], start: float, now: float) -> bool:
         for run in runs:
             if run.verdict is not None or run.proc is None:
                 continue
             rc = self._poll_process(run, start)
-            if rc is not None:
-                self._drain(run)
-                if run.verdict is not None:
-                    return self.stop_on_first_failure
-                if not run.we_killed and rc in KILLED_BY_US_CODES:
-                    self._fail(
-                        run,
-                        f"Stress process killed externally (code {rc}) — possible OOM or system issue",
-                        start,
-                        error_type="killed",
-                    )
-                    return self.stop_on_first_failure
-                if rc not in KILLED_BY_US_CODES and now - run.started_at < STARTUP_WINDOW_SECONDS:
-                    # A fatal error the tool recorded before stopping is a
-                    # verdict, however fast it came: mprime writes it to
-                    # results.txt and exits 0 within a second at a bad offset.
-                    # Only an exit with nothing recorded is an apparatus fault.
-                    live_err = self.backend.poll_errors(run.lane.work_dir)
-                    if live_err:
-                        self._fail(run, live_err, start)
-                        return self.stop_on_first_failure
-                    log.warning(
-                        "Stress process for core %d exited in <%.0fs (code %d) — "
-                        "binary may be missing or misconfigured",
-                        run.lane.core_id,
-                        STARTUP_WINDOW_SECONDS,
-                        rc,
-                    )
-                    self._fail(
-                        run,
-                        f"stress exited at startup (code {rc}) with no work done — verdict unavailable",
-                        start,
-                        error_type="startup",
-                    )
-                    return True
-                live_err = self.backend.poll_errors(run.lane.work_dir)
-                if live_err:
-                    self._fail(run, live_err, start)
-                    return self.stop_on_first_failure
-                passed, msg = self.backend.parse_output(run.stdout, run.stderr, rc)
-                if passed:
-                    run.verdict = StressResult(
-                        core_id=run.lane.core_id,
-                        passed=True,
-                        duration_seconds=now - start,
-                    )
-                    continue
-                self._fail(run, msg or f"stress exited with code {rc}", start)
+            if rc is None:
+                continue
+            self._terminate_run(run, start)
+            self._drain(run)
+            if run.verdict is None:
+                run.verdict = self._classify_completed(run, now - start, interrupted=False)
+            if run.verdict is not None and not run.verdict.passed:
                 return self.stop_on_first_failure
-            if run.unit is not None and now - run.last_watchdog >= WATCHDOG_INTERVAL:
-                run.last_watchdog = now
-                fault = self._containment_fault(run, now)
-                if fault:
-                    self._fail(run, fault, start, error_type="startup")
-                    return True
-            if now - start >= STALL_GRACE_SECONDS and self._is_stalled(run, now):
-                if self.hooks.on_stall:
-                    self.hooks.on_stall(run.lane.core_id)
-                self._fail(
-                    run,
-                    f"Stress test stalled on core {run.lane.core_id} "
-                    f"(CPU usage near 0 on CPUs {run.lane.cpu_list} for "
-                    f"{self.stall_timeout:.0f}s)",
-                    start,
-                    error_type="stall",
-                )
-                return self.stop_on_first_failure
+        return False
+
+    def _poll_containment(self, runs: list[_LaneRun], start: float, now: float) -> bool:
+        for run in runs:
+            if not run.running or run.unit is None or now - run.last_watchdog < WATCHDOG_INTERVAL:
+                continue
+            run.last_watchdog = now
+            fault = self._containment_fault(run, now)
+            if fault:
+                self._fail(run, fault, start, error_type="startup")
+                return True
+        return False
+
+    def _poll_stalls(
+        self,
+        runs: list[_LaneRun],
+        start: float,
+        now: float,
+        snapshot: dict[int, tuple[int, int]],
+    ) -> bool:
+        if now - start < STALL_GRACE_SECONDS:
+            return False
+        for run in runs:
+            if not run.running or not self._is_stalled(run, now, snapshot):
+                continue
+            if self.hooks.on_stall:
+                self.hooks.on_stall(run.lane.core_id)
+            self._fail(
+                run,
+                f"Stress test stalled on core {run.lane.core_id} "
+                f"(CPU usage near 0 on CPUs {run.lane.cpu_list} for {self.stall_timeout:.0f}s)",
+                start,
+                error_type="stall",
+            )
+            return self.stop_on_first_failure
         return False
 
     def _poll_process(self, run: _LaneRun, start: float) -> int | None:
@@ -519,6 +563,36 @@ class Supervisor:
             log.error("core %d: duty-cycle driver failed to stop: %s", run.lane.core_id, exc)
             self._fail(run, f"Failed to stop duty-cycle driver: {exc}", start, error_type="startup")
 
+    def _terminate_run(self, run: _LaneRun, start: float) -> bool:
+        with self._teardown_lock:
+            self._stop_duty_driver(run, start)
+            if run.proc is None:
+                return True
+            if run.termination is not None and run.termination.all_gone:
+                return True
+            try:
+                outcome = kill_process_group(run.proc, run.pgid)
+                scope_gone = self._scope_terminator(run.unit) if run.unit is not None else True
+                run.termination = TerminationOutcome(
+                    sent_signals=outcome.sent_signals,
+                    group_gone=outcome.group_gone,
+                    scope_gone=scope_gone,
+                )
+                if not run.termination.all_gone or run.proc.poll() is None:
+                    raise RuntimeError("stress process group or containment scope remains alive")
+            except (OSError, RuntimeError) as exc:
+                self._fail(run, f"Failed to stop stress test: {exc}", start, error_type="startup")
+                return False
+        return True
+
+    def force_teardown(self) -> bool:
+        """Synchronously stop every active lane and confirm all owned children are gone."""
+        self.stop_event.set()
+        with self._runs_lock:
+            runs = list(self._active_runs)
+        started = min((run.started_at for run in runs if run.started_at), default=time.monotonic())
+        return all(self._terminate_run(run, started) for run in runs)
+
     def _containment_fault(self, run: _LaneRun, now: float) -> str | None:
         if run.proc is None or run.unit is None:
             return None
@@ -528,30 +602,35 @@ class Supervisor:
             if now - run.started_at > CONTAINMENT_GRACE_SECONDS:
                 return (
                     f"scope {run.unit} never adopted the stress payload within "
-                    f"{CONTAINMENT_GRACE_SECONDS:.0f}s — containment fault, not a core verdict"
+                    f"{CONTAINMENT_GRACE_SECONDS:.0f}s - containment fault, not a core verdict"
                 )
             return None
         effective = containment.scope_effective_cpus(run.cgroup)
         if effective is None:
             return (
                 f"the kernel record for scope {run.unit} vanished while the payload ran "
-                "— containment fault, not a core verdict"
+                "- containment fault, not a core verdict"
             )
         if effective != set(run.lane.cpus):
             return (
                 f"scope {run.unit} runs on CPUs {containment.cpu_list(effective)} "
-                f"instead of {run.lane.cpu_list} — containment fault, not a core verdict"
+                f"instead of {run.lane.cpu_list} - containment fault, not a core verdict"
             )
         return None
 
-    def _is_stalled(self, run: _LaneRun, now: float) -> bool:
+    def _is_stalled(
+        self,
+        run: _LaneRun,
+        now: float,
+        snapshot: dict[int, tuple[int, int]],
+    ) -> bool:
         active = False
         any_sample = False
         for cpu in run.lane.cpus:
-            cur = cpu_times(cpu)
-            busy = busy_fraction(run.prev_times.get(cpu), cur)
-            if cur is not None:
-                run.prev_times[cpu] = cur
+            current = snapshot.get(cpu)
+            busy = busy_fraction(run.prev_times.get(cpu), current)
+            if current is not None:
+                run.prev_times[cpu] = current
             if busy is not None:
                 any_sample = True
                 if busy > 0.05:
@@ -604,60 +683,57 @@ class Supervisor:
         elapsed = time.monotonic() - start
         interrupted = self.stop_event.is_set() and elapsed < duration
         for run in runs:
-            self._stop_duty_driver(run, start)
-            if run.proc is None:
-                continue
-            run.we_killed = not _exited_without_reaping(run.proc)
-            try:
-                kill_process_group(run.proc)
-                if run.proc.poll() is None:
-                    raise RuntimeError("Stress process remains alive after termination")
-            except (OSError, RuntimeError) as exc:
-                self._fail(run, f"Failed to stop stress test: {exc}", start, error_type="startup")
-            self._drain(run)
+            self._terminate_run(run, start)
+            if run.proc is not None:
+                self._drain(run)
         self._apply_mce_events(runs, start, force=True)
         for run in runs:
             if run.proc is not None and (run.verdict is None or run.verdict.passed):
                 runtime = run.verdict.duration_seconds if run.verdict is not None else elapsed
-                run.verdict = self._final_verdict(run, runtime, interrupted and run.verdict is None)
-        reap_zombies()
+                run.verdict = self._classify_completed(run, runtime, interrupted and run.verdict is None)
 
-    def _final_verdict(self, run: _LaneRun, elapsed: float, interrupted: bool) -> StressResult | None:
-        rc = run.proc.returncode if run.proc is not None else 0
-        rc = rc if rc is not None else 0
-        if rc in KILLED_BY_US_CODES and not run.we_killed:
+    @staticmethod
+    def _termination_matches_returncode(run: _LaneRun, returncode: int) -> bool:
+        if run.termination is None:
+            return False
+        return any(returncode in {-sent, 128 + sent} for sent in run.termination.sent_signals)
+
+    def _classify_completed(self, run: _LaneRun, elapsed: float, interrupted: bool) -> StressResult | None:
+        returncode = run.proc.returncode if run.proc is not None else 0
+        returncode = returncode if returncode is not None else 0
+        live_error = self.backend.poll_errors(run.lane.work_dir)
+        if live_error:
             return StressResult(
                 core_id=run.lane.core_id,
                 passed=False,
                 duration_seconds=elapsed,
-                error_message=(f"Stress process killed externally (code {rc}) — possible OOM or system issue"),
+                error_message=live_error,
+                error_type=classify_error(live_error),
+            )
+        if returncode in KILLED_BY_US_CODES and not self._termination_matches_returncode(run, returncode):
+            return StressResult(
+                core_id=run.lane.core_id,
+                passed=False,
+                duration_seconds=elapsed,
+                error_message=f"Stress process killed externally (code {returncode}) - possible OOM or system issue",
                 error_type="killed",
             )
-        if rc != 0 and rc not in KILLED_BY_US_CODES and elapsed < STARTUP_WINDOW_SECONDS:
-            return StressResult(
-                core_id=run.lane.core_id,
-                passed=False,
-                duration_seconds=elapsed,
-                error_message=f"stress exited with code {rc} at startup",
-                error_type="startup",
-            )
-        live_err = self.backend.poll_errors(run.lane.work_dir)
-        if live_err:
-            return StressResult(
-                core_id=run.lane.core_id,
-                passed=False,
-                duration_seconds=elapsed,
-                error_message=live_err,
-                error_type=classify_error(live_err),
-            )
-        passed, msg = self.backend.parse_output(run.stdout or "", run.stderr or "", rc)
+        passed, message = self.backend.parse_output(run.stdout or "", run.stderr or "", returncode)
         if not passed:
             return StressResult(
                 core_id=run.lane.core_id,
                 passed=False,
                 duration_seconds=elapsed,
-                error_message=msg,
-                error_type=classify_error(msg) if msg else None,
+                error_message=message,
+                error_type=classify_error(message) if message else None,
+            )
+        if returncode not in KILLED_BY_US_CODES and elapsed < STARTUP_WINDOW_SECONDS:
+            return StressResult(
+                core_id=run.lane.core_id,
+                passed=False,
+                duration_seconds=elapsed,
+                error_message=f"stress exited at startup (code {returncode}) with no work done - verdict unavailable",
+                error_type="startup",
             )
         if interrupted:
             return None
@@ -667,6 +743,7 @@ class Supervisor:
 def watch_idle(
     *,
     cpus: tuple[int, ...],
+    sibling_cpus: tuple[int, ...] = (),
     duration: float,
     thermal: ThermalWatch,
     detector: ErrorDetector,
@@ -675,7 +752,7 @@ def watch_idle(
     phase: str,
     poll_interval: float = 0.5,
 ) -> str | None:
-    own = set(cpus)
+    own = set(sibling_cpus or cpus)
     start = time.monotonic()
     while True:
         finished = time.monotonic() - start >= duration or stop_event.is_set()

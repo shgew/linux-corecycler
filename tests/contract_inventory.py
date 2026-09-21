@@ -16,12 +16,12 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path, PurePath
 from typing import TYPE_CHECKING
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import MagicMock
 
 from corecycler.config import tools
 from corecycler.engine import containment
 from corecycler.engine.backends import BACKEND_REGISTRY, load_all, ycruncher
-from corecycler.engine.execution import cpu_times as _cpu_times
+from corecycler.monitor.cpu_usage import read_cpu_times
 from corecycler.monitor.memory import parse_dmidecode_output
 from corecycler.monitor.msr import (
     MSR_APERF,
@@ -39,12 +39,15 @@ from corecycler.smu.commands import (
     get_commands,
 )
 from corecycler.smu.driver import RyzenSMU, SMUResponse
-from corecycler.tuner.engine import _read_cpu_times
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
 _ZEN5 = CPUGeneration.ZEN5_GRANITE_RIDGE
+_ZEN5_X3D2_LAYOUT = (0x1A, 0x44, 16, 2, 8, 96 * 1024, frozenset({0, 1}))
+_RYZEN_SMU_REQUIRED_NODES = frozenset({"smu_args", "smn"})
+_RYZEN_SMU_COMMAND_NODES = frozenset({"mp1_smu_cmd", "rsmu_cmd", "hsmp_smu_cmd"})
+_RYZEN_SMU_PM_TABLE_NODES = frozenset({"pm_table", "pm_table_version", "pm_table_size"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -161,7 +164,9 @@ def _pin_mprime_31x_config_keys() -> None:
                 assert "NumCPUs=1" in content
                 assert "CoresPerTest=1" in content
             assert "EnableSetAffinity=0" in prime
-    assert MprimeBackend.parse_version("Mersenne Prime Test Program: Linux64,Untrusted Prime95,v31.4,build 2") == "31.4"
+    assert MprimeBackend.parse_version("Mersenne Prime Test Program: Linux64,Untrusted Prime95,v31.4,build 2") == (
+        "31.4-build-2"
+    )
 
 
 def _pin_proc_cpus_allowed_list() -> None:
@@ -174,9 +179,10 @@ def _pin_proc_cpus_allowed_list() -> None:
 
 def _pin_proc_stat_cpu_fields() -> None:
     stat = "cpu  1 2 3 4 5 6 7 8\ncpu0 100 20 300 4000 50 6 7 8\n"
-    for reader in (_cpu_times, _read_cpu_times):
-        with patch("builtins.open", mock_open(read_data=stat)):
-            assert reader(0) == (4050, 4491), reader.__module__
+    with tempfile.NamedTemporaryFile(mode="w+") as proc_stat:
+        proc_stat.write(stat)
+        proc_stat.flush()
+        assert read_cpu_times(Path(proc_stat.name)).get(0) == (4050, 4491), read_cpu_times.__module__
 
 
 def _pin_apu_co_command_ids() -> None:
@@ -262,6 +268,7 @@ def _pin_core_slot_mapping() -> None:
     topo = MagicMock()
     topo.cores = {c: MagicMock(ccd=0) for c in range(6)}
     fused_off = {2, 3}
+    topo.cpus_all_online = True
     fuse_reads: list[int] = []
     co_calls: list[int] = []
 
@@ -330,8 +337,25 @@ def _pin_external_tool_discovery() -> None:
     )
     assert {key for key, tool in tools.TOOLS.items() if tool.kind == tools.CORE} == {
         "systemd-run",
+        "systemctl",
         "setpriv",
     }
+
+
+def _pin_9950x3d2_dual_vcache_layout() -> None:
+    assert (26, 0x44, 16, 2, 8, 98304, frozenset({0, 1})) == _ZEN5_X3D2_LAYOUT
+
+
+def _pin_ryzen_smu_sysfs_abi() -> None:
+    assert frozenset({"smu_args", "smn"}) == _RYZEN_SMU_REQUIRED_NODES
+    assert frozenset({"mp1_smu_cmd", "rsmu_cmd", "hsmp_smu_cmd"}) == _RYZEN_SMU_COMMAND_NODES
+    assert frozenset({"pm_table", "pm_table_version", "pm_table_size"}) == _RYZEN_SMU_PM_TABLE_NODES
+
+
+def _pin_granite_ridge_core_disable_fuse_address() -> None:
+    commands = get_commands(CPUGeneration.ZEN5_GRANITE_RIDGE)
+    assert commands is not None
+    assert commands.core_fuse_addr == 0x304A03DC
 
 
 CONTRACTS: list[Contract] = [
@@ -478,5 +502,29 @@ CONTRACTS: list[Contract] = [
         ring_a=_pin_core_slot_mapping,
         live_verifiable=True,
         ring_b_test="test_hardware_contracts.py::test_core_slot_map_matches_the_live_core_disable_fuse",
+    ),
+    Contract(
+        name="zen5-x3d2-dual-vcache-layout",
+        kind="arch",
+        source="AMD Ryzen 9 9950X3D2: 16 cores, two 8-core CCDs, each with 96 MiB L3 and V-Cache",
+        ring_a=_pin_9950x3d2_dual_vcache_layout,
+        live_verifiable=True,
+        ring_b_test="test_hardware_contracts.py::test_9950x3d2_dual_vcache_layout",
+    ),
+    Contract(
+        name="ryzen-smu-sysfs-abi",
+        kind="os",
+        source="ryzen_smu sysfs ABI: args, mailbox command, SMN, and optional PM-table node group",
+        ring_a=_pin_ryzen_smu_sysfs_abi,
+        live_verifiable=True,
+        ring_b_test="test_hardware_contracts.py::test_ryzen_smu_sysfs_exposes_required_nodes",
+    ),
+    Contract(
+        name="granite-ridge-core-disable-fuse-address",
+        kind="arch",
+        source="Granite Ridge per-CCD core-disable fuse base SMN address 0x304A03DC",
+        ring_a=_pin_granite_ridge_core_disable_fuse_address,
+        live_verifiable=True,
+        ring_b_test="test_hardware_contracts.py::test_granite_ridge_core_disable_fuse_matches_live_slots",
     ),
 ]

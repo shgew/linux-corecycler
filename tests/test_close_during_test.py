@@ -68,17 +68,11 @@ class TestCloseDuringTest:
         window._on_worker_finished()
         assert window._closing is True
 
-    def test_close_disconnects_the_finished_handler(self, window, no_modal):
-        worker = _running_worker()
-        window._worker = worker
-        _answer(no_modal, "Yes")
-        _close(window)
-        worker.finished.disconnect.assert_any_call(window._on_worker_finished)
-
-    def test_close_stops_the_worker_before_closing_the_database(self, window, no_modal):
+    def test_close_confirms_teardown_before_closing_the_database(self, window, no_modal):
         order: list[str] = []
         worker = _running_worker()
         worker.scheduler.force_stop.side_effect = lambda: order.append("stop")
+        worker.scheduler.force_teardown.side_effect = lambda: (order.append("teardown"), True)[1]
         worker.wait.side_effect = lambda _ms: (order.append("wait"), True)[1]
         window._worker = worker
         close = window._history_db.close
@@ -86,8 +80,20 @@ class TestCloseDuringTest:
         window._history_db.close.side_effect = lambda: order.append("db-close")
         _answer(no_modal, "Yes")
         _close(window)
-        assert order == ["stop", "wait", "db-close"]
+        assert order == ["stop", "teardown", "wait", "db-close"]
         close()
+
+    def test_teardown_failure_keeps_the_window_and_database_open(self, window, no_modal, db):
+        worker = _running_worker()
+        worker.scheduler.force_teardown.return_value = False
+        window._worker = worker
+        _answer(no_modal, "Yes")
+        event = _close(window)
+        assert event.ignore.called
+        assert not event.accept.called
+        assert window._closing is False
+        assert db.list_runs(limit=1) == []
+        window._worker = None
 
     def test_close_aborts_a_paused_tuner_with_an_inflight_worker(self, window, no_modal):
         engine = MagicMock()
@@ -164,6 +170,16 @@ class TestWorkerFinishAlive:
         window._on_worker_crashed("boom")
         assert "boom" in window._status_msg.text()
 
+    def test_a_crash_remains_terminal_after_finished(self, window):
+        logger = MagicMock()
+        window._logger = logger
+        window._worker = _running_worker()
+        window._on_worker_crashed("boom")
+        window._on_worker_finished()
+        logger.on_test_crashed.assert_called_once_with("boom")
+        assert "boom" in window._status_msg.text()
+        assert "complete" not in window._status_msg.text().lower()
+
     def test_a_crash_after_close_stays_silent(self, window):
         window._closing = True
         before = window._status_msg.text()
@@ -201,3 +217,15 @@ class TestHonestSummary:
         kwargs = self._summary(window, monkeypatch, {"0": [], "1": []})
         assert kwargs["total"] == 0
         assert kwargs["failed"] == 0
+
+
+def test_settings_failure_keeps_the_window_and_database_open(window, db):
+    mw.save_settings.side_effect = OSError("read-only settings")
+
+    event = _close(window)
+
+    assert event.ignore.called
+    assert not event.accept.called
+    assert window._closing is False
+    assert window._history_db is db
+    assert db.list_runs(limit=1) == []

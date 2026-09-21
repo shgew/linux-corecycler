@@ -22,7 +22,7 @@ def _qapp():
 def _topo(cores: int = 4) -> CPUTopology:
     topo = CPUTopology(model_name="Test", family=26, model=0x44, physical_cores=cores, ccds=1)
     for cid in range(cores):
-        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, ccx=None, logical_cpus=(cid,))
+        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, logical_cpus=(cid,))
     return topo
 
 
@@ -49,6 +49,11 @@ class TestStyleFormatters:
         from corecycler.gui.style import ABSENT, span_str
 
         assert span_str("not-a-date", "also-not-a-date") == ABSENT
+
+    def test_span_str_mixed_naive_and_aware_is_absent(self):
+        from corecycler.gui.style import ABSENT, span_str
+
+        assert span_str("2026-07-24T00:00:00", "2026-07-24T01:30:00+00:00") == ABSENT
 
     def test_span_str_valid_range(self):
         from corecycler.gui.style import span_str

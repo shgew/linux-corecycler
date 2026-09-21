@@ -9,6 +9,8 @@ import pytest
 if not hasattr(_sys.modules.get("PySide6", None), "__path__"):
     pytest.skip("GUI tests require real PySide6", allow_module_level=True)
 
+from PySide6.QtCore import Qt
+
 from corecycler.engine.scheduler import CoreTestStatus
 
 
@@ -40,13 +42,24 @@ class TestResultsTab:
     def test_update_unknown_core_is_noop(self):
         tab = _tab()
         tab.init_cores(_statuses(2))
+        before = [
+            [tab._table.item(row, column).text() for column in range(tab._table.columnCount())]
+            for row in range(tab._table.rowCount())
+        ]
         tab.update_core(99, CoreTestStatus(core_id=99, state="failed"))
+        after = [
+            [tab._table.item(row, column).text() for column in range(tab._table.columnCount())]
+            for row in range(tab._table.rowCount())
+        ]
+        assert after == before
 
     @pytest.mark.parametrize("state", ["pending", "testing", "passed", "failed", "skipped"])
-    def test_all_states_render_without_crash(self, state):
+    def test_all_states_have_semantic_data(self, state):
         tab = _tab()
         tab.init_cores(_statuses(1))
         tab.update_core(0, CoreTestStatus(core_id=0, state=state, errors=1 if state == "failed" else 0))
+        status_item = tab._table.item(tab._core_rows[0], 2)
+        assert status_item.data(Qt.ItemDataRole.UserRole) == state
 
     def test_error_row_shows_count_and_last_error(self):
         tab = _tab()
@@ -68,11 +81,22 @@ class TestResultsTab:
         text = tab._log.toPlainText()
         assert "boom" in text and "note" in text
 
-    def test_summary_and_clear(self):
+    def test_summary_exposes_values(self):
+        tab = _tab()
+        tab.update_summary(total=3, passed=2, failed=1, elapsed=61.0, cycle=1, total_cycles=2)
+        assert tab._total_label.property("value") == 3
+        assert tab._passed_label.property("value") == 2
+        assert tab._failed_label.property("value") == 1
+        assert tab._elapsed_label.property("value") == 61.0
+        assert tab._cycle_label.property("value") == (1, 2)
+
+    def test_clear_resets_rows_mapping_and_log(self):
         tab = _tab()
         tab.init_cores(_statuses(3))
-        tab.update_summary(total=3, passed=2, failed=1, elapsed=61.0, cycle=1, total_cycles=2)
-        assert "2" in tab._passed_label.text()
+        tab.add_log(0, "entry")
+
         tab.clear()
+
         assert tab._table.rowCount() == 0
+        assert tab._core_rows == {}
         assert tab._log.toPlainText() == ""

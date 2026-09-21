@@ -184,10 +184,10 @@ class TestRequirements:
         ]
 
     def test_one_backend_and_the_containment_tools_are_enough(self):
-        assert tools.unmet_requirements(self._resolutions({"stress-ng", "systemd-run", "setpriv"})) == []
+        assert tools.unmet_requirements(self._resolutions({"stress-ng", "systemd-run", "systemctl", "setpriv"})) == []
 
     def test_no_backend_is_unmet(self):
-        unmet = tools.unmet_requirements(self._resolutions({"systemd-run", "setpriv"}))
+        unmet = tools.unmet_requirements(self._resolutions({"systemd-run", "systemctl", "setpriv"}))
         assert len(unmet) == 1
         assert "no stress backend" in unmet[0]
 
@@ -197,7 +197,7 @@ class TestRequirements:
         assert any(u.startswith("setpriv is required") for u in unmet)
 
     def test_optional_tools_are_never_unmet(self):
-        assert tools.unmet_requirements(self._resolutions({"mprime", "systemd-run", "setpriv"})) == []
+        assert tools.unmet_requirements(self._resolutions({"mprime", "systemd-run", "systemctl", "setpriv"})) == []
 
 
 class TestCommandConstruction:

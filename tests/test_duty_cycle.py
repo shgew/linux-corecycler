@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import random
 import signal
@@ -86,7 +85,8 @@ def test_stop_resumes_child_after_driver_exception(
     stopped = _wait_for_child_state(busy_child, os.WIFSTOPPED)
     release_failure.set()
     continued = _wait_for_child_state(busy_child, os.WIFCONTINUED)
-    driver.stop()
+    with pytest.raises(RuntimeError, match="clock failed"):
+        driver.stop()
 
     assert os.WIFSTOPPED(stopped)
     assert os.WIFCONTINUED(continued)
@@ -166,17 +166,15 @@ def test_stop_interrupts_a_long_idle_wait(busy_child: subprocess.Popen[bytes]) -
     assert os.WIFCONTINUED(_wait_for_child_state(busy_child, os.WIFCONTINUED))
 
 
-def test_resume_os_error_is_telemetry_only(monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture) -> None:
+def test_resume_os_error_is_reported_as_control_failure(monkeypatch: pytest.MonkeyPatch) -> None:
     def fail_resume(_pgid: int, _sig: signal.Signals) -> None:
         raise PermissionError("resume denied")
 
     monkeypatch.setattr(duty.os, "killpg", fail_resume)
     driver = DutyCycleDriver(DutyCycle(), 123)
 
-    with caplog.at_level(logging.WARNING):
+    with pytest.raises(RuntimeError, match="resume denied"):
         driver.stop()
-
-    assert "resume denied" in caplog.text
 
 
 def test_intentional_idle_clock_includes_completed_and_open_windows(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -220,26 +218,28 @@ def test_execution_starts_and_stops_driver_with_payload(monkeypatch: pytest.Monk
     supervisor = execution.Supervisor.__new__(execution.Supervisor)
     supervisor.backend = backend
     supervisor._containment_for = lambda _cpus: None
+    supervisor._scope_terminator = lambda _unit: True
+    supervisor._teardown_lock = threading.Lock()
     supervisor.stop_event = threading.Event()
     supervisor.stop_on_first_failure = False
     supervisor.detector = MagicMock()
     supervisor.observed = []
     supervisor._drain = lambda _run: None
     supervisor._apply_mce_events = lambda _runs, _start, *, force: None
-    supervisor._final_verdict = lambda run, elapsed, interrupted: StressResult(
+    supervisor._classify_completed = lambda run, elapsed, interrupted: StressResult(
         core_id=run.lane.core_id,
         passed=True,
         duration_seconds=elapsed,
     )
 
-    def kill(proc: FakeProcess) -> None:
+    def kill(proc: FakeProcess, pgid: int | None = None) -> execution.TerminationOutcome:
         events.append("kill")
         proc.returncode = -signal.SIGTERM
+        return execution.TerminationOutcome((signal.SIGTERM,), group_gone=True)
 
     monkeypatch.setattr(execution, "DutyCycleDriver", FakeDriver)
     monkeypatch.setattr(execution.subprocess, "Popen", lambda *_args, **_kwargs: process)
     monkeypatch.setattr(execution, "kill_process_group", kill)
-    monkeypatch.setattr(execution, "reap_zombies", lambda: None)
     run = _LaneRun(Lane(core_id=0, cpus=(0,), work_dir=tmp_path))
     config = StressConfig(duty_cycle=DutyCycle())
 
@@ -291,28 +291,30 @@ def test_driver_start_failure_cannot_bypass_payload_termination(
     supervisor = execution.Supervisor.__new__(execution.Supervisor)
     supervisor.backend = backend
     supervisor._containment_for = lambda _cpus: None
+    supervisor._scope_terminator = lambda _unit: True
+    supervisor._teardown_lock = threading.Lock()
     supervisor.stop_event = threading.Event()
     supervisor.stop_on_first_failure = False
     supervisor.detector = MagicMock()
     supervisor.observed = []
     supervisor._drain = lambda _run: None
     supervisor._apply_mce_events = lambda _runs, _start, *, force: None
-    supervisor._final_verdict = lambda run, elapsed, interrupted: StressResult(
+    supervisor._classify_completed = lambda run, elapsed, interrupted: StressResult(
         core_id=run.lane.core_id, passed=False, duration_seconds=elapsed
     )
 
     def fail_start(_thread: threading.Thread) -> None:
         raise RuntimeError("thread unavailable")
 
-    def kill(proc: FakeProcess) -> None:
+    def kill(proc: FakeProcess, pgid: int | None = None) -> execution.TerminationOutcome:
         events.append("kill")
         proc.returncode = -signal.SIGTERM
+        return execution.TerminationOutcome((signal.SIGTERM,), group_gone=True)
 
     monkeypatch.setattr(duty.threading.Thread, "start", fail_start)
     monkeypatch.setattr(duty.os, "killpg", lambda _pgid, sent: events.append(sent))
     monkeypatch.setattr(execution.subprocess, "Popen", lambda *_args, **_kwargs: process)
     monkeypatch.setattr(execution, "kill_process_group", kill)
-    monkeypatch.setattr(execution, "reap_zombies", lambda: None)
     run = _LaneRun(Lane(core_id=0, cpus=(0,), work_dir=tmp_path))
 
     assert not supervisor._launch(run, StressConfig(duty_cycle=DutyCycle()), time.monotonic())
@@ -348,12 +350,13 @@ def test_exit_is_observed_before_reaping_and_modulation_stops_before_poll(
     supervisor.stall_timeout = 30.0
     supervisor.hooks = execution.SuperviseHooks()
     supervisor._drain = lambda _run: None
+    supervisor._terminate_run = lambda _run, _start: True
     run = _LaneRun(Lane(core_id=0, cpus=(0,), work_dir=tmp_path))
     run.proc = FakeProcess()
     run.duty_driver = FakeDriver()  # type: ignore[assignment]
     monkeypatch.setattr(execution.os, "waitid", lambda *_args: object())
 
-    assert not supervisor._poll_exits_stalls_watchdog([run], time.monotonic())
+    assert not supervisor._poll_exits([run], time.monotonic(), time.monotonic())
     assert events == ["stop", "poll"]
 
 
@@ -366,16 +369,10 @@ def test_stall_clock_excludes_observed_duty_cycle_idle(monkeypatch: pytest.Monke
     run = _LaneRun(Lane(core_id=0, cpus=(0,), work_dir=tmp_path))
     driver = FakeDriver()
     run.duty_driver = driver  # type: ignore[assignment]
-    monkeypatch.setattr(
-        execution,
-        "cpu_times",
-        MagicMock(side_effect=[(0, 100), (100, 200), (200, 300)]),
-    )
-
-    assert not supervisor._is_stalled(run, 0.0)
+    assert not supervisor._is_stalled(run, 0.0, {0: (0, 100)})
     driver.intentional_idle_seconds = 99.0
-    assert not supervisor._is_stalled(run, 100.0)
-    assert supervisor._is_stalled(run, 102.0)
+    assert not supervisor._is_stalled(run, 100.0, {0: (100, 200)})
+    assert supervisor._is_stalled(run, 102.0, {0: (200, 300)})
 
 
 def test_process_group_is_not_signaled_after_wait_reaps_leader(
@@ -395,6 +392,8 @@ def test_process_group_is_not_signaled_after_wait_reaps_leader(
             return 0
 
     monkeypatch.setattr(execution.os, "getpgid", lambda _pid: 4321)
+    monkeypatch.setattr(execution, "_process_group_gone", lambda _pgid: False)
+    monkeypatch.setattr(execution, "_wait_for_group_exit", lambda _pgid, _timeout: True)
     monkeypatch.setattr(
         execution.os,
         "killpg",

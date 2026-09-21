@@ -1,8 +1,8 @@
-"""Error detection — MCE (Machine Check Exceptions) and kernel crash lines.
+"""Error detection for MCE (Machine Check Exceptions) and kernel crash lines.
 
 The kernel log is the single source of truth. The legacy sysfs
 /sys/devices/system/machinecheck/*/bank* files are MCA control registers
-(constant enable masks), not error counters — they never change when an
+(constant enable masks), not error counters. They never change when an
 error is logged, so counting them cannot detect anything.
 """
 
@@ -46,7 +46,7 @@ class ErrorState:
 
 
 # AMD Zen decoded MCA block: exactly one line carries CPU, bank and severity
-# flags together — "[Hardware Error]: CPU:9 (1a:44:0) MC0_STATUS[Over|CE|...]".
+# flags together: "[Hardware Error]: CPU:9 (1a:44:0) MC0_STATUS[Over|CE|...]".
 # Only that line produces an event; the block's header ("Machine check events
 # logged") and detail lines (Corrected error/Error Addr/IPID/Syndrome/unit)
 # describe the same event and must not double-count it.
@@ -119,7 +119,7 @@ class ErrorDetector:
         self._seen: set[tuple[float, int, int]] = set()
 
     def reset(self) -> None:
-        """Start a new observation window — only lines newer than now count."""
+        """Start a new observation window. Only lines newer than now count."""
         self._dmesg_baseline_ts = _get_dmesg_raw_timestamp()
         self._last_dmesg_time = 0.0
         self._seen.clear()
@@ -297,7 +297,7 @@ def _is_mce_error_line(line_lower: str) -> bool:
 
     Excludes boot/info messages like:
     - "mce: CPU supports N MCE banks"
-    - "Machine check events logged" (the AMD block header — the event itself
+    - "Machine check events logged" (the AMD block header; the event itself
       is counted from the MCx_STATUS line of the same block)
     - "mce_cpu_quirks"
     - "mce: [Hardware Error]:" informational lines about MCE configuration
@@ -343,7 +343,7 @@ def _is_kernel_error_line(line_lower: str) -> bool:
     """Return True if a dmesg line indicates a kernel crash, oops, or BUG.
 
     CO undervolting can cause kernel-level faults that manifest as oops or
-    BUG traps rather than MCE events — especially under heavy instruction
+    BUG traps rather than MCE events, especially under heavy instruction
     pressure with AVX/SSE workloads.
     """
     indicators = [

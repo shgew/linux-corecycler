@@ -317,3 +317,31 @@ class TestFollowingTheDesktop:
             assert widget.update.called
         finally:
             style.use_scheme(style.LIGHT, QPalette())
+
+    def test_reapplies_a_preexisting_semantic_stylesheet(self):
+        widget = MagicMock()
+        desktop = _FakeDesktop(BREEZE_DARK, Qt.ColorScheme.Dark, [widget])
+        try:
+            style.follow(desktop)
+            style.set_semantic_style(widget, lambda: f"color: {style.theme.COLOR_TEXT_DIM}")
+            before = widget.setStyleSheet.call_args.args[0]
+            desktop.change(BREEZE_LIGHT, Qt.ColorScheme.Light)
+            after = widget.setStyleSheet.call_args.args[0]
+            assert after != before
+            assert style.theme.COLOR_TEXT_DIM in after
+        finally:
+            style.use_scheme(style.LIGHT, QPalette())
+
+
+@pytest.mark.parametrize(
+    ("formatter", "value", "expected"),
+    [
+        (style.format_mhz, 4200.4, "4200 MHz"),
+        (style.format_watts, 12.34, "12.3 W"),
+        (style.format_volts, 1.2345, "1.234 V"),
+        (style.format_temperature, 72.34, "72.3 C"),
+        (style.format_mhz, None, style.NOT_AVAILABLE),
+    ],
+)
+def test_metric_formatters(formatter, value, expected):
+    assert formatter(value) == expected

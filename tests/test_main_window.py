@@ -20,7 +20,7 @@ import pytest
 if not hasattr(_sys.modules.get("PySide6", None), "__path__"):
     pytest.skip("GUI tests require real PySide6", allow_module_level=True)
 
-from corecycler.gui.main_window import MainWindow
+from corecycler.gui.main_window import MainWindow, _WorkloadOwner
 
 
 def _mw(**over):
@@ -46,6 +46,13 @@ def _mw(**over):
     ns._status_msg = MagicMock()
     ns._core_telemetry = {}
     ns._logger = None
+    ns._history_db = None
+    ns._workload_owner = _WorkloadOwner.NONE
+    ns._memory_tab._stress_worker = None
+    ns._active_workload_owner = MethodType(MainWindow._active_workload_owner, ns)
+    ns._apply_workload_owner = MethodType(MainWindow._apply_workload_owner, ns)
+    ns._set_workload_owner = MethodType(MainWindow._set_workload_owner, ns)
+    ns._refresh_workload_owner = MethodType(MainWindow._refresh_workload_owner, ns)
     for k, v in over.items():
         setattr(ns, k, v)
     return ns
@@ -156,3 +163,20 @@ class TestGridAndCacheSlots:
         result = MagicMock(passed=False, error_message=None)
         _call("_on_core_finished", ns, 0, result)
         ns._results_tab.add_error.assert_called_with(0, "Unknown error")
+
+
+class TestResidualOwnershipAndCrash:
+    def test_cached_manual_owner_reports_the_hardware_as_owned(self):
+        ns = _mw(_workload_owner=_WorkloadOwner.MANUAL)
+        assert _call("_workload_is_owned", ns) is True
+
+    def test_history_failure_does_not_hide_the_worker_crash(self):
+        logger = MagicMock()
+        logger.on_test_crashed.side_effect = OSError("database gone")
+        ns = _mw(_logger=logger, _closing=False)
+
+        _call("_on_worker_crashed", ns, "payload failed")
+
+        assert ns._worker_crash == "payload failed"
+        assert ns._logger is None
+        ns._status_msg.setText.assert_called_with("Test worker crashed: payload failed")

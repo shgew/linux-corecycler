@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from corecycler.tuner.config import TunerConfig
-from corecycler.tuner.regime import Profile, Regime, Workload, regimes_covered, workload_errors
+from corecycler.tuner.regime import DEFAULT_BATTERY, Profile, Regime, Workload, regimes_covered, workload_errors
 
 
 def _entry(**changes: object) -> dict[str, object]:
@@ -15,6 +15,72 @@ def _entry(**changes: object) -> dict[str, object]:
     }
     entry.update(changes)
     return entry
+
+
+def test_default_battery_is_the_decided_execution_contract():
+    assert [workload.to_dict() for workload in DEFAULT_BATTERY] == [
+        {
+            "regime": "boost",
+            "backend": "mprime",
+            "stress_mode": "SSE",
+            "fft_preset": "SMALL",
+            "profile": "sustained",
+            "threads": 1,
+        },
+        {
+            "regime": "boost",
+            "backend": "ycruncher",
+            "stress_mode": "AVX2",
+            "fft_preset": "SMALL",
+            "profile": "sustained",
+            "threads": 1,
+            "tests": ["BKT"],
+        },
+        {
+            "regime": "current",
+            "backend": "mprime",
+            "stress_mode": "AVX2",
+            "fft_preset": "SMALL",
+            "profile": "sustained",
+            "threads": 2,
+        },
+        {
+            "regime": "current",
+            "backend": "ycruncher",
+            "stress_mode": "AVX2",
+            "fft_preset": "SMALL",
+            "profile": "sustained",
+            "threads": 2,
+            "tests": ["FFTv4", "N63"],
+        },
+        {
+            "regime": "transient",
+            "backend": "mprime",
+            "stress_mode": "AVX2",
+            "fft_preset": "SMALL",
+            "profile": "transient",
+            "threads": 2,
+        },
+        {
+            "regime": "coupled",
+            "backend": "mprime",
+            "stress_mode": "AVX2",
+            "fft_preset": "LARGE",
+            "profile": "sustained",
+            "threads": 2,
+            "memory_coupled": True,
+        },
+        {
+            "regime": "coupled",
+            "backend": "ycruncher",
+            "stress_mode": "AVX2",
+            "fft_preset": "SMALL",
+            "profile": "sustained",
+            "threads": 2,
+            "tests": ["VT3"],
+            "memory_coupled": True,
+        },
+    ]
 
 
 def test_workload_labels_describe_the_actual_stress_recipe():

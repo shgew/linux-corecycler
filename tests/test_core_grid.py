@@ -27,7 +27,6 @@ def _topo(ccds=2, vcache_ccd=None):
         topo.cores[cid] = PhysicalCore(
             core_id=cid,
             ccd=ccd,
-            ccx=None,
             logical_cpus=(cid, cid + 8),
             has_vcache=(ccd == vcache_ccd),
         )
@@ -52,8 +51,33 @@ class TestGrid:
 
     def test_rebuild_replaces_cells_cleanly(self):
         grid = _grid(_topo(ccds=2))
-        grid.set_topology(_topo(ccds=1))
-        assert sorted(grid._cells) == list(range(8))
+        old_cells = dict(grid._cells)
+        replacement = CPUTopology(model_name="Replacement", physical_cores=2, ccds=1)
+        replacement.cores = {
+            core_id: PhysicalCore(core_id=core_id, ccd=0, logical_cpus=(core_id,)) for core_id in (20, 21)
+        }
+
+        grid.set_topology(replacement)
+
+        assert sorted(grid._cells) == [20, 21]
+        assert not set(old_cells.values()) & set(grid._cells.values())
+        assert grid._layout.count() == 4
+        grid.update_core_status(0, CoreTestStatus(core_id=0, state="failed"))
+        assert grid._cells[20]._state == "pending"
+
+    def test_9950x3d2_builds_both_vcache_ccds(self, topo_9950x3d2):
+        from PySide6.QtWidgets import QLabel
+
+        grid = _grid(topo_9950x3d2)
+
+        assert sorted(grid._cells) == list(range(16))
+        assert all(cell.has_vcache and cell._header_label.text().endswith("V") for cell in grid._cells.values())
+        headers = [
+            grid._layout.itemAt(index).widget().text()
+            for index in range(grid._layout.count())
+            if isinstance(grid._layout.itemAt(index).widget(), QLabel)
+        ]
+        assert headers == ["CCD 0 (V-Cache)", "CCD 1 (V-Cache)"]
 
     def test_vcache_flag_carried_to_cell(self):
         grid = _grid(_topo(ccds=2, vcache_ccd=0))
@@ -64,10 +88,16 @@ class TestGrid:
     def test_update_status_all_states(self, state):
         grid = _grid(_topo())
         grid.update_core_status(0, CoreTestStatus(core_id=0, state=state))
+        cell = grid._cells[0]
+        assert cell._state == state
+        assert cell.height() == (38 if state == "testing" else 22)
+        assert cell._telemetry_label.isHidden() is (state != "testing")
 
     def test_update_unknown_core_is_noop(self):
         grid = _grid(_topo())
+        states = {core_id: cell._state for core_id, cell in grid._cells.items()}
         grid.update_core_status(999, CoreTestStatus(core_id=999, state="failed"))
+        assert {core_id: cell._state for core_id, cell in grid._cells.items()} == states
 
     def test_passed_with_errors_becomes_warned(self):
         grid = _grid(_topo())
@@ -96,3 +126,10 @@ class TestGrid:
     def test_telemetry_unknown_core_is_noop(self):
         grid = _grid(_topo())
         grid.update_core_telemetry(999, freq_mhz=5000)
+
+    def test_missing_temperature_is_not_rendered_as_zero(self):
+        grid = _grid(_topo())
+        grid.update_core_status(0, CoreTestStatus(core_id=0, state="testing"))
+        grid.update_core_telemetry(0, freq_mhz=5200, temp_c=None)
+        assert "5200MHz" in grid._cells[0]._telemetry_label.text()
+        assert "0C" not in grid._cells[0]._telemetry_label.text()

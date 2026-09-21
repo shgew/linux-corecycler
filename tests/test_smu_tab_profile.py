@@ -22,7 +22,7 @@ def _qapp():
 def _topo(model_name="Test", family=26, model=0x44, cores=8) -> CPUTopology:
     topo = CPUTopology(model_name=model_name, family=family, model=model, physical_cores=cores, ccds=1)
     for cid in range(cores):
-        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, ccx=None, logical_cpus=(cid,))
+        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0, logical_cpus=(cid,))
     return topo
 
 
@@ -52,6 +52,7 @@ class TestSetTopologyStates:
         import corecycler.gui.smu_tab as st
 
         monkeypatch.setattr(st.RyzenSMU, "is_available", staticmethod(lambda *a, **k: True))
+        monkeypatch.setattr(st, "core_map_blocked", lambda _smu: None)
         tab.set_topology(_topo())
         assert "Connected" in tab._status_label.text()
         assert tab._apply_all_btn.isEnabled()
@@ -65,12 +66,26 @@ class TestSetTopologyStates:
         assert "no CO support" in tab._status_label.text()
         assert tab._apply_all_btn.isEnabled() is False
 
-    def test_driver_not_loaded(self, tab, monkeypatch):
+    def test_disconnect_clears_backup_and_disables_every_write_control(self, tab, monkeypatch):
         import corecycler.gui.smu_tab as st
+
+        monkeypatch.setattr(st, "core_map_blocked", lambda _smu: None)
+        monkeypatch.setattr(st.RyzenSMU, "is_available", staticmethod(lambda *a, **k: True))
+        tab.set_topology(_topo())
+        tab._co_backup = {0: -10}
+        assert tab._apply_all_btn.isEnabled()
 
         monkeypatch.setattr(st.RyzenSMU, "is_available", staticmethod(lambda *a, **k: False))
         tab.set_topology(_topo())
+
         assert "Driver not loaded" in tab._status_label.text()
+        assert tab._co_backup == {}
+        assert not tab._apply_all_btn.isEnabled()
+        assert not tab._reset_btn.isEnabled()
+        assert not tab._backup_btn.isEnabled()
+        assert not tab._restore_btn.isEnabled()
+        for row in range(tab._table.rowCount()):
+            assert not tab._table.cellWidget(row, 4).isEnabled()
 
     def test_unsupported_generation(self, tab):
         tab.set_topology(_topo(model_name="Intel Core i9", family=6, model=0xA7))

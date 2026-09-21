@@ -12,6 +12,7 @@ from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine
 from corecycler.tuner.regime import Mask
 from corecycler.tuner.state import CoreState, TunerPhase
+from tests.silicon import complete_context
 
 
 @pytest.fixture
@@ -27,16 +28,27 @@ def simple_topology(topo_single_ccd):
     return topo_single_ccd
 
 
+def _session(db, cfg, topology, smu):
+    context_id = complete_context(db, topology, smu)
+    return db.create_tuner_session(cfg.to_json(), "Test BIOS", topology.model_name, context_id)
+
+
 @pytest.fixture
 def mock_smu():
     smu = MagicMock()
     smu.commands = MagicMock()
     smu.commands.co_range = (-60, 10)
-    smu.set_co_offset = MagicMock(return_value=True)
-    smu.get_co_offset = MagicMock(return_value=0)
-    smu.get_all_co_offsets = MagicMock(return_value={0: 0, 1: 0, 2: 0, 3: 0})
-    smu.get_pbo_scalar = MagicMock(return_value=1.0)
-    smu.get_boost_limit = MagicMock(return_value=5500)
+    applied = dict.fromkeys(range(4), 0)
+
+    def write(core_id, offset):
+        applied[core_id] = offset
+        return True
+
+    smu.set_co_offset.side_effect = write
+    smu.get_co_offset.side_effect = applied.get
+    smu.get_all_co_offsets.side_effect = lambda _count: dict(applied)
+    smu.get_pbo_scalar.return_value = 1.0
+    smu.get_boost_limit.return_value = 5500
     return smu
 
 
@@ -111,7 +123,7 @@ class TestStateMachineTransitions:
         assert cs.best_offset == -4
 
     def test_failed_confirmation_backs_off_before_next_launch(self, engine):
-        engine._session_id = tp.create_session(engine._db, engine._config, "", "")
+        engine._session_id = engine._db.create_tuner_session(engine._config.to_json(), "", "")
         cs = CoreState(core_id=0, phase=TunerPhase.FAILED_CONFIRM, current_offset=-20, best_offset=-20)
         engine._core_states = {0: cs}
         with patch.object(engine, "_start_worker") as launch:
@@ -274,7 +286,7 @@ class TestStateMachineTransitions:
 
 class TestResumeFromCrash:
     def test_resume_loads_saved_state(self, db, simple_topology, mock_smu, mock_backend):
-        cfg = TunerConfig(cores_to_test=[0, 1], search_duration_seconds=1)
+        cfg = TunerConfig(cores_to_test=[0, 1], search_duration_seconds=10)
         eng = TunerEngine(
             db=db,
             topology=simple_topology,
@@ -285,10 +297,9 @@ class TestResumeFromCrash:
 
         # Create a session with saved state. A CONFIRMED claim must be backed
         # by a logged pass (resume reconciliation demotes evidence-free claims).
-        sid = tp.create_session(db, cfg, "", "")
-        tp.log_test_result(db, sid, 0, -20, "confirm", True, duration=300.0)
-        tp.save_core_state(
-            db,
+        sid = _session(db, cfg, simple_topology, mock_smu)
+        db.insert_tuner_test_log(sid, 0, -20, "confirm", True, duration=300.0)
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=0,
@@ -297,8 +308,7 @@ class TestResumeFromCrash:
                 best_offset=-20,
             ),
         )
-        tp.save_core_state(
-            db,
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=1,
@@ -324,7 +334,7 @@ class TestResumeFromCrash:
         assert eng._core_states[1].phase != TunerPhase.COARSE_SEARCH
 
     def test_resume_reapplies_baseline_offsets(self, db, simple_topology, mock_smu, mock_backend):
-        cfg = TunerConfig(cores_to_test=[0], search_duration_seconds=1)
+        cfg = TunerConfig(cores_to_test=[0], search_duration_seconds=10)
         eng = TunerEngine(
             db=db,
             topology=simple_topology,
@@ -333,9 +343,8 @@ class TestResumeFromCrash:
             config=cfg,
         )
 
-        sid = tp.create_session(db, cfg, "", "")
-        tp.save_core_state(
-            db,
+        sid = _session(db, cfg, simple_topology, mock_smu)
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=0,
@@ -355,7 +364,7 @@ class TestResumeFromCrash:
 
     def test_resume_does_not_advance_queued_cores(self, db, simple_topology, mock_smu, mock_backend):
         """Cores queued in active phases (not in_test) should NOT be advanced on resume."""
-        cfg = TunerConfig(cores_to_test=[0, 1], search_duration_seconds=1)
+        cfg = TunerConfig(cores_to_test=[0, 1], search_duration_seconds=10)
         eng = TunerEngine(
             db=db,
             topology=simple_topology,
@@ -364,10 +373,9 @@ class TestResumeFromCrash:
             config=cfg,
         )
 
-        sid = tp.create_session(db, cfg, "", "")
+        sid = _session(db, cfg, simple_topology, mock_smu)
         # Core 0 was actively testing when crash happened
-        tp.save_core_state(
-            db,
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=0,
@@ -378,8 +386,7 @@ class TestResumeFromCrash:
             ),
         )
         # Core 1 was queued for fine search (not actively testing)
-        tp.save_core_state(
-            db,
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=1,
@@ -418,7 +425,7 @@ class TestConfigVariations:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         eng._core_states = {
             0: CoreState(core_id=0),
             1: CoreState(core_id=1),
@@ -442,7 +449,7 @@ class TestPickNextCore:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         eng._core_states = {
             0: CoreState(core_id=0, phase=TunerPhase.CONFIRMED),
             1: CoreState(core_id=1, phase=TunerPhase.COARSE_SEARCH, current_offset=-5),
@@ -460,7 +467,7 @@ class TestPickNextCore:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         eng._core_states = {
             0: CoreState(core_id=0, phase=TunerPhase.CONFIRMED),
             1: CoreState(core_id=1, phase=TunerPhase.CONFIRMED),
@@ -483,7 +490,7 @@ class TestPickFunctionsPure:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         return eng
 
     def test_sequential_does_not_advance_not_started(self, db, simple_topology, mock_smu, mock_backend):
@@ -563,7 +570,7 @@ class TestInheritCurrentCO:
         cfg = TunerConfig(
             cores_to_test=[0, 1],
             inherit_current=True,
-            search_duration_seconds=1,
+            search_duration_seconds=10,
         )
         eng = TunerEngine(
             db=db,
@@ -574,6 +581,7 @@ class TestInheritCurrentCO:
         )
         with patch.object(eng, "_run_next"):
             eng.start()
+        assert eng._core_states
         assert eng._core_states[0].current_offset == -15
         assert eng._core_states[1].current_offset == -20
 
@@ -584,7 +592,7 @@ class TestInheritCurrentCO:
             cores_to_test=[0],
             inherit_current=True,
             coarse_step=5,
-            search_duration_seconds=1,
+            search_duration_seconds=10,
         )
         eng = TunerEngine(
             db=db,
@@ -607,7 +615,7 @@ class TestInheritCurrentCO:
             cores_to_test=[0, 1],
             inherit_current=False,
             start_offset=-5,
-            search_duration_seconds=1,
+            search_duration_seconds=10,
         )
         eng = TunerEngine(
             db=db,
@@ -624,7 +632,7 @@ class TestInheritCurrentCO:
 
 class TestSeededStart:
     def _engine(self, db, simple_topology, mock_smu, mock_backend, **kw):
-        cfg = TunerConfig(cores_to_test=[0, 1], search_duration_seconds=1, **kw)
+        cfg = TunerConfig(cores_to_test=[0, 1], search_duration_seconds=10, **kw)
         return TunerEngine(
             db=db,
             topology=simple_topology,
@@ -729,7 +737,7 @@ class TestCCDAlternatingOrder:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         eng._core_states = {
             i: CoreState(core_id=i, phase=TunerPhase.COARSE_SEARCH, current_offset=-5) for i in range(8)
         }
@@ -762,7 +770,7 @@ class TestCCDAlternatingOrder:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         eng._core_states = {
             0: CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-5),
             1: CoreState(core_id=1, phase=TunerPhase.COARSE_SEARCH, current_offset=-5),
@@ -787,7 +795,7 @@ class TestCCDRoundRobinOrder:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         eng._core_states = {
             i: CoreState(core_id=i, phase=TunerPhase.COARSE_SEARCH, current_offset=-5) for i in range(8)
         }
@@ -829,7 +837,7 @@ class TestCoreCyclingIntent:
     def _engine(self, db, topo, mock_smu, mock_backend, order, cores):
         cfg = TunerConfig(cores_to_test=cores, test_order=order)
         eng = TunerEngine(db=db, topology=topo, smu=mock_smu, backend=mock_backend, config=cfg)
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         return eng
 
     def test_sequential_finishes_a_core_before_the_next(self, db, simple_topology, mock_smu, mock_backend):
@@ -887,12 +895,12 @@ class TestCoreCyclingIntent:
         resume, so round-robin/CCD ordering continues instead of restarting. The
         synthetic crash-recovery row (NULL duration) must not move the cursor."""
         cfg = TunerConfig(cores_to_test=[0, 1, 2], test_order="round_robin")
-        sid = tp.create_session(db, cfg, "", "")
+        sid = db.create_tuner_session(cfg.to_json(), "", "")
         for i in range(3):
-            tp.save_core_state(db, sid, CoreState(core_id=i, phase=TunerPhase.COARSE_SEARCH, current_offset=-5))
-        tp.log_test_result(db, sid, 0, -5, "coarse", True, duration=1.0)
-        tp.log_test_result(db, sid, 1, -5, "coarse", True, duration=1.0)  # last REAL test
-        tp.log_test_result(db, sid, 2, -30, "coarse", False, error_type="crash", duration=None)  # synthetic, ignored
+            db.upsert_tuner_core_state(sid, CoreState(core_id=i, phase=TunerPhase.COARSE_SEARCH, current_offset=-5))
+        db.insert_tuner_test_log(sid, 0, -5, "coarse", True, duration=1.0)
+        db.insert_tuner_test_log(sid, 1, -5, "coarse", True, duration=1.0)  # last REAL test
+        db.insert_tuner_test_log(sid, 2, -30, "coarse", False, error_type="crash", duration=None)  # synthetic, ignored
         eng = TunerEngine(db=db, topology=simple_topology, smu=mock_smu, backend=mock_backend, config=cfg)
         with patch.object(eng, "_run_next"):
             eng.resume(sid)
@@ -1189,7 +1197,7 @@ class TestBackoffAlgorithm:
 
     def test_resume_from_backoff_preconfirm(self, db, simple_topology, mock_smu, mock_backend):
         """Resuming a session interrupted during backoff_preconfirm should back off."""
-        cfg = TunerConfig(cores_to_test=[0], search_duration_seconds=1)
+        cfg = TunerConfig(cores_to_test=[0], search_duration_seconds=10)
         eng = TunerEngine(
             db=db,
             topology=simple_topology,
@@ -1197,9 +1205,8 @@ class TestBackoffAlgorithm:
             backend=mock_backend,
             config=cfg,
         )
-        sid = tp.create_session(db, cfg, "", "")
-        tp.save_core_state(
-            db,
+        sid = _session(db, cfg, simple_topology, mock_smu)
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=0,
@@ -1238,7 +1245,7 @@ class TestCrashDetection:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         return eng
 
     def test_is_more_aggressive_negative_direction(self, db, simple_topology, mock_smu, mock_backend):
@@ -1379,7 +1386,7 @@ class TestCrashDetection:
             1: CoreState(core_id=1, phase=TunerPhase.FINE_SEARCH, current_offset=-8, in_test=False),
         }
         tp.journal_co_intent(db, eng._session_id, 0, -10, survived=False)
-        session = tp.get_session(db, eng._session_id)
+        session = db.get_tuner_session(eng._session_id)
         crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
         assert crashed == [0]
         assert pending_hunt is False
@@ -1389,7 +1396,7 @@ class TestCrashDetection:
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
         cs = CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-10, in_test=True)
         eng._core_states = {0: cs}
-        eng._attribute_crash_after_reboot(tp.get_session(db, eng._session_id))
+        eng._attribute_crash_after_reboot(db.get_tuner_session(eng._session_id))
         assert cs.in_test is False
 
     def test_detect_and_handle_crashes_applies_penalty(self, db, simple_topology, mock_smu, mock_backend):
@@ -1410,7 +1417,7 @@ class TestCrashDetection:
         )
         eng._core_states = {0: cs}
         tp.journal_co_intent(db, eng._session_id, 0, -15, survived=False)
-        eng._attribute_crash_after_reboot(tp.get_session(db, eng._session_id))
+        eng._attribute_crash_after_reboot(db.get_tuner_session(eng._session_id))
         # Penalty: -15 - ((-1)*3*1) = -15 + 3 = -12
         assert cs.current_offset == -12
         assert cs.crash_count == 1
@@ -1427,15 +1434,15 @@ class TestCrashDetection:
         )
         eng._core_states = {0: cs}
         tp.journal_co_intent(db, eng._session_id, 0, -10, survived=False)
-        eng._attribute_crash_after_reboot(tp.get_session(db, eng._session_id))
-        log_entries = tp.get_test_log(db, eng._session_id, core_id=0)
+        eng._attribute_crash_after_reboot(db.get_tuner_session(eng._session_id))
+        log_entries = db.get_tuner_test_log(eng._session_id, core_id=0)
         assert any(e.get("error_type") == "crash" for e in log_entries)
 
     def test_resume_uses_crash_detection(self, db, simple_topology, mock_smu, mock_backend):
         """resume() uses crash penalty (not plain advance) for in_test cores."""
         cfg = TunerConfig(
             cores_to_test=[0],
-            search_duration_seconds=1,
+            search_duration_seconds=10,
             crash_penalty_steps=3,
             fine_step=1,
         )
@@ -1446,9 +1453,8 @@ class TestCrashDetection:
             backend=mock_backend,
             config=cfg,
         )
-        sid = tp.create_session(db, cfg, "", "")
-        tp.save_core_state(
-            db,
+        sid = _session(db, cfg, simple_topology, mock_smu)
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=0,
@@ -1471,7 +1477,7 @@ class TestCrashDetection:
 
     def test_resume_non_in_test_not_penalized(self, db, simple_topology, mock_smu, mock_backend):
         """Cores not in_test are not touched by crash detection."""
-        cfg = TunerConfig(cores_to_test=[0, 1], search_duration_seconds=1)
+        cfg = TunerConfig(cores_to_test=[0, 1], search_duration_seconds=10)
         eng = TunerEngine(
             db=db,
             topology=simple_topology,
@@ -1479,9 +1485,8 @@ class TestCrashDetection:
             backend=mock_backend,
             config=cfg,
         )
-        sid = tp.create_session(db, cfg, "", "")
-        tp.save_core_state(
-            db,
+        sid = _session(db, cfg, simple_topology, mock_smu)
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=0,
@@ -1490,8 +1495,7 @@ class TestCrashDetection:
                 in_test=False,
             ),
         )
-        tp.save_core_state(
-            db,
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=1,
@@ -1575,7 +1579,7 @@ class TestDeathSpiralPrevention:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         return eng
 
     def test_time_budget_pauses_without_confirming(self, db, simple_topology, mock_smu, mock_backend):
@@ -1679,7 +1683,7 @@ class TestCrashAwareScheduling:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         return eng
 
     def test_cooldown_skips_core(self, db, simple_topology, mock_smu, mock_backend):
@@ -1809,7 +1813,7 @@ class TestRegimeBatteryAndAnnealing:
 
     def test_offset_advances_only_after_every_regime_passes(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
-        eng._session_id = tp.create_session(db, eng._config, "", "")
+        eng._session_id = db.create_tuner_session(eng._config.to_json(), "", "")
         cs = CoreState(
             core_id=0,
             phase=TunerPhase.FINE_SEARCH,
@@ -1818,7 +1822,7 @@ class TestRegimeBatteryAndAnnealing:
             coarse_fail_offset=-12,
         )
         eng._core_states = {0: cs}
-        tp.save_core_state(db, eng._session_id, cs)
+        db.upsert_tuner_core_state(eng._session_id, cs)
         regime_count = len(eng._slot_regimes(cs))
         assert regime_count == 4
 
@@ -1829,7 +1833,7 @@ class TestRegimeBatteryAndAnnealing:
             for expected_index in range(1, regime_count):
                 eng._on_test_finished(0, True, "", "", 1.0, 0.0)
                 assert cs.battery_index == expected_index
-                assert tp.load_core_states(db, eng._session_id)[0].battery_index == expected_index
+                assert db.get_tuner_core_states(eng._session_id)[0].battery_index == expected_index
                 assert cs.current_offset == -6
                 assert cs.best_offset == -5
 
@@ -1838,14 +1842,14 @@ class TestRegimeBatteryAndAnnealing:
         assert cs.battery_index == 0
         assert cs.best_offset == -6
         assert cs.current_offset == -7
-        persisted = tp.load_core_states(db, eng._session_id)[0]
+        persisted = db.get_tuner_core_states(eng._session_id)[0]
         assert persisted.battery_index == 0
         assert persisted.best_offset == -6
         assert persisted.current_offset == -7
 
     def test_regime_failure_ends_the_slot_immediately(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
-        eng._session_id = tp.create_session(db, eng._config, "", "")
+        eng._session_id = db.create_tuner_session(eng._config.to_json(), "", "")
         cs = CoreState(
             core_id=0,
             phase=TunerPhase.FINE_SEARCH,
@@ -1855,7 +1859,7 @@ class TestRegimeBatteryAndAnnealing:
             battery_index=1,
         )
         eng._core_states = {0: cs}
-        tp.save_core_state(db, eng._session_id, cs)
+        db.upsert_tuner_core_state(eng._session_id, cs)
 
         with (
             patch.object(eng, "_revert_core_to_baseline", return_value=True),
@@ -1866,7 +1870,7 @@ class TestRegimeBatteryAndAnnealing:
         assert cs.battery_index == 0
         assert cs.phase == TunerPhase.SETTLED
         assert cs.best_offset == -5
-        persisted = tp.load_core_states(db, eng._session_id)[0]
+        persisted = db.get_tuner_core_states(eng._session_id)[0]
         assert persisted.battery_index == 0
         assert persisted.phase is TunerPhase.SETTLED
         assert persisted.best_offset == -5
@@ -1989,7 +1993,7 @@ class TestRegimeBatteryAndAnnealing:
 
     def test_annealing_pass_promotes_the_probe(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend, anneal_bank_hours=6.0)
-        eng._session_id = tp.create_session(db, eng._config, "", "")
+        eng._session_id = db.create_tuner_session(eng._config.to_json(), "", "")
         cs = CoreState(
             core_id=0,
             phase=TunerPhase.ANNEALING,
@@ -2009,7 +2013,7 @@ class TestRegimeBatteryAndAnnealing:
         assert cs.best_offset == -11
         assert cs.anneal_strikes == 0
         assert cs.anneal_bar_hours == 6.0
-        persisted = tp.load_core_states(db, eng._session_id)[0]
+        persisted = db.get_tuner_core_states(eng._session_id)[0]
         assert persisted.best_offset == -11
         assert persisted.anneal_strikes == 0
         assert persisted.anneal_bar_hours == 6.0
@@ -2017,7 +2021,7 @@ class TestRegimeBatteryAndAnnealing:
 
     def test_annealing_failure_restores_best_and_doubles_bar(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
-        eng._session_id = tp.create_session(db, eng._config, "", "")
+        eng._session_id = db.create_tuner_session(eng._config.to_json(), "", "")
         cs = CoreState(
             core_id=0,
             phase=TunerPhase.ANNEALING,
@@ -2037,7 +2041,7 @@ class TestRegimeBatteryAndAnnealing:
         assert cs.best_offset == -10
         assert cs.anneal_strikes == 2
         assert cs.anneal_bar_hours == 24.0
-        persisted = tp.load_core_states(db, eng._session_id)[0]
+        persisted = db.get_tuner_core_states(eng._session_id)[0]
         assert persisted.current_offset == -10
         assert persisted.best_offset == -10
         assert persisted.anneal_strikes == 2
@@ -2118,6 +2122,7 @@ class TestMicroFreezeLifecycle:
             assert eng._read_breadcrumb() == (
                 "core 0 transient at -12 (worst scheduling hitch 0.000ms in the minute before the freeze)"
             )
+            eng._freeze.stop = MagicMock(return_value=True)
             eng._stop_freeze_monitor()
 
         assert eng._freeze is None
@@ -2162,6 +2167,7 @@ class TestMaskApplicationFailures:
             backend=mock_backend,
             config=TunerConfig(cores_to_test=[0, 1]),
         )
+        eng._session_id = _session(db, eng._config, simple_topology, mock_smu)
         eng._core_states = {
             0: CoreState(core_id=0, current_offset=-10, best_offset=-9),
             1: CoreState(core_id=1, current_offset=-7, best_offset=-6),
@@ -2176,14 +2182,27 @@ class TestMaskApplicationFailures:
         eng = self._engine(db, simple_topology, mock_smu, mock_backend)
         lines = []
         eng.log_message.connect(lines.append)
-        with patch.object(eng, "_apply_co", side_effect=OSError("SMU unavailable")):
-            assert eng._apply_co_mask(0, -10, Mask.LIVE) is False
+        original_write = eng._smu.set_co_offset.side_effect
+        attempts = []
+        intent_before_write = []
+
+        def fail_candidate(core_id, offset):
+            attempts.append((core_id, offset))
+            if (core_id, offset) == (1, -6):
+                intent_before_write.append(tp.journal_values(db, eng.session_id)[1])
+                raise OSError("SMU unavailable")
+            return original_write(core_id, offset)
+
+        eng._smu.set_co_offset.side_effect = fail_candidate
+        assert eng._apply_co_mask(0, -10, Mask.LIVE) is False
 
         assert eng.status == "paused"
-        assert eng._co_applied == {0: 0, 1: 0}
+        assert attempts[:3] == [(1, -6)] * 3
+        assert (0, -10) not in attempts
+        assert intent_before_write == [-6] * 3
+        assert all(eng._smu.get_co_offset(core_id) == 0 for core_id in simple_topology.cores)
         assert lines[0] == (
-            "CO mask failed: core 1 could not be set to -6 — SMU unavailable. "
-            "Stopping (SMU issue, not a core stability failure)."
+            "CO mask failed: core 1 write to -6 did not read back. Stopping (SMU issue, not a core stability failure)."
         )
 
     def test_other_core_readback_failure_pauses_without_testing_the_candidate(
@@ -2192,11 +2211,25 @@ class TestMaskApplicationFailures:
         eng = self._engine(db, simple_topology, mock_smu, mock_backend)
         lines = []
         eng.log_message.connect(lines.append)
-        with patch.object(eng, "_apply_co", return_value=False):
-            assert eng._apply_co_mask(0, -10, Mask.LIVE) is False
+        original_write = eng._smu.set_co_offset.side_effect
+        attempts = []
+        intent_before_write = []
+
+        def mismatch_candidate(core_id, offset):
+            attempts.append((core_id, offset))
+            if (core_id, offset) == (1, -6):
+                intent_before_write.append(tp.journal_values(db, eng.session_id)[1])
+                return True
+            return original_write(core_id, offset)
+
+        eng._smu.set_co_offset.side_effect = mismatch_candidate
+        assert eng._apply_co_mask(0, -10, Mask.LIVE) is False
 
         assert eng.status == "paused"
-        assert eng._co_applied == {0: 0, 1: 0}
+        assert attempts[:3] == [(1, -6)] * 3
+        assert (0, -10) not in attempts
+        assert intent_before_write == [-6] * 3
+        assert all(eng._smu.get_co_offset(core_id) == 0 for core_id in simple_topology.cores)
         assert lines[0] == (
             "CO mask failed: core 1 write to -6 did not read back. Stopping (SMU issue, not a core stability failure)."
         )
@@ -2218,7 +2251,6 @@ def _make_minimal_topology():
         topo.cores[i] = PhysicalCore(
             core_id=i,
             ccd=0,
-            ccx=None,
             logical_cpus=(i,),
         )
     return topo
@@ -2342,25 +2374,18 @@ class TestValidationS4:
             engine._on_validation_test_finished(0, passed=True)
         assert engine._validation_stage == 5
 
-    def test_validation_fail_s4_backs_off(self):
-        """S4 failure backs off the most aggressive core."""
+    def test_validation_fail_s4_starts_attribution_hunt(self):
         cfg = TunerConfig(validate_transitions=True)
         engine = make_test_engine(cfg)
         engine._validation_stage = 4
         engine._core_states = {
             0: CoreState(core_id=0, phase=TunerPhase.CONFIRMED, best_offset=-10, baseline_offset=0, current_offset=-10),
         }
-        with (
-            patch.object(engine, "_find_most_aggressive_core", return_value=0),
-            patch("PySide6.QtCore.QTimer.singleShot"),
-        ):
-            engine._on_validation_test_finished(0, passed=False)
-        # Incremental semantics: the core is backed off and owes a solo
-        # re-test, then stage 4 itself reruns — no stage-1 restart.
-        assert engine._core_states[0].best_offset == -9
-        assert engine._validation_requeue == [0]
-        assert engine._validation_stage == 4
+        with patch.object(engine, "_start_hunt") as start_hunt:
+            engine._on_validation_test_finished(0, passed=False, duration=12.0)
+        assert engine._core_states[0].best_offset == -10
         assert engine._validation_dirty is True
+        start_hunt.assert_called_once_with(observed_mttf=12.0, loaded=[])
 
 
 class TestCooldownDrainLoop:
@@ -2377,7 +2402,7 @@ class TestCooldownDrainLoop:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         return eng
 
     def test_high_cooldown_drains_without_deep_recursion(self, db, simple_topology, mock_smu, mock_backend):
@@ -2413,7 +2438,7 @@ class TestStateMachineGaps:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         return eng
 
     # Gap 3: Resume with in_test=True during CONFIRMING phase
@@ -2425,7 +2450,7 @@ class TestStateMachineGaps:
         )
         eng._core_states = {0: cs}
         tp.journal_co_intent(db, eng._session_id, 0, -10, survived=False)
-        crashed, _ = eng._attribute_crash_after_reboot(tp.get_session(db, eng._session_id))
+        crashed, _ = eng._attribute_crash_after_reboot(db.get_tuner_session(eng._session_id))
         assert 0 in crashed
         assert cs.in_test is False
         assert cs.crash_count == 1
@@ -2575,7 +2600,7 @@ class TestStateMachineInvariants:
             backend=mock_backend,
             config=cfg,
         )
-        eng._session_id = tp.create_session(db, cfg, "", "")
+        eng._session_id = db.create_tuner_session(cfg.to_json(), "", "")
         return eng
 
     @given(results=st.lists(st.booleans(), min_size=1, max_size=200))
@@ -2713,7 +2738,7 @@ class TestThermalAbort:
             patch("corecycler.tuner.engine.QTimer") as qtimer,
             patch.object(eng, "_revert_core_to_baseline") as revert,
             patch.object(eng, "abort") as abort_,
-            patch.object(tp, "save_core_state"),
+            patch.object(eng._db, "upsert_tuner_core_state"),
         ):
             eng._handle_thermal_abort(0, cs, duration=42.0)
         assert cs.thermal_aborts == 1
@@ -2736,7 +2761,7 @@ class TestThermalAbort:
         with (
             patch("corecycler.tuner.engine.QTimer"),
             patch.object(eng, "_revert_core_to_baseline"),
-            patch.object(tp, "save_core_state"),
+            patch.object(eng._db, "upsert_tuner_core_state"),
         ):
             eng._handle_thermal_abort(0, cs, duration=30.0)
         assert cs.cumulative_test_time == pytest.approx(30.0)
@@ -2749,7 +2774,7 @@ class TestThermalAbort:
             patch("corecycler.tuner.engine.QTimer") as qtimer,
             patch.object(eng, "_revert_core_to_baseline"),
             patch.object(eng, "abort") as abort_,
-            patch.object(tp, "save_core_state"),
+            patch.object(eng._db, "upsert_tuner_core_state"),
         ):
             eng._handle_thermal_abort(0, cs, duration=1.0)
         assert cs.thermal_aborts == 4
@@ -2983,7 +3008,7 @@ class TestEventLoopDeferral:
 class TestWorkerCheckpoint:
     @staticmethod
     def _prepare_hunt_without_state(eng):
-        eng._session_id = tp.create_session(eng._db, eng._config, "", "")
+        eng._session_id = eng._db.create_tuner_session(eng._config.to_json(), "", "")
         eng._core_states = {0: CoreState(core_id=0, current_offset=-5)}
         eng._hunting = True
         eng._hunt = None
@@ -2991,7 +3016,7 @@ class TestWorkerCheckpoint:
     def test_without_session_persists_nothing(self, engine):
         engine._checkpoint_worker({"profile": "sustained"}, [0])
 
-        assert tp.get_latest_session(engine._db) is None
+        assert engine._db.get_latest_tuner_session() is None
 
     def test_missing_hunt_state_pauses_without_arming(self, engine):
         self._prepare_hunt_without_state(engine)
@@ -3000,7 +3025,7 @@ class TestWorkerCheckpoint:
 
         engine._checkpoint_worker({"profile": "sustained"}, [0])
 
-        session = tp.get_session(engine._db, engine._session_id)
+        session = engine._db.get_tuner_session(engine._session_id)
         assert "Hunt state vanished before worker launch; pausing." in lines
         assert engine.status == "paused"
         assert session is not None

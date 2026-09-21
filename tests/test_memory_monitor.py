@@ -72,6 +72,11 @@ class TestParseDmidecode:
         assert d.locator == "DIMM 0"
         assert d.configured_voltage == 1.1
 
+    @pytest.mark.parametrize("value", [".", "1.2.3", "nan", "inf"])
+    def test_malformed_voltage_is_unknown(self, value):
+        text = SAMPLE_DMIDECODE.replace("Configured Voltage: 1.1 V", f"Configured Voltage: {value}")
+        assert parse_dmidecode_output(text)[0].configured_voltage is None
+
     def test_empty_output(self):
         assert parse_dmidecode_output("") == []
 
@@ -225,7 +230,7 @@ def _make_headless_tab():
     """
     import types
 
-    from corecycler.gui.memory_tab import MemoryTab
+    from corecycler.gui.memory_tab import MemoryTab, _MemoryWorker
 
     tab = types.SimpleNamespace()
     tab._fclk_label = _MockLabel("FCLK: --")
@@ -239,20 +244,22 @@ def _make_headless_tab():
     tab._pm_reader.is_available.return_value = True
     tab._spd_reader = MagicMock()
     tab._spd_reader.is_available.return_value = False
-    # SPD timing labels (added in Plan 04-02)
     tab._primary_label = _MockLabel("Primary: --")
     tab._secondary_label = _MockLabel("Secondary: --")
     tab._spd_unavailable_label = _MockLabel("")
     tab._spd_group = _MockGroupBox("SPD Timings (DDR5)")
-    # Bind MemoryTab methods to our namespace object
     tab._update_clock_labels = types.MethodType(MemoryTab._update_clock_labels, tab)
     tab._update_voltage_labels = types.MethodType(MemoryTab._update_voltage_labels, tab)
     tab._show_uncalibrated = types.MethodType(MemoryTab._show_uncalibrated, tab)
     tab._set_clocks_unavailable = types.MethodType(MemoryTab._set_clocks_unavailable, tab)
-    tab._update_live_data = types.MethodType(MemoryTab._update_live_data, tab)
-    tab._update_temperatures = types.MethodType(MemoryTab._update_temperatures, tab)
     tab._update_spd_labels = types.MethodType(MemoryTab._update_spd_labels, tab)
-    tab._temp_labels = []
+    tab._apply_memory_snapshot = types.MethodType(MemoryTab._apply_memory_snapshot, tab)
+    tab._update_temperatures = MagicMock()
+    tab._update_dependencies = MagicMock()
+    tab._apply_inventory = MagicMock()
+    tab._memory_worker = _MemoryWorker(tab._spd_reader, tab._pm_reader)
+    tab._memory_worker.refresh_inventory = False
+    tab._memory_worker.snapshot_ready.connect(tab._apply_memory_snapshot)
     return tab
 
 
@@ -329,7 +336,7 @@ class TestMemoryTabBehavior:
             is_verified=True,
         )
         tab._pm_reader.read.return_value = pm_data
-        tab._update_live_data()
+        tab._memory_worker.run()
         assert "2000" in tab._fclk_label.text()
         assert "Verified" in tab._cal_label.text()
 
@@ -346,7 +353,7 @@ class TestMemoryTabBehavior:
             is_verified=False,
         )
         tab._pm_reader.read.return_value = pm_data
-        tab._update_live_data()
+        tab._memory_worker.run()
         assert "2000" in tab._fclk_label.text()
         assert "community-sourced" in tab._cal_label.text()
         assert "Verified" not in tab._cal_label.text()
@@ -360,7 +367,7 @@ class TestMemoryTabBehavior:
             raw_floats=[0.0] * 50,
         )
         tab._pm_reader.read.return_value = pm_data
-        tab._update_live_data()
+        tab._memory_worker.run()
         assert "--" in tab._fclk_label.text()
         assert "Uncalibrated" in tab._cal_label.text()
 
@@ -368,7 +375,7 @@ class TestMemoryTabBehavior:
         """None from pm_reader.read() greys out all labels."""
         tab = _make_headless_tab()
         tab._pm_reader.read.return_value = None
-        tab._update_live_data()
+        tab._memory_worker.run()
         assert "--" in tab._fclk_label.text()
         assert theme.COLOR_MUTED in tab._fclk_label.styleSheet()
         assert tab._cal_label.text() == ""
@@ -378,7 +385,7 @@ class TestMemoryTabBehavior:
         tab = _make_headless_tab()
         # First: fail
         tab._pm_reader.read.return_value = None
-        tab._update_live_data()
+        tab._memory_worker.run()
         assert "--" in tab._fclk_label.text()
         # Then: recover
         pm_data = PMTableData(
@@ -391,7 +398,7 @@ class TestMemoryTabBehavior:
             is_verified=True,
         )
         tab._pm_reader.read.return_value = pm_data
-        tab._update_live_data()
+        tab._memory_worker.run()
         assert "2000" in tab._fclk_label.text()
         assert "Verified" in tab._cal_label.text()
 
@@ -455,7 +462,7 @@ class TestSPDTimingDecode:
         """Zero tCK_ps (bytes 20-21 = 0) returns None."""
         data = bytearray(48)
         data[2] = 0x12  # DDR5
-        # bytes 20-21 default to 0 — zero tCK
+        # bytes 20-21 default to zero tCK
         assert decode_spd_timings(bytes(data)) is None
 
     def test_tcl_rounds_to_even(self):
@@ -591,7 +598,7 @@ class TestSPDTimingDisplay:
             dimm_index=0,
         )
         tab = self._make_spd_tab(spd)
-        tab._update_spd_labels()
+        tab._update_spd_labels(spd)
         assert tab._primary_label.text() == "Primary: 40-40-40-77-117"
 
     def test_secondary_label_format(self):
@@ -610,13 +617,13 @@ class TestSPDTimingDisplay:
             dimm_index=0,
         )
         tab = self._make_spd_tab(spd)
-        tab._update_spd_labels()
+        tab._update_spd_labels(spd)
         assert tab._secondary_label.text() == "Secondary: tRFC1: 295ns  tRFCsb: 130ns  tWR: 30ns"
 
     def test_unavailable_when_none(self):
         """None SPD data shows 'SPD Timings unavailable' message."""
         tab = self._make_spd_tab(None)
-        tab._update_spd_labels()
+        tab._update_spd_labels(None)
         assert "SPD Timings unavailable" in tab._spd_unavailable_label.text()
         assert tab._spd_unavailable_label.isVisible()
         assert not tab._primary_label.isVisible()
@@ -638,7 +645,7 @@ class TestSPDTimingDisplay:
             dimm_index=0,
         )
         tab = self._make_spd_tab(spd)
-        tab._update_spd_labels()
+        tab._update_spd_labels(spd)
         assert "DIMM 1" in tab._spd_group.title()
 
     def test_labels_visible_when_data_available(self):
@@ -657,7 +664,7 @@ class TestSPDTimingDisplay:
             dimm_index=0,
         )
         tab = self._make_spd_tab(spd)
-        tab._update_spd_labels()
+        tab._update_spd_labels(spd)
         assert tab._primary_label.isVisible()
         assert tab._secondary_label.isVisible()
         assert not tab._spd_unavailable_label.isVisible()

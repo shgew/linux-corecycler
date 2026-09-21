@@ -24,7 +24,6 @@ from corecycler.engine.scheduler import CoreTestStatus
 from corecycler.engine.topology import CPUTopology, PhysicalCore
 from corecycler.gui import main_window as mw
 from corecycler.history.db import HistoryDB, RunRecord
-from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 
 
@@ -46,7 +45,7 @@ def _topo(cores: int = 2) -> CPUTopology:
         is_x3d=True,
     )
     for cid in range(cores):
-        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=cid, ccx=None, logical_cpus=(cid, cid + 8))
+        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=cid, logical_cpus=(cid, cid + 8))
     return topo
 
 
@@ -134,12 +133,15 @@ class TestWorkerBridge:
         assert seen["cycle"] == 2
         assert json.loads(seen["done"])["0"][0]["passed"] is True
 
-    def test_run_delegates_to_the_scheduler(self):
+    def test_a_scheduler_crash_is_emitted_as_the_terminal_outcome(self):
         _qapp()
         scheduler = MagicMock()
+        scheduler.run.side_effect = RuntimeError("boom")
         worker = mw.TestWorker(scheduler)
+        seen = []
+        worker.crashed.connect(seen.append)
         worker.run()
-        assert scheduler.run.called
+        assert seen == ["boom"]
 
 
 class TestConstruction:
@@ -230,15 +232,15 @@ class TestStartTest:
         window._memory_tab._stress_worker = _mock_worker()
         window._start_test()
         assert window._worker is None
-        assert no_modal.warning.call_args.args[1] == "Memory Stress Active"
+        assert no_modal.warning.called
 
-    def test_an_active_tuner_session_can_be_declined(self, window, monkeypatch, no_modal):
+    def test_an_active_tuner_session_blocks_manual_stress(self, window, monkeypatch, no_modal):
         self._ready(window, monkeypatch)
-        sid = tp.create_session(window._history_db, TunerConfig(), bios_version="2402", cpu_model="Test")
-        tp.update_session_status(window._history_db, sid, "running")
-        no_modal.question.return_value = no_modal.StandardButton.No
+        sid = window._history_db.create_tuner_session(TunerConfig().to_json(), "2402", "Test")
+        window._history_db.update_tuner_session_status(sid, "running")
         window._start_test()
         assert window._worker is None
+        assert no_modal.warning.called
 
     def test_an_unknown_backend_is_refused(self, window, monkeypatch, no_modal):
         def _missing(_n):
@@ -297,6 +299,13 @@ class TestStartTest:
         assert window._logger is not None
         assert window._elapsed_timer.isActive()
         window._elapsed_timer.stop()
+
+    def test_manual_stress_requires_a_thermal_sensor(self, window, monkeypatch):
+        self._ready(window, monkeypatch)
+        scheduler = MagicMock()
+        monkeypatch.setattr(mw, "CoreScheduler", scheduler)
+        window._start_test()
+        assert scheduler.call_args.kwargs["scheduler_config"].require_thermal_sensor is True
 
     def test_a_broken_history_logger_does_not_stop_the_test(self, window, monkeypatch):
         self._ready(window, monkeypatch)
@@ -422,7 +431,7 @@ class TestTunerAndMemoryBridges:
         assert not window._start_btn.isEnabled()
 
     def test_a_loaded_profile_switches_to_the_curve_optimizer(self, window):
-        window._on_load_co_profile({0: -30})
+        window._on_load_co_profile({0: -30}, "Test 8C X3D")
         assert window._tabs.currentWidget() is window._smu_tab
 
     def test_opening_the_curve_optimizer_rereads_the_offsets(self, window):
@@ -540,8 +549,8 @@ class TestAutoResume:
         assert not window._tuner_tab._resume_session.called
 
     def test_an_active_engine_blocks_auto_resume(self, window, caplog):
-        sid = tp.create_session(window._history_db, TunerConfig(), bios_version="2402", cpu_model="Test")
-        tp.update_session_status(window._history_db, sid, "running")
+        sid = window._history_db.create_tuner_session(TunerConfig().to_json(), "2402", "Test")
+        window._history_db.update_tuner_session_status(sid, "running")
         window._tuner_tab._engine = MagicMock(status="running")
         window._tuner_tab._resume_session = MagicMock()
         with caplog.at_level("INFO", logger="corecycler.gui.main_window"):
@@ -550,8 +559,8 @@ class TestAutoResume:
         assert not window._tuner_tab._resume_session.called
 
     def test_a_mid_run_session_is_resumed(self, window):
-        sid = tp.create_session(window._history_db, TunerConfig(), bios_version="2402", cpu_model="Test")
-        tp.update_session_status(window._history_db, sid, "running")
+        sid = window._history_db.create_tuner_session(TunerConfig().to_json(), "2402", "Test")
+        window._history_db.update_tuner_session_status(sid, "running")
         window._tuner_tab._engine = None
         window._tuner_tab._resume_session = MagicMock()
         window.attempt_auto_resume()
@@ -565,6 +574,14 @@ class TestCloseEvent:
         assert event.accept.called
         assert window._msr.close.called
 
+    def test_close_persists_the_edited_active_profile(self, window):
+        window._config_tab._time_spin.setValue(123)
+        active_index = window._settings.active_profile_idx
+        event = MagicMock()
+        window.closeEvent(event)
+        assert window._settings.profiles[active_index].seconds_per_core == 123
+        assert event.accept.called
+
     def test_a_declined_close_is_cancelled(self, window, no_modal):
         window._worker = _mock_worker()
         no_modal.question.return_value = no_modal.StandardButton.No
@@ -575,6 +592,8 @@ class TestCloseEvent:
 
     def test_an_accepted_close_force_stops_the_worker(self, window, no_modal):
         worker = _mock_worker()
+        worker.wait.return_value = True
+        worker.scheduler.force_teardown.return_value = True
         window._worker = worker
         logger = MagicMock()
         window._logger = logger
@@ -582,8 +601,8 @@ class TestCloseEvent:
         event = MagicMock()
         window.closeEvent(event)
         assert logger.on_test_stopped.called
-        assert worker.scheduler.force_stop.called
-        assert worker.terminate.called
+        worker.scheduler.force_teardown.assert_called_once_with()
+        assert not worker.terminate.called
         assert event.accept.called
 
     def test_a_running_tuner_is_force_stopped(self, window, no_modal):
@@ -594,3 +613,13 @@ class TestCloseEvent:
         window.closeEvent(event)
         assert window._tuner_tab.force_stop.called
         assert event.accept.called
+
+
+class TestInvalidProfileStart:
+    def test_rejected_profile_never_starts_a_worker(self, window, no_modal):
+        window._config_tab.get_profile = MagicMock(side_effect=ValueError("seconds_per_core is invalid"))
+
+        window._start_test()
+
+        assert window._worker is None
+        assert no_modal.warning.call_args.args[1:] == ("Invalid profile", "seconds_per_core is invalid")

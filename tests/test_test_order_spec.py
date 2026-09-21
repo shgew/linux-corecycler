@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from corecycler.history.db import HistoryDB
-from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine
 from corecycler.tuner.state import CoreState, TunerPhase
@@ -87,15 +86,15 @@ def ccd_of(eng, core: int) -> int:
 @pytest.mark.parametrize("order", ORDERS)
 class TestGlobalInvariants:
     @pytest.mark.parametrize("phase", [phase for phase in TunerPhase if phase is not TunerPhase.CONFIRMED])
-    def test_every_nonconfirmed_phase_is_available(self, db, topo_dual_ccd_x3d, order, phase):
-        eng = make_engine(db, topo_dual_ccd_x3d, order)
-        phases = dict.fromkeys(range(8), TERMINAL)
+    def test_every_nonconfirmed_phase_is_available(self, db, topo_9950x3d2, order, phase):
+        eng = make_engine(db, topo_9950x3d2, order)
+        phases = dict.fromkeys(range(16), TERMINAL)
         phases[0] = phase
         seed(eng, phases)
         assert eng._pick_next_core() == 0
 
-    def test_never_picks_confirmed_or_cooling(self, db, topo_dual_ccd_x3d, order):
-        eng = make_engine(db, topo_dual_ccd_x3d, order)
+    def test_never_picks_confirmed_or_cooling(self, db, topo_9950x3d2, order):
+        eng = make_engine(db, topo_9950x3d2, order)
         seed(
             eng,
             {0: TERMINAL, 1: TERMINAL, 2: ACTIVE, 3: ACTIVE, 4: ACTIVE, 5: TERMINAL, 6: ACTIVE, 7: ACTIVE},
@@ -108,13 +107,13 @@ class TestGlobalInvariants:
             assert cs.phase is not TunerPhase.CONFIRMED
             assert cs.crash_cooldown == 0
 
-    def test_all_confirmed_without_annealing_credit_returns_none(self, db, topo_dual_ccd_x3d, order):
-        eng = make_engine(db, topo_dual_ccd_x3d, order)
-        seed(eng, dict.fromkeys(range(8), TERMINAL))
+    def test_all_confirmed_without_annealing_credit_returns_none(self, db, topo_9950x3d2, order):
+        eng = make_engine(db, topo_9950x3d2, order)
+        seed(eng, dict.fromkeys(range(16), TERMINAL))
         assert eng._pick_next_core() is None
 
-    def test_liveness_when_all_ordinary_work_is_cooling(self, db, topo_dual_ccd_x3d, order):
-        eng = make_engine(db, topo_dual_ccd_x3d, order)
+    def test_liveness_when_all_ordinary_work_is_cooling(self, db, topo_9950x3d2, order):
+        eng = make_engine(db, topo_9950x3d2, order)
         seed(
             eng,
             {0: ACTIVE, 1: TERMINAL, 2: ACTIVE, 3: TERMINAL, 4: TERMINAL, 5: TERMINAL, 6: TERMINAL, 7: TERMINAL},
@@ -129,18 +128,18 @@ class TestGlobalInvariants:
                     cs.crash_cooldown -= 1
         assert eng._pick_next_core() is not None
 
-    def test_pick_decrements_other_cooldowns(self, db, topo_dual_ccd_x3d, order):
-        eng = make_engine(db, topo_dual_ccd_x3d, order)
-        seed(eng, dict.fromkeys(range(8), ACTIVE), cooldowns={5: 2})
+    def test_pick_decrements_other_cooldowns(self, db, topo_9950x3d2, order):
+        eng = make_engine(db, topo_9950x3d2, order)
+        seed(eng, dict.fromkeys(range(16), ACTIVE), cooldowns={5: 2})
         picked = step(eng)
         assert picked != 5
         assert eng._core_states[5].crash_cooldown == 1
 
 
 class TestSequentialSpec:
-    def test_lowest_available_and_stays_until_confirmed(self, db, topo_dual_ccd_x3d):
-        eng = make_engine(db, topo_dual_ccd_x3d, "sequential")
-        seed(eng, dict.fromkeys(range(8), ACTIVE))
+    def test_lowest_available_and_stays_until_confirmed(self, db, topo_9950x3d2):
+        eng = make_engine(db, topo_9950x3d2, "sequential")
+        seed(eng, dict.fromkeys(range(16), ACTIVE))
         assert step(eng) == 0
         assert step(eng) == 0
         eng._core_states[0].phase = TERMINAL
@@ -148,15 +147,15 @@ class TestSequentialSpec:
 
 
 class TestRoundRobinSpec:
-    def test_full_round_visits_each_core_once_cyclically(self, db, topo_dual_ccd_x3d):
-        eng = make_engine(db, topo_dual_ccd_x3d, "round_robin")
-        seed(eng, dict.fromkeys(range(8), ACTIVE))
-        assert [step(eng) for _ in range(8)] == list(range(8))
+    def test_full_round_visits_each_core_once_cyclically(self, db, topo_9950x3d2):
+        eng = make_engine(db, topo_9950x3d2, "round_robin")
+        seed(eng, dict.fromkeys(range(16), ACTIVE))
+        assert [step(eng) for _ in range(16)] == list(range(16))
         assert step(eng) == 0
 
-    def test_terminal_cursor_continues_at_next_position(self, db, topo_dual_ccd_x3d):
-        eng = make_engine(db, topo_dual_ccd_x3d, "round_robin")
-        seed(eng, dict.fromkeys(range(8), ACTIVE))
+    def test_terminal_cursor_continues_at_next_position(self, db, topo_9950x3d2):
+        eng = make_engine(db, topo_9950x3d2, "round_robin")
+        seed(eng, dict.fromkeys(range(16), ACTIVE))
         eng._last_tested_core = 3
         eng._core_states[3].phase = TERMINAL
         assert step(eng) == 4
@@ -164,75 +163,64 @@ class TestRoundRobinSpec:
 
 class TestWeakestFirstSpec:
     @pytest.mark.parametrize("phase,expected_score", PHASE_SCORES.items())
-    def test_exact_phase_score(self, db, topo_dual_ccd_x3d, phase, expected_score):
+    def test_exact_phase_score(self, db, topo_9950x3d2, phase, expected_score):
         """Two opposite tie-break layouts prove equality with a known score."""
         reference_phase = TunerPhase.FINE_SEARCH if expected_score % 2 == 0 else TunerPhase.CONFIRMING
         reference_base = PHASE_SCORES[reference_phase]
         reference_crashes = (expected_score - reference_base) // 2
 
-        eng = make_engine(db, topo_dual_ccd_x3d, "weakest_first")
-        phases = dict.fromkeys(range(8), TERMINAL)
+        eng = make_engine(db, topo_9950x3d2, "weakest_first")
+        phases = dict.fromkeys(range(16), TERMINAL)
         phases.update({0: phase, 1: reference_phase})
         seed(eng, phases, crash_counts={1: reference_crashes})
         assert eng._pick_next_core() == 0
 
-        eng = make_engine(db, topo_dual_ccd_x3d, "weakest_first")
-        phases = dict.fromkeys(range(8), TERMINAL)
+        eng = make_engine(db, topo_9950x3d2, "weakest_first")
+        phases = dict.fromkeys(range(16), TERMINAL)
         phases.update({0: reference_phase, 1: phase})
         seed(eng, phases, crash_counts={0: reference_crashes})
         assert eng._pick_next_core() == 0
 
-    def test_crash_count_adds_two_points_each(self, db, topo_dual_ccd_x3d):
-        eng = make_engine(db, topo_dual_ccd_x3d, "weakest_first")
-        phases = dict.fromkeys(range(8), TERMINAL)
+    def test_crash_count_adds_two_points_each(self, db, topo_9950x3d2):
+        eng = make_engine(db, topo_9950x3d2, "weakest_first")
+        phases = dict.fromkeys(range(16), TERMINAL)
         phases.update({0: TunerPhase.FINE_SEARCH, 1: TunerPhase.COARSE_SEARCH})
         seed(eng, phases, crash_counts={0: 2})
         assert eng._pick_next_core() == 1
 
 
 class TestCcdAlternatingSpec:
-    def test_alternates_while_both_ccds_have_work(self, db, topo_dual_ccd_x3d):
-        eng = make_engine(db, topo_dual_ccd_x3d, "ccd_alternating")
-        seed(eng, dict.fromkeys(range(8), ACTIVE))
+    def test_alternates_while_both_ccds_have_work(self, db, topo_9950x3d2):
+        eng = make_engine(db, topo_9950x3d2, "ccd_alternating")
+        seed(eng, dict.fromkeys(range(16), ACTIVE))
         picks = [step(eng) for _ in range(6)]
         ccds = [ccd_of(eng, core) for core in picks]
         assert all(left != right for left, right in zip(ccds, ccds[1:], strict=False))
 
-    def test_without_cursor_prefers_ccd_with_fewer_confirmed_cores(self, db, topo_dual_ccd_x3d):
-        eng = make_engine(db, topo_dual_ccd_x3d, "ccd_alternating")
-        seed(
-            eng,
-            {
-                0: ACTIVE,
-                1: TERMINAL,
-                2: TERMINAL,
-                3: TERMINAL,
-                4: ACTIVE,
-                5: ACTIVE,
-                6: ACTIVE,
-                7: ACTIVE,
-            },
-        )
-        assert step(eng) == 4
+    def test_without_cursor_prefers_ccd_with_fewer_confirmed_cores(self, db, topo_9950x3d2):
+        eng = make_engine(db, topo_9950x3d2, "ccd_alternating")
+        phases = dict.fromkeys(range(16), ACTIVE)
+        phases.update(dict.fromkeys(range(1, 8), TERMINAL))
+        seed(eng, phases)
+        assert step(eng) == 8
 
-    def test_drains_remaining_ccd_when_other_is_done(self, db, topo_dual_ccd_x3d):
-        eng = make_engine(db, topo_dual_ccd_x3d, "ccd_alternating")
-        seed(
-            eng,
-            {0: ACTIVE, 1: ACTIVE, 2: TERMINAL, 3: TERMINAL, 4: TERMINAL, 5: TERMINAL, 6: TERMINAL, 7: TERMINAL},
-        )
+    def test_drains_remaining_ccd_when_other_is_done(self, db, topo_9950x3d2):
+        eng = make_engine(db, topo_9950x3d2, "ccd_alternating")
+        phases = dict.fromkeys(range(16), TERMINAL)
+        phases.update({0: ACTIVE, 1: ACTIVE})
+        seed(eng, phases)
         eng._last_tested_core = 0
         assert ccd_of(eng, step(eng)) == 0
 
 
 class TestCcdRoundRobinSpec:
-    def test_alternates_ccds_and_rotates_within_each(self, db, topo_dual_ccd_x3d):
-        eng = make_engine(db, topo_dual_ccd_x3d, "ccd_round_robin")
-        seed(eng, dict.fromkeys(range(8), ACTIVE))
-        picks = [step(eng) for _ in range(8)]
+    def test_alternates_ccds_and_rotates_within_each(self, db, topo_9950x3d2):
+        eng = make_engine(db, topo_9950x3d2, "ccd_round_robin")
+        seed(eng, dict.fromkeys(range(16), ACTIVE))
+        picks = [step(eng) for _ in range(16)]
         ccds = [ccd_of(eng, core) for core in picks]
         assert all(left != right for left, right in zip(ccds, ccds[1:], strict=False))
-        assert sorted(picks) == list(range(8))
+        assert sorted(picks) == list(range(16))
 
     def test_single_ccd_degrades_to_round_robin(self, db, topo_single_ccd):
         eng = make_engine(db, topo_single_ccd, "ccd_round_robin")
@@ -242,9 +230,9 @@ class TestCcdRoundRobinSpec:
 
 
 class TestAnnealingFallThrough:
-    def test_ordinary_work_precedes_eligible_annealing(self, db, topo_dual_ccd_x3d, monkeypatch):
-        eng = make_engine(db, topo_dual_ccd_x3d, "sequential", anneal_bank_hours=1.0)
-        phases = dict.fromkeys(range(8), TERMINAL)
+    def test_ordinary_work_precedes_eligible_annealing(self, db, topo_9950x3d2, monkeypatch):
+        eng = make_engine(db, topo_9950x3d2, "sequential", anneal_bank_hours=1.0)
+        phases = dict.fromkeys(range(16), TERMINAL)
         phases[0] = ACTIVE
         seed(eng, phases, best_offsets={3: -10})
         monkeypatch.setattr(eng, "_banked_hours", lambda cs: 10.0 if cs.core_id == 3 else 0.0)
@@ -252,9 +240,9 @@ class TestAnnealingFallThrough:
         assert eng._pick_next_core() == 0
         assert eng._core_states[3].phase is TERMINAL
 
-    def test_no_ordinary_work_promotes_eligible_core_to_annealing(self, db, topo_dual_ccd_x3d, monkeypatch):
-        eng = make_engine(db, topo_dual_ccd_x3d, "round_robin", anneal_bank_hours=2.0)
-        seed(eng, dict.fromkeys(range(8), TERMINAL), best_offsets={3: -10})
+    def test_no_ordinary_work_promotes_eligible_core_to_annealing(self, db, topo_9950x3d2, monkeypatch):
+        eng = make_engine(db, topo_9950x3d2, "round_robin", anneal_bank_hours=2.0)
+        seed(eng, dict.fromkeys(range(16), TERMINAL), best_offsets={3: -10})
         monkeypatch.setattr(eng, "_banked_hours", lambda cs: 2.0 if cs.core_id == 3 else 0.0)
 
         assert eng._pick_next_core() == 3
@@ -263,15 +251,15 @@ class TestAnnealingFallThrough:
         assert cs.current_offset == -11
         assert cs.battery_index == 0
 
-    def test_strike_limit_stops_further_annealing(self, db, topo_dual_ccd_x3d, monkeypatch):
+    def test_strike_limit_stops_further_annealing(self, db, topo_9950x3d2, monkeypatch):
         eng = make_engine(
             db,
-            topo_dual_ccd_x3d,
+            topo_9950x3d2,
             "sequential",
             anneal_bank_hours=1.0,
             anneal_max_strikes=3,
         )
-        seed(eng, dict.fromkeys(range(8), TERMINAL), best_offsets={3: -10})
+        seed(eng, dict.fromkeys(range(16), TERMINAL), best_offsets={3: -10})
         eng._core_states[3].anneal_strikes = 3
         monkeypatch.setattr(eng, "_banked_hours", lambda _cs: 100.0)
 
@@ -281,17 +269,15 @@ class TestAnnealingFallThrough:
         ("best_offset", "banked_hours"),
         [(-10, 0.5), (-50, 100.0)],
     )
-    def test_bank_bar_and_offset_limit_gate_annealing(
-        self, db, topo_dual_ccd_x3d, monkeypatch, best_offset, banked_hours
-    ):
+    def test_bank_bar_and_offset_limit_gate_annealing(self, db, topo_9950x3d2, monkeypatch, best_offset, banked_hours):
         eng = make_engine(
             db,
-            topo_dual_ccd_x3d,
+            topo_9950x3d2,
             "sequential",
             anneal_bank_hours=1.0,
             max_offset=-50,
         )
-        seed(eng, dict.fromkeys(range(8), TERMINAL), best_offsets={3: best_offset})
+        seed(eng, dict.fromkeys(range(16), TERMINAL), best_offsets={3: best_offset})
         monkeypatch.setattr(eng, "_banked_hours", lambda _cs: banked_hours)
 
         assert eng._pick_next_core() is None
@@ -300,36 +286,39 @@ class TestAnnealingFallThrough:
 class TestInterruptionContract:
     @staticmethod
     def _log_real_test(db, session_id, core, offset=-10):
-        tp.log_test_result(db, session_id, core, offset, "coarse", True, duration=60.0)
+        db.insert_tuner_test_log(session_id, core, offset, "coarse", True, duration=60.0)
 
-    def test_cursors_rebuilt_from_real_test_log_only(self, db, topo_dual_ccd_x3d):
-        session_id = tp.create_session(db, TunerConfig(), "", "")
-        for core in (0, 4, 1):
+    def test_cursors_rebuilt_from_real_test_log_only(self, db, topo_9950x3d2):
+        config = TunerConfig()
+        session_id = db.create_tuner_session(config.to_json(), "", "")
+        for core in (0, 8, 1):
             self._log_real_test(db, session_id, core)
-        tp.log_test_result(db, session_id, 6, -20, "coarse", False, error_type="crash", duration=None)
+        db.insert_tuner_test_log(session_id, 6, -20, "coarse", False, error_type="crash", duration=None)
 
-        eng = make_engine(db, topo_dual_ccd_x3d, "ccd_round_robin")
-        seed(eng, dict.fromkeys(range(8), ACTIVE))
+        eng = make_engine(db, topo_9950x3d2, "ccd_round_robin")
+        seed(eng, dict.fromkeys(range(16), ACTIVE))
         eng._session_id = session_id
         eng._reconstruct_scheduling_position()
 
         assert eng._last_tested_core == 1
-        assert eng._ccd_last_tested == {0: 1, 1: 4}
+        assert eng._ccd_last_tested == {0: 1, 1: 8}
 
-    def test_round_robin_continues_after_resume(self, db, topo_dual_ccd_x3d):
-        session_id = tp.create_session(db, TunerConfig(), "", "")
+    def test_round_robin_continues_after_resume(self, db, topo_9950x3d2):
+        config = TunerConfig()
+        session_id = db.create_tuner_session(config.to_json(), "", "")
         for core in (0, 1, 2):
             self._log_real_test(db, session_id, core)
-        eng = make_engine(db, topo_dual_ccd_x3d, "round_robin")
-        seed(eng, dict.fromkeys(range(8), ACTIVE))
+        eng = make_engine(db, topo_9950x3d2, "round_robin")
+        seed(eng, dict.fromkeys(range(16), ACTIVE))
         eng._session_id = session_id
         eng._reconstruct_scheduling_position()
         assert step(eng) == 3
 
-    def test_no_test_log_leaves_cursors_unset(self, db, topo_dual_ccd_x3d):
-        session_id = tp.create_session(db, TunerConfig(), "", "")
-        eng = make_engine(db, topo_dual_ccd_x3d, "round_robin")
-        seed(eng, dict.fromkeys(range(8), ACTIVE))
+    def test_no_test_log_leaves_cursors_unset(self, db, topo_9950x3d2):
+        config = TunerConfig()
+        session_id = db.create_tuner_session(config.to_json(), "", "")
+        eng = make_engine(db, topo_9950x3d2, "round_robin")
+        seed(eng, dict.fromkeys(range(16), ACTIVE))
         eng._session_id = session_id
         eng._reconstruct_scheduling_position()
         assert eng._last_tested_core is None

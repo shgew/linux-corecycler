@@ -1,224 +1,217 @@
-"""Tests for history.context — tuning context capture and comparison."""
+"""Tests for complete hardware context capture and identity."""
 
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 
 from corecycler.history.context import (
-    TuningContextRecord,
+    SystemContext,
     capture_system_context,
-    compute_co_hash,
+    compute_context_hash,
     detect_bios_change,
-    find_or_create_context,
     read_bios_version,
 )
-from corecycler.history.db import HistoryDB
+from corecycler.history.db import HistoryDB, TuningContextRecord
 
 
 @pytest.fixture
 def db():
-    d = HistoryDB(":memory:")
-    yield d
-    d.close()
+    history = HistoryDB(":memory:")
+    yield history
+    history.close()
 
 
-class TestComputeCoHash:
-    def test_deterministic(self):
-        h1 = compute_co_hash({0: -30, 1: -20, 2: -25})
-        h2 = compute_co_hash({0: -30, 1: -20, 2: -25})
-        assert h1 == h2
-        assert len(h1) == 64  # SHA-256 hex
+def _hash(**changes):
+    values = {
+        "cpu_model": "AMD Ryzen 9 9950X3D2",
+        "physical_cores": 16,
+        "ccds": 2,
+        "co": tuple(range(-16, 0)),
+        "pbo_scalar": 1.0,
+        "boost_limit_mhz": 200,
+        "ppt_limit_w": 200.0,
+        "tdc_limit_a": 160.0,
+        "edc_limit_a": 225.0,
+        "bios_version": "2402",
+    }
+    values.update(changes)
+    return compute_context_hash(**values)
 
-    def test_order_independent(self):
-        h1 = compute_co_hash({0: -30, 1: -20})
-        h2 = compute_co_hash({1: -20, 0: -30})
-        assert h1 == h2
 
-    def test_different_values_different_hash(self):
-        h1 = compute_co_hash({0: -30, 1: -20})
-        h2 = compute_co_hash({0: -30, 1: -25})
-        assert h1 != h2
+class TestComputeContextHash:
+    def test_is_deterministic(self):
+        assert _hash() == _hash()
+        assert len(_hash()) == 64
 
-    def test_empty_offsets(self):
-        assert compute_co_hash({}) == ""
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [
+            ("cpu_model", "different"),
+            ("physical_cores", 8),
+            ("ccds", 1),
+            ("co", (0,) * 16),
+            ("pbo_scalar", None),
+            ("boost_limit_mhz", None),
+            ("ppt_limit_w", None),
+            ("tdc_limit_a", None),
+            ("edc_limit_a", None),
+            ("bios_version", "different"),
+        ],
+    )
+    def test_every_operating_point_field_changes_identity(self, field, value):
+        assert _hash(**{field: value}) != _hash()
 
-    def test_none_values_excluded(self):
-        h1 = compute_co_hash({0: -30, 1: None, 2: -20})
-        h2 = compute_co_hash({0: -30, 2: -20})
-        assert h1 == h2
-
-    def test_all_none_is_empty(self):
-        assert compute_co_hash({0: None, 1: None}) == ""
+    def test_missing_core_does_not_equal_an_absent_core(self):
+        assert _hash(co=(-30, None, -20)) != _hash(co=(-30, -20))
 
 
 class TestReadBiosVersion:
-    def test_reads_from_file(self, tmp_path):
-        bios_file = tmp_path / "bios_version"
-        bios_file.write_text("2101\n")
-        assert read_bios_version(bios_file) == "2101"
-
-    def test_missing_file(self, tmp_path):
-        assert read_bios_version(tmp_path / "nonexistent") == ""
-
-    def test_strips_whitespace(self, tmp_path):
+    def test_reads_and_strips_file(self, tmp_path):
         bios_file = tmp_path / "bios_version"
         bios_file.write_text("  2101  \n")
         assert read_bios_version(bios_file) == "2101"
 
+    def test_missing_or_unreadable_path_is_empty(self, tmp_path):
+        assert read_bios_version(tmp_path / "missing") == ""
+        assert read_bios_version(tmp_path) == ""
+
 
 class TestCaptureSystemContext:
-    def test_without_smu(self, tmp_path):
+    def test_complete_capture_contains_full_vector(self, tmp_path, monkeypatch):
+        import corecycler.smu.pmtable as pmtable_mod
+
         bios_file = tmp_path / "bios_version"
-        bios_file.write_text("2101")
+        bios_file.write_text("2402")
+        monkeypatch.setattr(pmtable_mod, "read_power_limits", lambda: (200.0, 160.0, 225.0))
+        smu = MagicMock()
+        smu.get_all_co_offsets.return_value = {0: -30, 1: -25}
+        smu.get_pbo_scalar.return_value = 1.0
+        smu.get_boost_limit.return_value = 200
 
-        ctx = capture_system_context(smu=None, num_cores=0, bios_path=bios_file)
-        assert ctx.bios_version == "2101"
-        assert ctx.co_offsets_json == "{}"
-        assert ctx.co_hash == ""
-        assert ctx.pbo_scalar is None
-        assert ctx.boost_limit_mhz is None
-
-    def test_without_smu_no_bios(self, tmp_path):
-        ctx = capture_system_context(smu=None, num_cores=0, bios_path=tmp_path / "missing")
-        assert ctx.bios_version == ""
-        assert ctx.co_hash == ""
-
-
-class TestFindOrCreateContext:
-    def test_creates_new(self, db):
-        ctx = TuningContextRecord(
-            bios_version="2101",
-            co_offsets_json='{"0":-30,"1":-20}',
-            co_hash=compute_co_hash({0: -30, 1: -20}),
+        context = capture_system_context(
+            smu,
+            2,
+            bios_file,
+            cpu_model="AMD Ryzen 9 9950X3D2",
+            ccds=2,
         )
-        ctx_id = find_or_create_context(db, ctx)
-        assert ctx_id > 0
 
-        fetched = db.get_context(ctx_id)
-        assert fetched.bios_version == "2101"
+        assert context.co == (-30, -25)
+        assert context.complete is True
+        assert context.missing == ()
+        assert context.ppt_limit_w == 200.0
+        assert context.context_hash == _hash(
+            physical_cores=2,
+            co=(-30, -25),
+            bios_version="2402",
+            boost_limit_mhz=200,
+        )
 
-    def test_finds_existing(self, db):
-        co_hash = compute_co_hash({0: -30, 1: -20})
-        ctx1 = TuningContextRecord(
-            bios_version="2101",
-            co_offsets_json='{"0":-30,"1":-20}',
-            co_hash=co_hash,
-        )
-        id1 = find_or_create_context(db, ctx1)
+    def test_optional_smu_values_may_be_unavailable(self, tmp_path):
+        smu = MagicMock()
+        smu.get_all_co_offsets.return_value = {0: -30}
+        smu.get_pbo_scalar.side_effect = OSError
+        smu.get_boost_limit.side_effect = OSError
 
-        ctx2 = TuningContextRecord(
-            bios_version="2101",
-            co_offsets_json='{"0":-30,"1":-20}',
-            co_hash=co_hash,
-        )
-        id2 = find_or_create_context(db, ctx2)
+        context = capture_system_context(smu, 1, tmp_path / "missing", cpu_model="CPU", ccds=1)
 
-        assert id1 == id2
+        assert context.complete is True
+        assert context.pbo_scalar is None
+        assert context.boost_limit_mhz is None
+        assert context.ppt_limit_w is None
 
-    def test_different_bios_creates_new(self, db):
-        co_hash = compute_co_hash({0: -30})
-        id1 = find_or_create_context(
-            db,
-            TuningContextRecord(bios_version="2101", co_hash=co_hash),
-        )
-        id2 = find_or_create_context(
-            db,
-            TuningContextRecord(bios_version="2201", co_hash=co_hash),
-        )
-        assert id1 != id2
+    def test_power_limits_may_be_unavailable(self, tmp_path, monkeypatch):
+        import corecycler.smu.pmtable as pmtable_mod
 
-    def test_different_co_creates_new(self, db):
-        id1 = find_or_create_context(
-            db,
-            TuningContextRecord(
-                bios_version="2101",
-                co_hash=compute_co_hash({0: -30}),
-            ),
+        smu = MagicMock()
+        smu.get_all_co_offsets.return_value = {0: -30}
+        smu.get_pbo_scalar.return_value = 1.0
+        smu.get_boost_limit.return_value = 200
+        monkeypatch.setattr(pmtable_mod, "read_power_limits", MagicMock(side_effect=OSError("unavailable")))
+
+        context = capture_system_context(smu, 1, tmp_path / "missing", cpu_model="CPU")
+
+        assert context.complete is True
+        assert context.ppt_limit_w is None
+        assert context.tdc_limit_a is None
+        assert context.edc_limit_a is None
+
+    def test_missing_and_offset_gaps_are_explicit(self, tmp_path):
+        smu = MagicMock()
+        smu.get_all_co_offsets.return_value = {0: -30}
+        smu.get_pbo_scalar.return_value = None
+        smu.get_boost_limit.return_value = None
+
+        context = capture_system_context(smu, 2, tmp_path / "missing")
+
+        assert context.complete is False
+        assert context.co == (-30, None)
+        assert context.missing == ("cpu_model", "co[1]")
+
+    def test_failed_offset_read_is_incomplete(self, tmp_path):
+        smu = MagicMock()
+        smu.get_all_co_offsets.side_effect = OSError
+        smu.get_pbo_scalar.return_value = None
+        smu.get_boost_limit.return_value = None
+
+        context = capture_system_context(smu, 1, tmp_path / "missing", cpu_model="CPU")
+
+        assert context.complete is False
+        assert context.missing == ("co[0]",)
+
+    def test_no_smu_or_cores_is_incomplete(self, tmp_path):
+        context = capture_system_context(None, 0, tmp_path / "missing")
+        assert context.complete is False
+        assert context.missing == ("cpu_model", "co")
+
+    def test_system_context_converts_to_persisted_record(self):
+        context = SystemContext(
+            cpu_model="CPU",
+            physical_cores=2,
+            ccds=1,
+            co=(-30, None),
+            pbo_scalar=None,
+            boost_limit_mhz=None,
+            ppt_limit_w=None,
+            tdc_limit_a=None,
+            edc_limit_a=None,
+            bios_version="2402",
+            context_hash="hash",
+            complete=False,
+            missing=("co[1]",),
         )
-        id2 = find_or_create_context(
-            db,
-            TuningContextRecord(
-                bios_version="2101",
-                co_hash=compute_co_hash({0: -40}),
-            ),
-        )
-        assert id1 != id2
+        record = context.to_record()
+        assert record.cpu_model == "CPU"
+        assert record.co_offsets_json == '{"0":-30,"1":null}'
+        assert record.context_hash == "hash"
+
+
+class TestStoredContexts:
+    def test_get_or_create_reuses_complete_identity(self, db):
+        context = TuningContextRecord(bios_version="2402", context_hash="same")
+        first = db.get_or_create_context(context)
+        second = db.get_or_create_context(TuningContextRecord(bios_version="2402", context_hash="same"))
+        assert first == second
+
+    def test_different_context_hash_or_bios_is_distinct(self, db):
+        first = db.get_or_create_context(TuningContextRecord(bios_version="2402", context_hash="one"))
+        second = db.get_or_create_context(TuningContextRecord(bios_version="2402", context_hash="two"))
+        third = db.get_or_create_context(TuningContextRecord(bios_version="2403", context_hash="one"))
+        assert len({first, second, third}) == 3
 
 
 class TestDetectBiosChange:
     def test_no_previous_contexts(self, db, tmp_path):
         bios_file = tmp_path / "bios_version"
         bios_file.write_text("2101")
-        changed, old, current = detect_bios_change(db, bios_path=bios_file)
-        assert changed is False
-        assert old == ""
-        assert current == "2101"
+        assert detect_bios_change(db, bios_file) == (False, "", "2101")
 
-    def test_same_bios(self, db, tmp_path):
-        db.create_context(TuningContextRecord(bios_version="2101"))
-
+    def test_same_and_changed_bios(self, db, tmp_path):
+        db.get_or_create_context(TuningContextRecord(bios_version="2101", context_hash="one"))
         bios_file = tmp_path / "bios_version"
         bios_file.write_text("2101")
-        changed, old, current = detect_bios_change(db, bios_path=bios_file)
-        assert changed is False
-
-    def test_different_bios(self, db, tmp_path):
-        db.create_context(TuningContextRecord(bios_version="2101"))
-
-        bios_file = tmp_path / "bios_version"
+        assert detect_bios_change(db, bios_file) == (False, "2101", "2101")
         bios_file.write_text("2201")
-        changed, old, current = detect_bios_change(db, bios_path=bios_file)
-        assert changed is True
-        assert old == "2101"
-        assert current == "2201"
-
-
-class TestPowerLimitsInContext:
-    """PBO power limits are part of the stability environment: the same CO
-    profile can be stable at PPT 200 W and unstable at 230 W, so they join
-    the context identity."""
-
-    def test_hash_without_limits_is_legacy_identical(self):
-        from corecycler.history.context import compute_co_hash
-
-        offsets = {0: -30, 1: -20}
-        assert compute_co_hash(offsets) == compute_co_hash(offsets, None)
-        assert compute_co_hash(offsets) == compute_co_hash(offsets, (None, None, None))
-
-    def test_limits_change_the_identity(self):
-        from corecycler.history.context import compute_co_hash
-
-        offsets = {0: -30, 1: -20}
-        base = compute_co_hash(offsets)
-        with_limits = compute_co_hash(offsets, (225.0, 190.0, 230.0))
-        other_limits = compute_co_hash(offsets, (200.0, 160.0, 225.0))
-        assert with_limits != base
-        assert with_limits != other_limits
-
-    def test_limits_hash_is_order_independent_and_rounded(self):
-        from corecycler.history.context import compute_co_hash
-
-        a = compute_co_hash({0: -30, 1: -20}, (225.04, 190.0, None))
-        b = compute_co_hash({1: -20, 0: -30}, (225.0, 190.01, None))
-        assert a == b
-
-    def test_capture_records_limits(self, monkeypatch):
-        import corecycler.smu.pmtable as pmtable_mod
-        from corecycler.history.context import capture_system_context
-
-        monkeypatch.setattr(pmtable_mod, "read_power_limits", lambda n: (225.0, 190.0, 230.0))
-        smu = MagicMock()
-        smu.get_all_co_offsets.return_value = {0: -30}
-        smu.get_pbo_scalar.return_value = 1.0
-        smu.get_boost_limit.return_value = None
-        ctx = capture_system_context(smu=smu, num_cores=1, bios_path=Path("/nonexistent"))
-        assert ctx.ppt_limit_w == 225.0
-        assert ctx.tdc_limit_a == 190.0
-        assert ctx.edc_limit_a == 230.0
-        # And the identity reflects them.
-        from corecycler.history.context import compute_co_hash
-
-        assert ctx.co_hash == compute_co_hash({0: -30}, (225.0, 190.0, 230.0))
+        assert detect_bios_change(db, bios_file) == (True, "2101", "2201")

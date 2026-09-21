@@ -1,4 +1,4 @@
-"""Results dashboard — per-core pass/fail table, error log, summary."""
+"""Results dashboard with per-core pass/fail table, error log, and summary."""
 
 from __future__ import annotations
 
@@ -97,7 +97,7 @@ class ResultsTab(QWidget):
         self._core_rows: dict[int, int] = {}  # core_id -> row index
 
     def init_cores(self, core_statuses: dict[int, CoreTestStatus]) -> None:
-        """Initialize the table with core entries — clears previous results."""
+        """Initialize the table with core entries after clearing previous results."""
         self._log.clear()
         self._table.setRowCount(len(core_statuses))
         self._core_rows.clear()
@@ -130,10 +130,17 @@ class ResultsTab(QWidget):
         cycle: int = 0,
         total_cycles: int = 0,
     ) -> None:
+        for label, value in (
+            (self._total_label, total),
+            (self._passed_label, passed),
+            (self._failed_label, failed),
+            (self._elapsed_label, elapsed),
+            (self._cycle_label, (cycle, total_cycles)),
+        ):
+            label.setProperty("value", value)
         self._total_label.setText(f"Cores: {total}")
         self._passed_label.setText(f"Passed: {passed}")
         self._failed_label.setText(f"Failed: {failed}")
-
         self._elapsed_label.setText(f"Elapsed: {duration_str(elapsed)}")
         self._cycle_label.setText(f"Cycle: {cycle}/{total_cycles}")
 
@@ -148,6 +155,7 @@ class ResultsTab(QWidget):
         self._table.setItem(row, 1, _item(ccd_text, Qt.AlignmentFlag.AlignCenter))
 
         status_item = _item(state_label(status.state), Qt.AlignmentFlag.AlignCenter)
+        status_item.setData(Qt.ItemDataRole.UserRole, status.state)
         _, fg, _border = theme.STATE_COLORS.get(status.state, theme.STATE_COLORS["pending"])
         status_item.setForeground(QColor(fg))
         self._table.setItem(row, 2, status_item)

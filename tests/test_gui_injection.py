@@ -33,7 +33,7 @@ def _qapp():
 def _topo() -> CPUTopology:
     topo = CPUTopology(model_name="Test 8C", family=26, model=0x44, physical_cores=8, ccds=2)
     for cid in range(8):
-        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0 if cid < 4 else 1, ccx=None, logical_cpus=(cid, cid + 8))
+        topo.cores[cid] = PhysicalCore(core_id=cid, ccd=0 if cid < 4 else 1, logical_cpus=(cid, cid + 8))
     return topo
 
 
@@ -68,19 +68,27 @@ def _tuner_tab():
 class TestCoreInputParser:
     @settings(deadline=None)
     @given(st.text(max_size=48))
-    def test_any_string_yields_none_or_valid_cores(self, text):
+    def test_any_string_is_rejected_or_yields_valid_cores(self, text):
         tab = _config_tab()
         tab._cores_input.setText(text)
-        cores = tab.get_profile().cores_to_test
-        assert cores is None or all(0 <= c <= 7 for c in cores)
+        try:
+            cores = tab.get_profile().cores_to_test
+        except ValueError as exc:
+            assert str(exc)
+        else:
+            assert cores is None or all(0 <= core <= 7 for core in cores)
 
     @settings(deadline=None)
     @given(st.lists(st.integers(-50, 50), max_size=12))
-    def test_integer_lists_filter_to_present_cores(self, ids):
+    def test_integer_lists_reject_absent_cores(self, ids):
         tab = _config_tab()
-        tab._cores_input.setText(",".join(str(i) for i in ids))
-        cores = tab.get_profile().cores_to_test
-        assert cores is None or set(cores) <= set(range(8))
+        tab._cores_input.setText(",".join(str(core) for core in ids))
+        if len(ids) != len(set(ids)) or any(core not in range(8) for core in ids):
+            with pytest.raises(ValueError):
+                tab.get_profile()
+        else:
+            cores = tab.get_profile().cores_to_test
+            assert cores is None or set(cores) <= set(range(8))
 
 
 class TestCoProfileInjection:
@@ -90,7 +98,7 @@ class TestCoProfileInjection:
         tab = _smu_tab()
         lo, hi = tab._commands.co_range
         with patch("corecycler.gui.smu_tab.QMessageBox.warning"):
-            tab.set_co_profile(profile)
+            tab.set_co_profile(profile, tab._topology.model_name)
         for spin in tab._spinboxes.values():
             assert lo <= spin.value() <= hi
 

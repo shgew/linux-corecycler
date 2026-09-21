@@ -1,9 +1,7 @@
-"""memory_tab _StressWorker coverage."""
+"""Memory stress Supervisor coverage."""
 
 from __future__ import annotations
 
-import signal
-import subprocess
 import sys as _sys
 from unittest.mock import MagicMock
 
@@ -12,6 +10,8 @@ import pytest
 if not hasattr(_sys.modules.get("PySide6", None), "__path__"):
     pytest.skip("GUI tests require real PySide6", allow_module_level=True)
 
+from corecycler.engine.backends.base import StressResult
+
 
 def _qapp():
     from PySide6.QtWidgets import QApplication
@@ -19,131 +19,145 @@ def _qapp():
     return QApplication.instance() or QApplication([])
 
 
-def _proc(stdout="Status: PASS\n", stderr="", returncode=0, timeout_first=False):
-    proc = MagicMock()
-    proc.pid = 4242
-    proc.returncode = returncode
-    proc.poll.return_value = None
-    if timeout_first:
-        proc.communicate.side_effect = [
-            subprocess.TimeoutExpired("cmd", 1),
-            (stdout, stderr),
-        ]
-    else:
-        proc.communicate.return_value = (stdout, stderr)
-    return proc
+class _Supervisor:
+    def __init__(self, result: StressResult | None) -> None:
+        self.result = result
+        self.calls = []
+
+    def run(self, lanes, config_for, duration):
+        self.calls.append((lanes, config_for(lanes[0]), duration))
+        return {lanes[0].core_id: self.result}
 
 
-def _run_worker(monkeypatch, tool, proc=None, popen_error=None):
-    import corecycler.gui.memory_tab as mt
+def _run(result: StressResult | None, *, stopped: bool = False):
+    from corecycler.gui.memory_tab import _StressWorker
 
     _qapp()
-    results: list = []
-    worker = mt._StressWorker(tool, 1)
-    worker.done.connect(lambda ok, out: results.append((ok, out)))
-    monkeypatch.setattr(mt, "default_memory_mb", lambda: 1536)
-    if popen_error is not None:
-        monkeypatch.setattr("subprocess.Popen", MagicMock(side_effect=popen_error))
-    elif proc is not None:
-        monkeypatch.setattr("subprocess.Popen", MagicMock(return_value=proc))
+    supervisor = _Supervisor(result)
+    worker = _StressWorker(
+        "stressapptest", 1, supervisor_factory=lambda **_kwargs: supervisor, detector_factory=MagicMock
+    )
+    seen = []
+    worker.done.connect(lambda passed, output: seen.append((passed, output)))
+    if stopped:
+        worker.stop()
     worker.run()
-    return results
+    return seen, supervisor
 
 
-class TestStressWorkerRun:
-    def test_unknown_tool_reports_failure(self, monkeypatch):
-        results = _run_worker(monkeypatch, "bogus-tool")
-        assert results == [(False, "Unknown tool: bogus-tool")]
+class TestStressWorker:
+    def test_clean_supervisor_result_passes(self):
+        result = StressResult(core_id=0, passed=True, duration_seconds=60.0)
+        seen, supervisor = _run(result)
+        assert seen == [(True, "Memory stress completed")]
+        lanes, config, deadline = supervisor.calls[0]
+        assert lanes[0].cpus
+        assert config.test_seconds == 60
+        assert deadline > config.test_seconds
 
-    def test_stressapptest_pass(self, monkeypatch):
-        results = _run_worker(monkeypatch, "stressapptest", proc=_proc())
-        assert results[0][0] is True
+    @pytest.mark.parametrize("error_type", ["timeout", "startup", "thermal", "mce"])
+    def test_supervisor_failures_never_pass(self, error_type):
+        result = StressResult(
+            core_id=0,
+            passed=False,
+            duration_seconds=1.0,
+            error_message=f"{error_type} failure",
+            error_type=error_type,
+        )
+        seen, _supervisor = _run(result)
+        assert seen == [(False, f"{error_type} failure")]
 
-    def test_stressapptest_failure_text(self, monkeypatch):
-        results = _run_worker(monkeypatch, "stressapptest", proc=_proc(stdout="miscompare\n"))
-        assert results[0][0] is False
+    def test_user_stop_never_passes_even_if_runner_returns_pass(self):
+        result = StressResult(core_id=0, passed=True, duration_seconds=1.0)
+        seen, _supervisor = _run(result, stopped=True)
+        assert seen == [(False, "Memory stress stopped")]
 
-    def test_stressapptest_sizes_memory_explicitly(self, monkeypatch):
-        """The GUI run is a single process, so it gets the whole single-lane
-        share; without -M stressapptest would grab 95% of physical RAM."""
-        popen = MagicMock(return_value=_proc())
-        import corecycler.gui.memory_tab as mt
+    def test_missing_verdict_is_failure(self):
+        seen, _supervisor = _run(None)
+        assert seen == [(False, "Memory stress stopped before a verdict")]
+
+    def test_unknown_tool_fails_without_running_supervisor(self):
+        from corecycler.gui.memory_tab import _StressWorker
 
         _qapp()
-        worker = mt._StressWorker("stressapptest", 2)
-        monkeypatch.setattr(mt, "default_memory_mb", lambda: 3072)
-        monkeypatch.setattr("subprocess.Popen", popen)
+        factory = MagicMock()
+        worker = _StressWorker("bogus-tool", 1, supervisor_factory=factory, detector_factory=MagicMock)
+        seen = []
+        worker.done.connect(lambda passed, output: seen.append((passed, output)))
         worker.run()
-        cmd = popen.call_args[0][0]
-        assert cmd[0] == "stressapptest"
-        assert cmd[cmd.index("-M") + 1] == "3072"
-        assert str(2 * 60) in cmd
-
-    def test_stress_ng_uses_returncode(self, monkeypatch):
-        results = _run_worker(monkeypatch, "stress-ng --vm", proc=_proc(returncode=0))
-        assert results[0][0] is True
-        results = _run_worker(monkeypatch, "stress-ng --vm", proc=_proc(returncode=3))
-        assert results[0][0] is False
-
-    def test_timeout_kills_process_group_then_collects(self, monkeypatch):
-        proc = _proc(timeout_first=True)
-        monkeypatch.setattr("os.getpgid", lambda _pid: 999)
-        killed: list = []
-        monkeypatch.setattr("os.killpg", lambda pgid, s: killed.append((pgid, s)))
-        results = _run_worker(monkeypatch, "stressapptest", proc=proc)
-        assert killed and killed[0][0] == 999
-        assert results[0][0] is True
-
-    def test_launch_failure_is_reported(self, monkeypatch):
-        results = _run_worker(monkeypatch, "stressapptest", popen_error=OSError("no binary"))
-        assert results[0][0] is False
-        assert "no binary" in results[0][1]
+        assert seen == [(False, "Unknown tool: bogus-tool")]
+        factory.assert_not_called()
 
 
-class TestStressWorkerStop:
-    def _worker(self, proc):
+class TestMemoryStressBackend:
+    def test_builds_supervised_payload_commands(self, tmp_path):
+        from corecycler.engine.backends.base import StressConfig
+        from corecycler.gui.memory_tab import _MemoryStressBackend
+
+        sat = _MemoryStressBackend("stressapptest")
+        sat._binary = "/tools/stressapptest"
+        sat_cmd = sat.get_command(StressConfig(test_seconds=90, memory_mb=2048), tmp_path)
+        assert sat_cmd == ["/tools/stressapptest", "-W", "-M", "2048", "-s", "90"]
+
+        stress_ng = _MemoryStressBackend("stress-ng --vm")
+        stress_ng._binary = "/tools/stress-ng"
+        ng_cmd = stress_ng.get_command(StressConfig(test_seconds=45), tmp_path)
+        assert ng_cmd == [
+            "/tools/stress-ng",
+            "--vm",
+            "1",
+            "--vm-bytes",
+            "75%",
+            "--verify",
+            "--timeout",
+            "45s",
+        ]
+
+    def test_parser_requires_a_real_stressapptest_pass(self):
+        from corecycler.gui.memory_tab import _MemoryStressBackend
+
+        backend = _MemoryStressBackend("stressapptest")
+        assert backend.parse_output("Status: PASS", "", 0) == (True, None)
+        assert backend.parse_output("finished", "", 0)[0] is False
+        assert backend.parse_output("Status: PASS", "", 2)[0] is False
+        assert backend.parse_output("Status: PASS", "miscompare", 0)[0] is False
+
+    def test_stress_ng_clean_exit_is_a_verdict_and_prepare_creates_directory(self, tmp_path):
+        from corecycler.engine.backends.base import StressConfig, StressMode
+        from corecycler.gui.memory_tab import _MemoryStressBackend
+
+        backend = _MemoryStressBackend("stress-ng --vm")
+        assert backend.parse_output("", "", 0) == (True, None)
+        assert backend.get_supported_modes() == [StressMode.SSE]
+        work_dir = tmp_path / "memory"
+        backend.prepare(work_dir, StressConfig())
+        assert work_dir.is_dir()
+
+
+class TestStressWorkerFailures:
+    def test_no_affinity_fails_without_running_supervisor(self, monkeypatch):
         import corecycler.gui.memory_tab as mt
 
         _qapp()
-        worker = mt._StressWorker("stressapptest", 1)
-        worker._process = proc
-        return worker
+        supervisor = _Supervisor(None)
+        monkeypatch.setattr(mt.os, "sched_getaffinity", lambda _pid: set())
+        worker = mt._StressWorker(
+            "stressapptest", 1, supervisor_factory=lambda **_kwargs: supervisor, detector_factory=MagicMock
+        )
+        seen = []
+        worker.done.connect(lambda passed, output: seen.append((passed, output)))
+        worker.run()
+        assert seen == [(False, "No online CPUs available")]
+        assert supervisor.calls == []
 
-    def test_stop_without_process_is_a_noop(self):
-        self._worker(None).stop()
+    def test_supervisor_exception_is_a_failure(self):
+        from corecycler.gui.memory_tab import _StressWorker
 
-    def test_stop_after_exit_is_a_noop(self):
-        proc = _proc()
-        proc.poll.return_value = 0
-        signals: list = []
-        import os
-
-        old = os.killpg
-        os.killpg = lambda pgid, s: signals.append(s)
-        try:
-            self._worker(proc).stop()
-        finally:
-            os.killpg = old
-        assert signals == []
-
-    def test_stop_signals_the_group_with_sigkill(self, monkeypatch):
-        proc = _proc()
-        monkeypatch.setattr("os.getpgid", lambda _pid: 999)
-        signals: list = []
-        monkeypatch.setattr("os.killpg", lambda pgid, s: signals.append((pgid, s)))
-        self._worker(proc).stop()
-        assert signals == [(999, signal.SIGKILL)]
-
-    def test_stop_never_waits_on_the_process(self, monkeypatch):
-        proc = _proc()
-        monkeypatch.setattr("os.getpgid", lambda _pid: 999)
-        monkeypatch.setattr("os.killpg", lambda pgid, s: None)
-        self._worker(proc).stop()
-        proc.wait.assert_not_called()
-        proc.communicate.assert_not_called()
-
-    def test_stop_tolerates_a_vanished_group(self, monkeypatch):
-        proc = _proc()
-        monkeypatch.setattr("os.getpgid", MagicMock(side_effect=ProcessLookupError))
-        self._worker(proc).stop()
-        proc.wait.assert_not_called()
+        _qapp()
+        factory = MagicMock()
+        factory.return_value.run.side_effect = RuntimeError("containment failed")
+        worker = _StressWorker("stressapptest", 1, supervisor_factory=factory, detector_factory=MagicMock)
+        seen = []
+        worker.done.connect(lambda passed, output: seen.append((passed, output)))
+        worker.run()
+        assert seen == [(False, "containment failed")]

@@ -24,7 +24,7 @@ def desktop_notify(title: str, body: str, *, urgency: str = "normal") -> bool:
         urgency = "normal"
     resolution = tools.resolve("notify-send")
     if resolution.path is None:
-        log.debug("notify-send unavailable (%s) — skipping desktop notification", resolution.problem)
+        log.debug("notify-send unavailable (%s) - skipping desktop notification", resolution.problem)
         return False
     binary = str(resolution.path)
     try:

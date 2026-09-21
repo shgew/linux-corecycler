@@ -9,6 +9,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
+from corecycler.engine.backends import available_backends
 from corecycler.engine.backends.base import (
     KILLED_BY_US_CODES,
     FFTPreset,
@@ -20,6 +21,11 @@ from corecycler.engine.backends.base import (
 from corecycler.engine.backends.mprime import FFT_RANGES, MODE_TO_CPU_FLAGS, MprimeBackend
 from corecycler.engine.backends.stress_ng import StressNgBackend, _mode_to_method
 from corecycler.engine.backends.ycruncher import MODE_TO_ALGORITHMS, VALID_COMPONENT_TESTS, YCruncherBackend
+
+
+def test_backend_registry_is_available_without_explicit_loading():
+    assert set(available_backends()) == {"mprime", "stress-ng", "stressapptest", "y-cruncher"}
+
 
 # ===========================================================================
 # Base class tests
@@ -119,6 +125,9 @@ class TestBaseBackendBinaryResolution:
 
         backend = DummyBackend()
         assert backend.get_supported_fft_presets() == []
+        assert backend.instruction_set(StressConfig()) is None
+        assert backend.workload(StressConfig(tests=("custom",))) == ("custom",)
+        assert backend.default_memory_mb(4) is None
 
     def test_default_prepare_and_cleanup(self, tmp_path):
         """Base class prepare/cleanup are no-ops."""
@@ -184,6 +193,12 @@ class TestMprimeBackend:
         assert StressMode.AVX in modes
         assert StressMode.AVX2 in modes
         assert StressMode.AVX512 in modes
+
+    def test_instruction_set_and_workload_are_independent(self):
+        config = StressConfig(mode=StressMode.AVX2, fft_preset=FFTPreset.LARGE, threads=2)
+        backend = MprimeBackend()
+        assert backend.instruction_set(config) is StressMode.AVX2
+        assert backend.workload(config) == ("torture", "large", "2T")
 
     def test_get_supported_fft_presets(self):
         backend = MprimeBackend()
@@ -295,7 +310,7 @@ class TestMprimeBackend:
         assert "CpuSupportsAVX2=1" in content
         assert "CpuSupportsAVX512F=0" in content
         assert "EnableSetAffinity=0" in content
-        # ResultsFile=/LogFile= were never real Prime95 keys — output stays at
+        # ResultsFile=/LogFile= were never real Prime95 keys, so output stays at
         # the defaults (results.txt / prime.log in the work dir)
         assert "ResultsFile" not in content
         assert "LogFile" not in content
@@ -346,14 +361,14 @@ class TestMprimeBackend:
     )
     def test_parse_output_self_test_passed(self, line):
         backend = MprimeBackend()
-        passed, msg = backend.parse_output(line + "\n", "", 0)
+        passed, msg = backend.parse_output(line + "\n", "", -15)
         assert passed
         assert msg is None
 
     def test_parse_output_torture_summary_clean(self):
         backend = MprimeBackend()
         passed, msg = backend.parse_output(
-            "Torture Test completed 20 tests in 15 minutes - 0 errors, 0 warnings.", "", 0
+            "Torture Test completed 20 tests in 15 minutes - 0 errors, 0 warnings.", "", -15
         )
         assert passed
         assert msg is None
@@ -381,8 +396,8 @@ class TestMprimeBackend:
     def test_parse_output_clean_exit_no_output(self):
         backend = MprimeBackend()
         passed, msg = backend.parse_output("", "", 0)
-        assert passed
-        assert msg is None
+        assert not passed
+        assert msg is not None and "verdict unavailable" in msg
 
     # --- cleanup tests ---
 
@@ -450,6 +465,11 @@ class TestMprimeBackend:
     def test_poll_errors_no_file(self, tmp_path):
         assert MprimeBackend().poll_errors(tmp_path) is None
 
+    def test_poll_errors_invalid_utf8_is_verdict_unavailable(self, tmp_path):
+        (tmp_path / "results.txt").write_bytes(b"\xff")
+        msg = MprimeBackend().poll_errors(tmp_path)
+        assert msg is not None and "verdict unavailable" in msg
+
 
 # ===========================================================================
 # stress-ng backend tests
@@ -505,6 +525,12 @@ class TestStressNgBackend:
         assert StressMode.AVX2 in modes
         assert StressMode.AVX512 not in modes
 
+    def test_workload_does_not_claim_an_instruction_set(self):
+        config = StressConfig(mode=StressMode.AVX2)
+        backend = StressNgBackend()
+        assert backend.instruction_set(config) is None
+        assert backend.workload(config) == ("fft",)
+
     def test_prepare(self, tmp_path):
         backend = StressNgBackend()
         work = tmp_path / "work"
@@ -533,12 +559,17 @@ class TestStressNgBackend:
         passed, msg = backend.parse_output("", "FAILED test", 1)
         assert not passed
 
-    @pytest.mark.parametrize("code", sorted(KILLED_BY_US_CODES) + [0])
+    @pytest.mark.parametrize("code", sorted(KILLED_BY_US_CODES))
     def test_parse_output_success_codes(self, code):
         backend = StressNgBackend()
         passed, msg = backend.parse_output("completed", "", code)
         assert passed
         assert msg is None
+
+    def test_parse_output_clean_exit_has_no_verdict(self):
+        passed, msg = StressNgBackend().parse_output("completed", "", 0)
+        assert not passed
+        assert msg is not None and "verdict unavailable" in msg
 
     def test_parse_output_unknown_exit_code(self):
         backend = StressNgBackend()
@@ -716,6 +747,13 @@ class TestYCruncherBackend:
         assert StressMode.AVX2 in modes
         assert StressMode.AVX512 in modes
 
+    def test_component_tests_are_the_workload_not_an_instruction_set(self):
+        config = StressConfig(mode=StressMode.AVX512, tests=("N63",))
+        backend = YCruncherBackend()
+        assert backend.instruction_set(config) is None
+        assert backend.workload(config) == ("N63",)
+        assert backend.default_memory_mb(4) == 256
+
     def test_parse_real_pass_output_not_false_flagged(self):
         backend = YCruncherBackend()
         passed, msg = backend.parse_output(_CAPTURED_PASS_OUTPUT, "", -15)
@@ -733,6 +771,12 @@ class TestYCruncherBackend:
         passed, msg = backend.parse_output(_CAPTURED_PASS_OUTPUT, "", 0)
         assert not passed
         assert "verdict unavailable" in msg
+
+    @pytest.mark.parametrize(("stdout", "stderr"), [("Checksum mismatch", ""), ("", "Checksum mismatch")])
+    def test_parse_checksum_mismatch_after_scheduler_kill(self, stdout, stderr):
+        passed, msg = YCruncherBackend().parse_output(stdout, stderr, -15)
+        assert not passed
+        assert msg is not None and "Checksum mismatch" in msg
 
     def test_parse_error_encountered(self):
         backend = YCruncherBackend()
@@ -832,7 +876,8 @@ class TestMprimeConstants:
 
     def test_version_parse_reads_the_live_format(self):
         line = "Mersenne Prime Test Program: Linux64,Untrusted Prime95,v31.4,build 2"
-        assert MprimeBackend.parse_version(line) == "31.4"
+        assert MprimeBackend.parse_version(line) == "31.4-build-2"
+        assert MprimeBackend.parse_version("Prime95,v31.4,build 99") == "31.4-build-99"
         assert MprimeBackend.parse_version("no version here") is None
 
     def test_installed_version_reads_the_binary(self, monkeypatch, tmp_path):
@@ -846,7 +891,7 @@ class TestMprimeConstants:
             "run",
             lambda *a, **k: SimpleNamespace(stdout="Prime95,v31.4,build 2", stderr=""),
         )
-        assert backend.installed_version() == "31.4"
+        assert backend.installed_version() == "31.4-build-2"
 
     def test_installed_version_survives_a_broken_binary(self, monkeypatch):
         import subprocess
@@ -863,7 +908,7 @@ class TestMprimeConstants:
 
 class TestFailClosedResultsRead:
     def test_unreadable_results_txt_is_not_a_pass(self, tmp_path):
-        """Without results.txt a real error could pass unseen — an unreadable
+        """Without results.txt a real error could pass unseen. An unreadable
         file must produce an apparatus-fault verdict (engine pauses on it),
         never a silent pass."""
         import os

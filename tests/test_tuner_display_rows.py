@@ -14,9 +14,11 @@ import pytest
 if not hasattr(_sys.modules.get("PySide6", None), "__path__"):
     pytest.skip("GUI tests require real PySide6", allow_module_level=True)
 
+from PySide6.QtCore import Qt
+
 from corecycler.engine.topology import CPUTopology, PhysicalCore
 from corecycler.history.db import HistoryDB, TuningContextRecord
-from corecycler.tuner import persistence as tp
+from corecycler.tuner import report
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.state import CoreState, TunerPhase
 
@@ -31,7 +33,7 @@ def db():
 def _topo():
     topo = CPUTopology(model_name="Test", family=26, model=0x44, physical_cores=8, ccds=2)
     for c in range(8):
-        topo.cores[c] = PhysicalCore(core_id=c, ccd=0 if c < 4 else 1, ccx=None, logical_cpus=(c, c + 8))
+        topo.cores[c] = PhysicalCore(core_id=c, ccd=0 if c < 4 else 1, logical_cpus=(c, c + 8))
     return topo
 
 
@@ -53,47 +55,58 @@ def _engine(sid, states):
 
 
 def _sid(db, context_id=None):
-    return tp.create_session(db, TunerConfig(), bios_version="2402", cpu_model="Test 8C", context_id=context_id)
+    return db.create_tuner_session(
+        TunerConfig().to_json(), bios_version="2402", cpu_model="Test 8C", context_id=context_id
+    )
 
 
 class TestCoreRow:
-    def test_update_core_row_shows_only_selected_context_banked_evidence(self, db):
-        """The row reports evidence from the selected session's complete context.
-
-        The two BIOS contexts intentionally share a CO hash. The weaker regime
-        is still the headline number, so a missing fourth regime is unproven.
-        """
-        selected_context = db.create_context(TuningContextRecord(bios_version="2402", co_hash="same"))
-        other_context = db.create_context(TuningContextRecord(bios_version="2403", co_hash="same"))
+    def test_update_core_row_matches_canonical_report(self, db):
+        selected_context = db.get_or_create_context(TuningContextRecord(bios_version="2402", context_hash="selected"))
+        other_context = db.get_or_create_context(TuningContextRecord(bios_version="2403", context_hash="other"))
         sid = _sid(db, selected_context)
-        tp.log_test_result(db, sid, 0, -30, "confirm", True, duration=60.0)
+        state = CoreState(
+            core_id=0,
+            phase=TunerPhase.CONFIRMED,
+            current_offset=-31,
+            best_offset=-30,
+            proven_offset=-30,
+            suspicion=1.5,
+        )
+        db.upsert_tuner_core_state(sid, state)
+        db.insert_tuner_test_log(sid, 0, -30, "confirm", True, duration=60.0)
         for regime in ("boost", "current", "transient"):
             db.bank_regime_time(selected_context, 0, regime, -30, 7200.0)
             db.bank_regime_time(other_context, 0, regime, -30, 18000.0)
         tab = _tab(db)
-        tab._engine = _engine(
-            sid,
-            {0: CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)},
-        )
+        tab._engine = _engine(sid, {0: state})
+
         tab._update_core_row(0)
-        assert tab._find_core_row(0) == 0
+
+        expected = report.core_row(db, sid, 0)
+        assert tab._core_table.item(0, 0).data(Qt.ItemDataRole.UserRole) == expected
         headers = [tab._core_table.horizontalHeaderItem(c).text() for c in range(tab._core_table.columnCount())]
+        assert tab._core_table.item(0, headers.index("Candidate")).text() == "-31"
+        assert tab._core_table.item(0, headers.index("Accepted")).text() == "-30"
+        assert tab._core_table.item(0, headers.index("Confidence")).text() == "0.0h"
         assert tab._core_table.item(0, headers.index("Boost")).text() == "2.0h"
         assert tab._core_table.item(0, headers.index("Coupled")).text() == "0.0h"
-        assert tab._core_table.item(0, headers.index("Proven")).text() == "0.0h"
-        assert tab._core_table.item(0, headers.index("Last Result")).text() == "PASS"
 
-    def test_core_row_reports_no_hours_without_a_context(self, db):
-        """Confidence is keyed to the operating point; with no context there
-        is nothing to key it to, and the row must not imply otherwise."""
+    def test_profile_quarantine_suppresses_the_accepted_offset(self, db):
         sid = _sid(db)
+        state = CoreState(core_id=0, current_offset=-31, best_offset=-30, proven_offset=-30)
+        db.upsert_tuner_core_state(sid, state)
+        db.update_tuner_session_status(sid, "profile_quarantined")
         tab = _tab(db)
-        tab._engine = _engine(
-            sid, {0: CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30)}
-        )
+        tab._engine = _engine(sid, {0: state})
+
         tab._update_core_row(0)
+
+        expected = report.core_row(db, sid, 0)
+        assert expected["accepted_offset"] is None
+        assert tab._core_table.item(0, 0).data(Qt.ItemDataRole.UserRole) == expected
         headers = [tab._core_table.horizontalHeaderItem(c).text() for c in range(tab._core_table.columnCount())]
-        assert tab._core_table.item(0, headers.index("Proven")).text() == "0.0h"
+        assert tab._core_table.item(0, headers.index("Accepted")).text() == "-"
 
     def test_update_core_row_no_engine_is_noop(self, db):
         tab = _tab(db)
@@ -111,7 +124,7 @@ class TestCoreRow:
 class TestLogEntry:
     def test_add_log_entry_appends_row(self, db):
         sid = _sid(db)
-        tp.log_test_result(db, sid, 0, -30, "confirm", True, duration=60.0)
+        db.insert_tuner_test_log(sid, 0, -30, "confirm", True, duration=60.0)
         tab = _tab(db)
         tab._engine = _engine(sid, {})
         before = tab._log_table.rowCount()
@@ -120,7 +133,7 @@ class TestLogEntry:
 
     def test_add_log_entry_respects_selected_core(self, db):
         sid = _sid(db)
-        tp.log_test_result(db, sid, 1, -30, "confirm", True, duration=60.0)
+        db.insert_tuner_test_log(sid, 1, -30, "confirm", True, duration=60.0)
         tab = _tab(db)
         tab._engine = _engine(sid, {})
         tab._selected_core = 0
@@ -132,10 +145,12 @@ class TestLogEntry:
 class TestSlots:
     def test_core_state_changed_updates_row(self, db):
         sid = _sid(db)
+        state = CoreState(core_id=2, phase=TunerPhase.COARSE_SEARCH, current_offset=-20)
+        db.upsert_tuner_core_state(sid, state)
         tab = _tab(db)
-        tab._engine = _engine(sid, {2: CoreState(core_id=2, phase=TunerPhase.COARSE_SEARCH, current_offset=-20)})
+        tab._engine = _engine(sid, {2: state})
         tab._on_core_state_changed(2, "coarse_search", -20)
-        assert tab._find_core_row(2) >= 0
+        assert tab._core_table.item(0, 0).data(Qt.ItemDataRole.UserRole)["core"] == 2
 
     def test_validation_progress_sets_label(self, db):
         tab = _tab(db)

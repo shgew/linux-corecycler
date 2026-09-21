@@ -193,28 +193,73 @@ class TestSaveLoadSettings:
 
     def test_load_wrong_types(self, tmp_path, monkeypatch):
         monkeypatch.setattr("corecycler.config.settings.CONFIG_DIR", tmp_path)
-        (tmp_path / "settings.json").write_text('{"work_dir": 42, "profiles": "bad"}')
-        s = load_settings()
-        # should fall back to defaults
-        assert isinstance(s, AppSettings)
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text('{"active_profile_idx": "0"}')
+
+        loaded = load_settings()
+
+        assert loaded.active_profile_idx == 0
+        assert not settings_file.exists()
+        assert (tmp_path / "settings.json.corrupt").exists()
+
+    @pytest.mark.parametrize(
+        "document",
+        [
+            ["not", "an", "object"],
+            {"poll_interval": True},
+            {"profiles": "not a list"},
+            {"profiles": ["not an object"]},
+            {"profiles": [{"cores_to_test": [0, True]}]},
+        ],
+    )
+    def test_malformed_settings_fail_soft_and_are_preserved(self, tmp_path, monkeypatch, document):
+        monkeypatch.setattr("corecycler.config.settings.CONFIG_DIR", tmp_path)
+        settings_file = tmp_path / "settings.json"
+        original = json.dumps(document)
+        settings_file.write_text(original)
+
+        loaded = load_settings()
+
+        assert loaded == AppSettings()
+        assert not settings_file.exists()
+        assert (tmp_path / "settings.json.corrupt").read_text() == original
 
     def test_load_extra_fields_ignored(self, tmp_path, monkeypatch):
         monkeypatch.setattr("corecycler.config.settings.CONFIG_DIR", tmp_path)
         data = {
-            "work_dir": "/tmp/test",
-            "theme": "system",
-            "poll_interval": 1.0,
-            "show_smt_threads": False,
-            "active_profile_idx": 0,
-            "window_width": 1200,
-            "window_height": 800,
-            "unknown_field": "should be ignored",
-            "profiles": [{"name": "Default"}],
+            "work_dir": "/scratch/corecycler",
+            "theme": "dark",
+            "unknown_field": "future value",
+            "profiles": [{"name": "Saved", "backend": "stress-ng", "future_profile_field": 3}],
         }
-        (tmp_path / "settings.json").write_text(json.dumps(data))
-        # This will likely raise TypeError on the extra field
-        s = load_settings()
-        assert isinstance(s, AppSettings)
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text(json.dumps(data))
+
+        loaded = load_settings()
+
+        assert loaded.work_dir == "/scratch/corecycler"
+        assert loaded.theme == "dark"
+        assert loaded.profiles[0].name == "Saved"
+        assert loaded.profiles[0].backend == "stress-ng"
+        assert settings_file.exists()
+        assert not (tmp_path / "settings.json.corrupt").exists()
+
+        save_settings(loaded)
+        rewritten = json.loads(settings_file.read_text())
+        assert rewritten["unknown_field"] == "future value"
+        assert rewritten["profiles"][0]["future_profile_field"] == 3
+
+    def test_unreadable_settings_file_returns_defaults_without_moving_it(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("corecycler.config.settings.CONFIG_DIR", tmp_path)
+        settings_file = tmp_path / "settings.json"
+        settings_file.write_text('{"theme": "dark"}')
+        monkeypatch.setattr(Path, "read_text", lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("denied")))
+
+        loaded = load_settings()
+
+        assert loaded == AppSettings()
+        assert settings_file.exists()
+        assert not (tmp_path / "settings.json.corrupt").exists()
 
     def test_save_creates_dir(self, tmp_path, monkeypatch):
         config_dir = tmp_path / "deep" / "nested"
@@ -388,3 +433,25 @@ class TestCorruptSettingsPreserved:
         assert loaded.work_dir == settings_mod.AppSettings().work_dir  # defaults
         assert not bad.exists()  # moved, not deleted
         assert (tmp_path / "settings.json.corrupt").read_text() == "{not valid json"
+
+
+class TestUpdateActiveProfile:
+    def test_replaces_active_values_but_preserves_saved_name(self):
+        settings = AppSettings(
+            profiles=[TestProfile(name="First"), TestProfile(name="Saved", backend="mprime")],
+            active_profile_idx=1,
+        )
+
+        settings.update_active_profile(TestProfile(name="Transient", backend="stress-ng", seconds_per_core=42))
+
+        assert settings.profiles[1].name == "Saved"
+        assert settings.profiles[1].backend == "stress-ng"
+        assert settings.profiles[1].seconds_per_core == 42
+
+    @pytest.mark.parametrize(
+        "settings",
+        [AppSettings(profiles=[]), AppSettings(profiles=[TestProfile()], active_profile_idx=2)],
+    )
+    def test_refuses_an_invalid_active_slot(self, settings):
+        with pytest.raises(ValueError, match="active profile"):
+            settings.update_active_profile(TestProfile())

@@ -1,8 +1,8 @@
-"""Ring B backend drift tests — the real packaged mprime on real hardware.
+"""Ring B backend drift tests for the real packaged mprime on real hardware.
 
-The config contract was verified against mprime 31.04; a version outside the
-verified set means the CpuSupports/EnableSetAffinity semantics must be
-re-proven before its verdicts are trusted.
+The config contract was verified against mprime 31.4 build 2. Any other build
+means the CpuSupports/EnableSetAffinity semantics must be re-proven before its
+verdicts are trusted.
 """
 
 from __future__ import annotations
@@ -66,7 +66,7 @@ def test_each_mode_produces_its_own_fft_path(mode, tmp_path):
             stdout=sink,
             stderr=subprocess.STDOUT,
             cwd=str(tmp_path),
-            preexec_fn=execution.make_preexec(),
+            start_new_session=True,
         )
     try:
         deadline = time.monotonic() + 20

@@ -83,7 +83,7 @@ class TestStatusTransitions:
         tab = _tab()
         tab._notify = MagicMock()
         tab._set_running_state(True)
-        tab._on_status_changed("quarantined")
+        tab._on_status_changed("profile_quarantined")
         assert tab._start_btn.isEnabled()
         assert tab._notify.called
 
@@ -97,7 +97,7 @@ class TestIsRunning:
             ("hunting", True),
             ("paused", True),
             ("idle", False),
-            ("quarantined", False),
+            ("profile_quarantined", False),
         ],
     )
     def test_is_running_tracks_active_statuses(self, status, expected):

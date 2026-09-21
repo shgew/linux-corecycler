@@ -59,7 +59,9 @@ class ParallelStress:
         self.detector.reset()
         self.work_dir.mkdir(parents=True, exist_ok=True)
 
-        cores = sorted(self.config.cores_to_test or self.topology.cores.keys())
+        cores = (
+            sorted(self.config.cores_to_test) if self.config.cores_to_test is not None else sorted(self.topology.cores)
+        )
         lanes: list[Lane] = []
         for core_id in cores:
             info = self.topology.cores.get(core_id)
@@ -77,11 +79,30 @@ class ParallelStress:
                 Lane(
                     core_id=core_id,
                     cpus=tuple(sorted(info.logical_cpus)[: self._requested_threads]),
+                    sibling_cpus=tuple(sorted(info.logical_cpus)),
                     work_dir=self.work_dir / f"core_{core_id}",
                 )
             )
         if not lanes:
             return {}
+        try:
+            if self.stress_config.memory_mb is not None:
+                per_lane_memory = self.stress_config.memory_mb // len(lanes)
+                if per_lane_memory < 1:
+                    raise RuntimeError("parallel memory budget is too small for every lane")
+            else:
+                per_lane_memory = self.backend.default_memory_mb(len(lanes))
+        except RuntimeError as exc:
+            return {
+                lane.core_id: StressResult(
+                    core_id=lane.core_id,
+                    passed=False,
+                    duration_seconds=0.0,
+                    error_message=str(exc),
+                    error_type="startup",
+                )
+                for lane in lanes
+            }
 
         supervisor = Supervisor(
             backend=self.backend,
@@ -103,6 +124,7 @@ class ParallelStress:
         def config_for(lane: Lane):
             cfg = copy.copy(self.stress_config)
             cfg.threads = len(lane.cpus)
+            cfg.memory_mb = per_lane_memory
             return cfg
 
         verdicts = supervisor.run(lanes, config_for, float(self.config.seconds_per_core))

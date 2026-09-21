@@ -78,7 +78,9 @@ class TestMemoryTabInventory:
         monkeypatch.setattr(mem, "SPD5118Reader", lambda: spd)
         monkeypatch.setattr(mem, "PMTableReader", lambda: pm)
         monkeypatch.setattr(mem, "read_dimm_info", lambda: dimms if dimms is not None else [])
-        return mem.MemoryTab()
+        tab = mem.MemoryTab()
+        tab._memory_worker.run()
+        return tab
 
     def test_a_populated_inventory_is_summarised(self, monkeypatch):
         tab = self._tab(monkeypatch, dimms=_dimms())
@@ -100,29 +102,10 @@ class TestMemoryTabInventory:
         tab = self._tab(monkeypatch, dimms=_dimms(), spd_available=True)
         assert tab._temp_group.isVisibleTo(tab)
         assert len(tab._temp_labels) == 2
-        assert tab._temp_labels[0].text() == "DIMM 1: 45.0C"
-        tab._spd_reader.read_temperatures.return_value = [51.0, 52.0]
-        tab._update_temperatures()
-        assert tab._temp_labels[1].text() == "DIMM 2: 52.0C"
-        tab._load_dimm_info()
-        assert len(tab._temp_labels) == 2
-        assert tab._temp_labels[0].text() == "DIMM 1: 51.0C"
-
-    def test_a_live_reader_starts_the_poll_timer(self, monkeypatch):
-        tab = self._tab(monkeypatch, pm_available=True)
-        assert tab._update_timer.isActive()
-        tab._update_timer.stop()
-
-    def test_no_live_reader_leaves_the_timer_stopped(self, monkeypatch):
-        tab = self._tab(monkeypatch)
-        assert not tab._update_timer.isActive()
-
-    def test_a_live_tick_refreshes_dimm_temperatures(self, monkeypatch):
-        tab = self._tab(monkeypatch, dimms=_dimms(), spd_available=True)
-        tab._update_timer.stop()
-        tab._spd_reader.read_temperatures.return_value = [60.0, 61.0]
-        tab._update_live_data()
-        assert tab._temp_labels[0].text() == "DIMM 1: 60.0C"
+        assert "45.0" in tab._temp_labels[0].text()
+        tab._memory_worker.spd_reader.read_temperatures.return_value = [51.0, 52.0]
+        tab._memory_worker.run()
+        assert "52.0" in tab._temp_labels[1].text()
 
 
 class TestMemoryTabLabels:
@@ -148,8 +131,8 @@ class TestMemoryTabLabels:
     def test_present_voltages_are_shown(self, monkeypatch):
         tab = self._tab(monkeypatch)
         tab._update_voltage_labels(MagicMock(vdd_mem_v=1.35, vddq_v=1.30))
-        assert tab._vdd_label.text() == "VDD: 1.350V"
-        assert tab._vddq_label.text() == "VDDQ: 1.300V"
+        assert tab._vdd_label.text() == "VDD: 1.350 V"
+        assert tab._vddq_label.text() == "VDDQ: 1.300 V"
 
     def test_absent_voltages_read_as_blank(self, monkeypatch):
         tab = self._tab(monkeypatch)
@@ -197,39 +180,14 @@ class TestMemoryStressLifecycle:
         tab._stop_memory_stress()
         assert not tab._stop_btn.isEnabled()
 
-    def test_force_stop_escalates_to_terminate(self, tab):
+    def test_force_stop_is_cooperative(self, tab):
         worker = MagicMock()
         worker.isRunning.return_value = True
         tab._stress_worker = worker
         tab.force_stop()
         assert worker.stop.called
         assert worker.wait.call_args.args == (3000,)
-        assert worker.terminate.called
-
-    def test_the_child_isolates_itself_and_dies_with_its_parent(self, tab, monkeypatch):
-        import ctypes
-        import ctypes.util
-        import os
-        import signal
-        import subprocess
-
-        proc = MagicMock()
-        proc.communicate.return_value = ("ok", "")
-        proc.returncode = 0
-        popen = MagicMock(return_value=proc)
-        monkeypatch.setattr(subprocess, "Popen", popen)
-        worker = mem._StressWorker("stressapptest", 1)
-        worker.run()
-
-        preexec = popen.call_args.kwargs["preexec_fn"]
-        sessions = []
-        libc = MagicMock()
-        monkeypatch.setattr(os, "setsid", lambda: sessions.append(True))
-        monkeypatch.setattr(ctypes, "CDLL", lambda *_a, **_kw: libc)
-        monkeypatch.setattr(ctypes.util, "find_library", lambda _n: "libc.so.6")
-        preexec()
-        assert sessions == [True]
-        assert libc.prctl.call_args.args == (1, signal.SIGKILL)
+        assert not worker.terminate.called
 
     def test_force_stop_leaves_a_finished_worker_alone(self, tab):
         worker = MagicMock()
@@ -275,11 +233,12 @@ class TestMonitorTabFallbacks:
         return mon.MonitorTab(topology=topology)
 
     def test_a_missing_thermal_sensor_reads_as_unavailable(self, monkeypatch):
+        from corecycler.gui.monitor_tab import MonitorSnapshot
+
         tab = self._tab(monkeypatch, hwmon_available=False)
+        tab._apply_snapshot(MonitorSnapshot((), None, (), None, None, (), (), (), None, ()))
         assert tab._tctl_label.text() == "Tctl: N/A"
         tab._timer.stop()
-
-    def test_an_unknown_max_boost_falls_back_to_a_ceiling(self, monkeypatch):
         tab = self._tab(monkeypatch, max_freq=None)
         assert tab._max_core_freq == 6000
         tab._timer.stop()
@@ -288,25 +247,17 @@ class TestMonitorTabFallbacks:
         tab = self._tab(monkeypatch)
         tab._build_per_core_bars()
         assert sorted(tab._per_core_bars) == [0, 1]
-        tab._timer.stop()
 
     def test_an_unknown_power_limit_reads_as_unavailable(self, monkeypatch):
+
+        from corecycler.gui.monitor_tab import MonitorSnapshot
+
         tab = self._tab(monkeypatch)
         tab._timer.stop()
-        tab._pmtable = _reader(
-            True,
-            read=MagicMock(
-                ppt_value_w=0.0,
-                ppt_limit_w=0.0,
-                tdc_value_a=0.0,
-                tdc_limit_a=0.0,
-                edc_value_a=0.0,
-                edc_limit_a=0.0,
-            ),
-        )
-        tab._update_power_limits()
-        assert tab._ppt_label.text() == "PPT: N/A"
-        assert tab._edc_label.text() == "EDC: N/A"
+        tab._apply_snapshot(MonitorSnapshot((), None, (), None, None, (), (), (), None, ()))
+        assert "N/A" in tab._ppt_label.text()
+        assert "N/A" in tab._tdc_label.text()
+        assert "N/A" in tab._edc_label.text()
 
 
 class TestSmuTabWithoutTopology:

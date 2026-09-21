@@ -6,6 +6,7 @@ import json
 import sys as _sys
 from functools import partial
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -92,9 +93,12 @@ class FakeEngine(QObject):
 
 
 class TestArgHandling:
+    def test_empty_argv_is_not_a_cli_invocation(self):
+        assert cli.invocation_is_cli([]) is False
+
     def test_unknown_command_refused(self, capsys):
         assert cli.cli_main(["bogus"]) == cli.EXIT_REFUSED
-        assert "headless commands" in capsys.readouterr().err
+        assert "invalid choice" in capsys.readouterr().err
 
     def test_tune_config_flag_needs_value(self):
         assert cli.cli_main(["tune", "--config"]) == cli.EXIT_REFUSED
@@ -110,8 +114,8 @@ class TestArgHandling:
         monkeypatch.setattr(cli, "cmd_run", lambda **kw: pytest.fail("help started tuning"))
         assert cli.cli_main(args) == cli.EXIT_COMPLETED
         out = capsys.readouterr().out
-        assert "corecycler tune" in out
-        assert "corecycler report" in out
+        assert "usage: corecycler" in out
+        assert args[0] in out
 
     @pytest.mark.parametrize(
         "args",
@@ -131,12 +135,12 @@ class TestArgHandling:
 
     @pytest.mark.parametrize("args", [["tune"], ["resume"], ["resume", "1"]])
     def test_valid_commands_preserve_paused_outcome(self, args, db, monkeypatch):
-        tp.create_session(db, TunerConfig(), "", "")
+        db.create_tuner_session(TunerConfig().to_json(), "", "")
         monkeypatch.setattr(cli, "cmd_run", partial(cli.cmd_run, db=db, engine_factory=lambda *_: FakeEngine("pauses")))
         assert cli.cli_main(args) == cli.EXIT_PAUSED
 
     def test_status_command_reports_sessions_without_starting_tuning(self, db, monkeypatch, capsys):
-        sid = tp.create_session(db, TunerConfig(), "", "")
+        sid = db.create_tuner_session(TunerConfig().to_json(), "", "")
         monkeypatch.setattr(cli, "cmd_status", partial(cli.cmd_status, db=db))
         assert cli.cli_main(["status"]) == cli.EXIT_COMPLETED
         out = capsys.readouterr().out
@@ -178,9 +182,8 @@ class TestStatus:
         assert "no tuner sessions" in capsys.readouterr().out
 
     def test_lists_sessions_with_done_counts(self, db, capsys):
-        sid = tp.create_session(db, TunerConfig(cores_to_test=[0, 1]), "", "")
-        tp.save_core_state(
-            db,
+        sid = db.create_tuner_session(TunerConfig(cores_to_test=[0, 1]).to_json(), "", "")
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=0,
@@ -190,8 +193,7 @@ class TestStatus:
                 baseline_offset=0,
             ),
         )
-        tp.save_core_state(
-            db,
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=1,
@@ -200,7 +202,7 @@ class TestStatus:
                 baseline_offset=0,
             ),
         )
-        tp.update_session_status(db, sid, "paused")
+        db.update_tuner_session_status(sid, "paused")
         assert cli.cmd_status(db=db) == 0
         out = capsys.readouterr().out
         assert f"#{sid}" in out
@@ -208,9 +210,8 @@ class TestStatus:
         assert "1/2 cores done" in out
 
     def test_reports_live_evidence_and_the_endurance_cursor(self, db, capsys):
-        sid = tp.create_session(db, TunerConfig(endurance=True), "", "")
-        tp.save_core_state(
-            db,
+        sid = db.create_tuner_session(TunerConfig(endurance=True).to_json(), "", "")
+        db.upsert_tuner_core_state(
             sid,
             CoreState(
                 core_id=0,
@@ -220,8 +221,7 @@ class TestStatus:
                 baseline_offset=0,
             ),
         )
-        tp.log_test_result(
-            db,
+        db.insert_tuner_test_log(
             sid,
             0,
             -41,
@@ -233,8 +233,8 @@ class TestStatus:
             fft_preset="SMALL",
             threads=2,
         )
-        tp.set_validation_position(db, sid, 9, 0, 0, False, "[]")
-        tp.set_endurance_position(db, sid, 0, 0, 1)
+        db.set_validation_position(sid, 9, 0, 0, False, "[]")
+        db.set_endurance_position(sid, 0, 0, 1)
 
         assert cli.cmd_status(db=db) == cli.EXIT_COMPLETED
         out = capsys.readouterr().out
@@ -242,13 +242,35 @@ class TestStatus:
         assert "core 0 @ -40: 0.3h live evidence (mprime AVX2 SMALL 2T 0.3h)" in out
 
     def test_an_unreadable_config_still_lists_sessions(self, db, capsys):
-        sid = tp.create_session(db, TunerConfig(), "", "")
-        tp.update_session_config(db, sid, '{"fine_step": 0}')
+        sid = db.create_tuner_session(TunerConfig().to_json(), "", "")
+        db.update_tuner_session_config(sid, '{"fine_step": 0}')
 
         assert cli.cmd_status(db=db) == cli.EXIT_COMPLETED
         out = capsys.readouterr().out
         assert f"#{sid}" in out
         assert "config unreadable" in out
+
+    def test_read_failure_has_distinct_history_exit(self, capsys):
+        broken = MagicMock()
+        broken.list_tuner_sessions.side_effect = PermissionError("denied")
+
+        assert cli.cmd_status(db=broken) == cli.EXIT_HISTORY
+        assert "cannot read tuner history" in capsys.readouterr().err
+
+    @pytest.mark.parametrize("failure", ["open", "close"])
+    def test_owned_history_lifecycle_failure_has_distinct_exit(self, monkeypatch, capsys, failure):
+        from corecycler.history import db as history_db
+
+        if failure == "open":
+            monkeypatch.setattr(history_db, "HistoryDB", lambda: (_ for _ in ()).throw(PermissionError("open failed")))
+        else:
+            broken = MagicMock()
+            broken.list_tuner_sessions.return_value = []
+            broken.close.side_effect = OSError("close failed")
+            monkeypatch.setattr(history_db, "HistoryDB", lambda: broken)
+
+        assert cli.cmd_status() == cli.EXIT_HISTORY
+        assert "tuner history" in capsys.readouterr().err
 
 
 class TestReport:
@@ -268,21 +290,21 @@ class TestReport:
 
     def test_bad_argument_shape_is_refused(self, capsys):
         assert cli._dispatch_report(["1", "2"]) == cli.EXIT_REFUSED
-        assert "expected [SESSION_ID] [--json]" in capsys.readouterr().err
+        assert "unrecognized arguments" in capsys.readouterr().err
 
     def test_non_integer_session_id_is_refused_by_the_cli(self, capsys):
         assert cli.cli_main(["report", "latest"]) == cli.EXIT_REFUSED
         captured = capsys.readouterr()
         assert captured.out == ""
-        assert captured.err == "corecycler report: invalid session id 'latest'\n"
+        assert "invalid int value" in captured.err
 
     def test_cli_opens_history_and_reports_the_latest_session(self, tmp_path, monkeypatch, capsys):
         from corecycler.history import db as history_db
 
         path = tmp_path / "report.sqlite"
         seeded = HistoryDB(path)
-        tp.create_session(seeded, TunerConfig(), "Old BIOS", "Old CPU")
-        latest = tp.create_session(seeded, TunerConfig(), "New BIOS", "New CPU")
+        seeded.create_tuner_session(TunerConfig().to_json(), "Old BIOS", "Old CPU")
+        latest = seeded.create_tuner_session(TunerConfig().to_json(), "New BIOS", "New CPU")
         seeded.close()
         monkeypatch.setattr(history_db, "HistoryDB", lambda: HistoryDB(path))
 
@@ -299,7 +321,7 @@ class TestReport:
 
         monkeypatch.setattr(history_db, "HistoryDB", fail_to_open)
 
-        assert cli.cli_main(["report", "--json"]) == cli.EXIT_REFUSED
+        assert cli.cli_main(["report", "--json"]) == cli.EXIT_HISTORY
         captured = capsys.readouterr()
         assert captured.out == ""
         assert captured.err == ("corecycler report: cannot read tuner history: permission denied\n")
@@ -311,7 +333,7 @@ class TestReport:
         path.write_bytes(b"not a sqlite database")
         monkeypatch.setattr(history_db, "HistoryDB", lambda: HistoryDB(path))
 
-        assert cli.cli_main(["report", "--json"]) == cli.EXIT_REFUSED
+        assert cli.cli_main(["report", "--json"]) == cli.EXIT_HISTORY
         captured = capsys.readouterr()
         assert captured.out == ""
         assert "corecycler report: cannot read tuner history" in captured.err
@@ -323,10 +345,10 @@ class TestReport:
         def fail(*_args):
             raise RuntimeError("boom")
 
-        sid = tp.create_session(db, TunerConfig(), "", "")
+        sid = db.create_tuner_session(TunerConfig().to_json(), "", "")
         monkeypatch.setattr(tuner_report, "build", fail)
 
-        assert cli.cmd_report(session_id=sid, as_json=True, db=db) == cli.EXIT_REFUSED
+        assert cli.cmd_report(session_id=sid, as_json=True, db=db) == cli.EXIT_HISTORY
         captured = capsys.readouterr()
         assert captured.out == ""
         assert captured.err == "corecycler report: cannot read tuner history: boom\n"
@@ -346,7 +368,7 @@ class TestReport:
 
         monkeypatch.setattr(history_db, "HistoryDB", BrokenHistory)
 
-        assert cli.cmd_report() == cli.EXIT_REFUSED
+        assert cli.cmd_report() == cli.EXIT_HISTORY
         captured = capsys.readouterr()
         assert captured.out == ""
         assert captured.err == "corecycler report: cannot read tuner history: read failed\n"
@@ -367,23 +389,21 @@ class TestReport:
 
         monkeypatch.setattr(history_db, "HistoryDB", BrokenHistory)
 
-        assert cli.cmd_report() == cli.EXIT_REFUSED
+        assert cli.cmd_report() == cli.EXIT_HISTORY
         captured = capsys.readouterr()
         assert captured.out == ""
         assert captured.err == "corecycler report: cannot read tuner history: close failed\n"
         assert closed == [True]
 
     def test_json_reports_per_core_offsets(self, db, monkeypatch, capsys):
-        sid = tp.create_session(db, TunerConfig(cores_to_test=[0, 1]), "Test BIOS", "Test CPU")
-        tp.save_core_state(
-            db,
+        sid = db.create_tuner_session(TunerConfig(cores_to_test=[0, 1]).to_json(), "Test BIOS", "Test CPU")
+        db.upsert_tuner_core_state(
             sid,
-            CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30),
+            CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30, proven_offset=-30),
         )
-        tp.save_core_state(
-            db,
+        db.upsert_tuner_core_state(
             sid,
-            CoreState(core_id=1, phase=TunerPhase.CONFIRMED, current_offset=-22, best_offset=-22),
+            CoreState(core_id=1, phase=TunerPhase.CONFIRMED, current_offset=-22, best_offset=-22, proven_offset=-22),
         )
         monkeypatch.setattr(cli, "cmd_report", partial(cli.cmd_report, db=db))
 
@@ -395,10 +415,9 @@ class TestReport:
 
 class TestSeedFrom:
     def _prior(self, db, offsets: dict[int, int]) -> int:
-        sid = tp.create_session(db, TunerConfig(cores_to_test=sorted(offsets)), "Test BIOS", "Test CPU")
+        sid = db.create_tuner_session(TunerConfig(cores_to_test=sorted(offsets)).to_json(), "Test BIOS", "Test CPU")
         for core_id, offset in offsets.items():
-            tp.save_core_state(
-                db,
+            db.upsert_tuner_core_state(
                 sid,
                 CoreState(
                     core_id=core_id,
@@ -434,23 +453,47 @@ class TestSeedFrom:
         code, engine = self._run(db, 999)
         assert code == cli.EXIT_REFUSED
         assert engine is None
-        assert "no session 999" in capsys.readouterr().err
+        assert "session 999 not found" in capsys.readouterr().err
 
     def test_seeding_from_a_session_that_learned_nothing_refuses(self, db, capsys):
         """Silently starting from stock would look like a seeded run and quietly
         throw away the hours the operator meant to carry forward."""
-        sid = tp.create_session(db, TunerConfig(), "Test BIOS", "Test CPU")
+        sid = db.create_tuner_session(TunerConfig().to_json(), "Test BIOS", "Test CPU")
         code, engine = self._run(db, sid)
         assert code == cli.EXIT_REFUSED
         assert engine is None
         assert "learned no offsets" in capsys.readouterr().err
 
+    @pytest.mark.parametrize(
+        "config",
+        [
+            TunerConfig(cores_to_test=[1]),
+            TunerConfig(cores_to_test=[0], direction=1, max_offset=10),
+        ],
+    )
+    def test_seed_with_no_applicable_offset_is_refused(self, db, tmp_path, capsys, config):
+        sid = self._prior(db, {0: -30})
+        config_path = tmp_path / "config.json"
+        config_path.write_text(config.to_json())
+
+        code = cli.cmd_run(
+            str(config_path),
+            None,
+            False,
+            seed_from=sid,
+            engine_factory=lambda *_: pytest.fail("inapplicable seed reached engine"),
+            db=db,
+        )
+
+        assert code == cli.EXIT_REFUSED
+        assert "no offsets applicable" in capsys.readouterr().err
+
     def test_a_quarantined_source_is_rejected_before_reading_offsets(self, db, monkeypatch, capsys):
         sid = self._prior(db, {0: -30})
-        tp.update_session_status(db, sid, "quarantined")
+        db.update_tuner_session_status(sid, "quarantined")
         monkeypatch.setattr(
-            tp,
-            "get_session_offsets",
+            db,
+            "get_tuner_session_offsets",
             lambda *_: pytest.fail("quarantined offsets were treated as seed hypotheses"),
         )
 
@@ -464,21 +507,20 @@ class TestSeedFrom:
         ("mark_unresolved", "description"),
         [
             (
-                lambda db, sid: tp.set_resume_crash_streak(db, sid, 1),
+                lambda db, sid: db.set_resume_crash_streak(sid, 1),
                 "crash recovery",
             ),
             (
-                lambda db, sid: tp.set_unattributed_crashes(db, sid, 1),
+                lambda db, sid: db.set_unattributed_crashes(sid, 1),
                 "unattributed crash",
             ),
-            (lambda db, sid: tp.set_hunting_core(db, sid, 0), "isolated hunt"),
             (
-                lambda db, sid: tp.set_hunt_state(db, sid, '{"stage":"control"}'),
+                lambda db, sid: db.set_hunt_state(sid, '{"stage":"control"}'),
                 "crash hunt",
             ),
             (
                 lambda db, sid: tp.journal_co_intent(db, sid, 0, -30, False),
-                "crash evidence",
+                "unapplied journal",
             ),
         ],
     )
@@ -488,8 +530,8 @@ class TestSeedFrom:
         sid = self._prior(db, {0: -30})
         mark_unresolved(db, sid)
         monkeypatch.setattr(
-            tp,
-            "get_session_offsets",
+            db,
+            "get_tuner_session_offsets",
             lambda *_: pytest.fail("unresolved offsets were treated as seed hypotheses"),
         )
 
@@ -498,6 +540,35 @@ class TestSeedFrom:
         assert code == cli.EXIT_REFUSED
         assert engine is None
         assert description in capsys.readouterr().err
+
+    def test_seed_source_history_failure_has_distinct_exit(self, db, monkeypatch, capsys):
+        monkeypatch.setattr(db, "get_tuner_session", MagicMock(side_effect=OSError("source failed")))
+
+        code, engine = self._run(db, 7)
+
+        assert code == cli.EXIT_HISTORY
+        assert engine is None
+        assert capsys.readouterr().err == "corecycler tune: cannot read tuner history: source failed\n"
+
+    def test_seed_journal_history_failure_has_distinct_exit(self, db, monkeypatch, capsys):
+        sid = self._prior(db, {0: -30})
+        monkeypatch.setattr(db, "journal_suspects", MagicMock(side_effect=OSError("journal failed")))
+
+        code, engine = self._run(db, sid)
+
+        assert code == cli.EXIT_HISTORY
+        assert engine is None
+        assert capsys.readouterr().err == "corecycler tune: cannot read tuner history: journal failed\n"
+
+    def test_seed_offsets_history_failure_has_distinct_exit(self, db, monkeypatch, capsys):
+        sid = self._prior(db, {0: -30})
+        monkeypatch.setattr(db, "get_tuner_session_offsets", MagicMock(side_effect=OSError("offsets failed")))
+
+        code, engine = self._run(db, sid)
+
+        assert code == cli.EXIT_HISTORY
+        assert engine is None
+        assert capsys.readouterr().err == "corecycler tune: cannot read tuner history: offsets failed\n"
 
     def test_the_flag_reaches_cmd_run(self, db, monkeypatch):
         sid = self._prior(db, {0: -37})
@@ -625,9 +696,9 @@ class TestResumeConfigOverride:
         path.write_text(TunerConfig(**kw).to_json())
         return str(path)
 
-    def _completed_session(self, db, **kw):
-        sid = tp.create_session(db, TunerConfig(**kw), "", "")
-        tp.update_session_status(db, sid, "completed")
+    def _resumable_session(self, db, **kw):
+        sid = db.create_tuner_session(TunerConfig(**kw).to_json(), "", "")
+        db.update_tuner_session_status(sid, "paused")
         return sid
 
     @pytest.mark.parametrize(
@@ -650,8 +721,17 @@ class TestResumeConfigOverride:
         assert cli.cli_main(["resume", "7", "--config", "f.json"]) == cli.EXIT_COMPLETED
         assert seen == {"config_path": "f.json", "resume_id": 7, "auto_resume": False}
 
+    def test_completed_session_is_rejected_before_engine_start(self, db, capsys):
+        sid = db.create_tuner_session(TunerConfig().to_json(), "", "")
+        db.update_tuner_session_status(sid, "completed")
+
+        code = cli.cmd_run(None, sid, False, engine_factory=lambda *_: pytest.fail("completed session resumed"), db=db)
+
+        assert code == cli.EXIT_REFUSED
+        assert "completed" in capsys.readouterr().err
+
     def test_a_compatible_override_replaces_the_saved_config(self, db, tmp_path):
-        sid = self._completed_session(db)
+        sid = self._resumable_session(db)
         made = []
 
         def factory(_db, cfg):
@@ -661,12 +741,12 @@ class TestResumeConfigOverride:
         code = cli.cmd_run(self._cfg_file(tmp_path, endurance=True), sid, False, engine_factory=factory, db=db)
 
         assert code == cli.EXIT_COMPLETED
-        assert TunerConfig.from_json(tp.get_session(db, sid).config_json).endurance is True
+        assert TunerConfig.from_json(db.get_tuner_session(sid).config_json).endurance is True
         assert made[0].endurance is True  # the engine runs the replacement, not the stale config
 
     def test_a_search_defining_change_is_refused(self, db, tmp_path, capsys):
-        sid = self._completed_session(db)
-        before = tp.get_session(db, sid).config_json
+        sid = self._resumable_session(db)
+        before = db.get_tuner_session(sid).config_json
         code = cli.cmd_run(
             self._cfg_file(tmp_path, fine_step=2, endurance=True),
             sid,
@@ -675,13 +755,13 @@ class TestResumeConfigOverride:
             db=db,
         )
         assert code == cli.EXIT_REFUSED
-        assert tp.get_session(db, sid).config_json == before
+        assert db.get_tuner_session(sid).config_json == before
         assert "fine_step" in capsys.readouterr().err
 
     def test_a_quarantined_session_is_refused(self, db, tmp_path, capsys):
-        sid = self._completed_session(db)
-        tp.update_session_status(db, sid, "quarantined")
-        before = tp.get_session(db, sid).config_json
+        sid = self._resumable_session(db)
+        db.update_tuner_session_status(sid, "quarantined")
+        before = db.get_tuner_session(sid).config_json
         code = cli.cmd_run(
             self._cfg_file(tmp_path, endurance=True),
             sid,
@@ -690,7 +770,7 @@ class TestResumeConfigOverride:
             db=db,
         )
         assert code == cli.EXIT_REFUSED
-        assert tp.get_session(db, sid).config_json == before
+        assert db.get_tuner_session(sid).config_json == before
         assert "quarantined" in capsys.readouterr().err
 
 
@@ -713,14 +793,116 @@ class TestCmdStatusOwnDb:
 def _fake_topology():
     from corecycler.engine.topology import CPUTopology, PhysicalCore
 
-    topo = CPUTopology(model_name="AMD Ryzen 9 9950X3D 16-Core Processor", family=26, model=0x44)
-    topo.cores = {cid: PhysicalCore(core_id=cid, ccd=cid // 8, ccx=None, logical_cpus=(cid,)) for cid in range(16)}
+    topo = CPUTopology(
+        model_name="AMD Ryzen 9 9950X3D 16-Core Processor",
+        family=26,
+        model=0x44,
+        ccd_layout_known=True,
+        cpus_all_online=True,
+    )
+    topo.cores = {
+        cid: PhysicalCore(core_id=cid, ccd=cid // 8, logical_cpus=(cid,), has_vcache=True) for cid in range(16)
+    }
     return topo
+
+
+class TestRunHistoryBoundary:
+    def test_open_failure_has_distinct_exit(self, monkeypatch, capsys):
+        from corecycler.history import db as history_db
+
+        monkeypatch.setattr(history_db, "HistoryDB", lambda: (_ for _ in ()).throw(PermissionError("denied")))
+
+        assert (
+            cli.cmd_run(None, None, False, engine_factory=lambda *_: pytest.fail("history failure reached engine"))
+            == cli.EXIT_HISTORY
+        )
+        assert "cannot read tuner history" in capsys.readouterr().err
+
+    def test_resume_read_failure_has_distinct_exit(self, capsys):
+        broken = MagicMock()
+        broken.get_tuner_session.side_effect = OSError("corrupt")
+
+        assert (
+            cli.cmd_run(
+                None, 7, False, engine_factory=lambda *_: pytest.fail("history failure reached engine"), db=broken
+            )
+            == cli.EXIT_HISTORY
+        )
+        assert "cannot read tuner history" in capsys.readouterr().err
+
+    def test_auto_resume_history_failure_has_distinct_exit(self, capsys):
+        broken = MagicMock()
+        broken.list_resumable_tuner_sessions.side_effect = OSError("list failed")
+
+        code = cli.cmd_run(
+            None,
+            None,
+            True,
+            engine_factory=lambda *_: pytest.fail("history failure reached engine"),
+            db=broken,
+        )
+
+        assert code == cli.EXIT_HISTORY
+        assert capsys.readouterr().err == "corecycler resume: cannot read tuner history: list failed\n"
+
+    def test_owned_history_is_closed_when_engine_construction_raises(self, monkeypatch):
+        from corecycler.history import db as history_db
+
+        owned = MagicMock()
+        monkeypatch.setattr(history_db, "HistoryDB", lambda: owned)
+
+        with pytest.raises(RuntimeError, match="engine failed"):
+            cli.cmd_run(
+                None,
+                None,
+                False,
+                engine_factory=lambda *_: (_ for _ in ()).throw(RuntimeError("engine failed")),
+            )
+
+        owned.close.assert_called_once()
+
+    def test_close_failure_during_engine_error_is_reported_without_masking_it(self, monkeypatch, capsys):
+        from corecycler.history import db as history_db
+
+        owned = MagicMock()
+        owned.close.side_effect = OSError("close failed")
+        monkeypatch.setattr(history_db, "HistoryDB", lambda: owned)
+
+        with pytest.raises(RuntimeError, match="engine failed"):
+            cli.cmd_run(
+                None,
+                None,
+                False,
+                engine_factory=lambda *_: (_ for _ in ()).throw(RuntimeError("engine failed")),
+            )
+
+        assert capsys.readouterr().err == "corecycler: cannot close tuner history: close failed\n"
+
+    def test_close_failure_has_distinct_exit(self, monkeypatch, capsys):
+        from corecycler.history import db as history_db
+
+        owned = MagicMock()
+        owned.close.side_effect = OSError("close failed")
+        monkeypatch.setattr(history_db, "HistoryDB", lambda: owned)
+
+        assert cli.cmd_run(None, None, False, engine_factory=lambda *_: FakeEngine("completes")) == cli.EXIT_HISTORY
+        assert "cannot close tuner history" in capsys.readouterr().err
 
 
 class TestRunPreflightRefusals:
     def _run(self, db):
         return cli.cmd_run(None, None, False, db=db)
+
+    def test_smu_co_range_is_applied_to_config_validation(self, db, monkeypatch, capsys):
+        monkeypatch.setattr("corecycler.engine.topology.detect_topology", _fake_topology)
+        monkeypatch.setattr(cli, "_build_smu", lambda _t: MagicMock(commands=MagicMock(co_range=(-10, 10))))
+        monkeypatch.setattr(
+            "corecycler.engine.backends.get_backend",
+            lambda *_: pytest.fail("out-of-range config reached backend selection"),
+        )
+
+        assert self._run(db) == cli.EXIT_REFUSED
+        assert "invalid tuner config" in capsys.readouterr().err
 
     def test_topology_detection_failure_refused(self, db, monkeypatch, capsys):
         monkeypatch.setattr("corecycler.engine.topology.detect_topology", lambda: None)
@@ -735,7 +917,7 @@ class TestRunPreflightRefusals:
 
     def test_unknown_backend_refused(self, db, monkeypatch, capsys):
         monkeypatch.setattr("corecycler.engine.topology.detect_topology", _fake_topology)
-        monkeypatch.setattr(cli, "_build_smu", lambda _t: object())
+        monkeypatch.setattr(cli, "_build_smu", lambda _t: MagicMock(commands=MagicMock(co_range=(-50, 10))))
 
         def boom(name):
             raise KeyError(name)
@@ -745,10 +927,9 @@ class TestRunPreflightRefusals:
         assert "unknown backend" in capsys.readouterr().err
 
     def test_backend_not_installed_refused(self, db, monkeypatch, capsys):
-        from unittest.mock import MagicMock
 
         monkeypatch.setattr("corecycler.engine.topology.detect_topology", _fake_topology)
-        monkeypatch.setattr(cli, "_build_smu", lambda _t: object())
+        monkeypatch.setattr(cli, "_build_smu", lambda _t: MagicMock(commands=MagicMock(co_range=(-50, 10))))
         from corecycler.config.tools import Resolution
 
         backend = MagicMock()
@@ -826,8 +1007,8 @@ class TestRunStatusAndSignal:
         assert made[0].status == "paused"
 
     def test_auto_resume_falls_back_to_first_resumable(self, db):
-        sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
-        tp.update_session_status(db, sid, "paused")
+        sid = db.create_tuner_session(TunerConfig(cores_to_test=[0]).to_json(), "", "")
+        db.update_tuner_session_status(sid, "paused")
         made = []
 
         def factory(_db, _config):
@@ -848,10 +1029,9 @@ class TestRunEngineConstruction:
         assert code == cli.EXIT_COMPLETED
 
     def test_real_engine_built_when_preflight_passes(self, db, monkeypatch):
-        from unittest.mock import MagicMock
 
         monkeypatch.setattr("corecycler.engine.topology.detect_topology", _fake_topology)
-        monkeypatch.setattr(cli, "_build_smu", lambda _t: object())
+        monkeypatch.setattr(cli, "_build_smu", lambda _t: MagicMock(commands=MagicMock(co_range=(-50, 10))))
         backend = MagicMock()
         backend.is_available.return_value = True
         monkeypatch.setattr("corecycler.engine.backends.get_backend", lambda _n: backend)
@@ -954,7 +1134,7 @@ class TestDoctor:
         monkeypatch.setattr(
             cli.tools,
             "report",
-            lambda: self._resolutions({"stress-ng", "systemd-run", "setpriv"}),
+            lambda: self._resolutions({"stress-ng", "systemd-run", "systemctl", "setpriv"}),
         )
         assert cli.cmd_doctor() == cli.EXIT_COMPLETED
         assert "doctor: ok" in capsys.readouterr().out

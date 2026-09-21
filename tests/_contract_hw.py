@@ -3,22 +3,22 @@
 Two tiers, because a live check can need the hardware, the privileges, or both:
 
     CORECYCLER_HW_CONTRACTS=1 pytest -m contract       # this machine has the hardware
-    CORECYCLER_HW_PRIVILEGED=1 pytest -m contract      # and this process has the rights
+    CORECYCLER_HW_CONTRACTS=1 CORECYCLER_HW_PRIVILEGED=1 pytest -m contract
+                                                       # and this process has the rights
 
 Under the first, an absent hardware resource is a HARD FAILURE: a drift-check
 that silently green-skips on the very machine meant to run it would hide a gap
 (the owner's never-silent rule). Reading MSRs (CAP_SYS_RAWIO), dmidecode
 (root) and the SMU mailbox (the corecycler group) additionally need privileges
 a plain run does not hold, so those checks are fatal only under the second
-flag and otherwise skip naming exactly what is uncovered -- a run without them
-is still worth having. Without either variable every absent resource skips
-with its reason.
+flag and otherwise skip naming exactly what is uncovered - a run without them
+is still worth having. Without the hardware-contract switch, every absent
+resource skips with its reason.
 """
 
 from __future__ import annotations
 
 import os
-import re
 from typing import TYPE_CHECKING
 
 import pytest
@@ -29,22 +29,11 @@ if TYPE_CHECKING:
 HW_CONTRACTS = os.environ.get("CORECYCLER_HW_CONTRACTS") == "1"
 HW_PRIVILEGED = os.environ.get("CORECYCLER_HW_PRIVILEGED") == "1"
 
-# `contract`, but not the `not contract` that excludes it.
-_ASKS_FOR_CONTRACT = re.compile(r"(?<!\bnot )\bcontract\b")
 
-
-def ring_b_requested(markexpr: str, env: Mapping[str, str] | None = None) -> bool:
-    """Whether this run deliberately asked for the live tier.
-
-    Ring B drives real systemd scopes, real stress binaries and real hardware.
-    `-m "not slow"` does not filter the `contract` marker, so without this gate
-    the everyday hermetic run spawns them as a side effect on any box that
-    happens to have the resources. Selecting them has to be deliberate.
-    """
+def hw_contracts_requested(env: Mapping[str, str] | None = None) -> bool:
+    """Return whether the explicit live-hardware switch is enabled."""
     environ = os.environ if env is None else env
-    if environ.get("CORECYCLER_HW_CONTRACTS") == "1" or environ.get("CORECYCLER_HW_PRIVILEGED") == "1":
-        return True
-    return bool(_ASKS_FOR_CONTRACT.search(markexpr or ""))
+    return environ.get("CORECYCLER_HW_CONTRACTS") == "1"
 
 
 def require(resource_present: bool, reason: str) -> None:

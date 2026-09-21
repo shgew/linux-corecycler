@@ -6,6 +6,8 @@ import json
 import re
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
 from corecycler.tuner import bisect
 from corecycler.tuner.bisect import HuntState, InvalidHuntState, Stage
@@ -36,6 +38,36 @@ def run_hunt(
             max_no_reproduce=max_no_reproduce,
         )
     return state, probes
+
+
+def _state_at(stage: Stage) -> HuntState:
+    if stage is Stage.CONTROL:
+        return bisect.begin([0, 1, 2, 3], [0])
+
+    state = bisect.begin([0, 1, 2, 3], [0])
+    bisect.next_live_set(state)
+    bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
+    if stage is Stage.PROBE:
+        return state
+    if stage is Stage.CONFIRM:
+        state.pending = [[0]]
+        bisect.next_live_set(state)
+        return state
+    if stage is Stage.CULPRIT:
+        state.pending = [[0]]
+        bisect.next_live_set(state)
+        bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
+        return state
+    if stage is Stage.EXHAUSTED:
+        state.pending = [[0]]
+        bisect.next_live_set(state)
+        bisect.record(state, reproduced=True, control_confirmations=1, max_no_reproduce=1)
+        return state
+
+    state = bisect.begin([0, 1, 2, 3], [0])
+    bisect.next_live_set(state)
+    bisect.record(state, reproduced=True, control_confirmations=1, max_no_reproduce=1)
+    return state
 
 
 class TestControl:
@@ -72,48 +104,41 @@ class TestIsolation:
 
     def test_two_culprits_are_both_found(self):
         state, _ = run_hunt(list(range(8)), {1, 6}, cap=400)
-        assert set(state.found) == {1, 6} or state.stage is Stage.CULPRIT
+        assert state.stage is Stage.CULPRIT
+        assert set(state.found) == {1, 6}
+        assert state.pending == []
 
-    def test_confirmation_can_exonerate(self):
-        """A suspect that survives its longer look is not blamed."""
+    def test_confirmation_uses_persisted_leave_one_out_mask(self):
         state = bisect.begin([3], [3])
         bisect.next_live_set(state)
         bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=3)
-        assert bisect.next_live_set(state) == [3]
+        assert bisect.next_live_set(state) == []
         assert state.stage is Stage.CONFIRM
-        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=1)
+        assert state.candidates == [3]
+        assert state.suspect == 3
+        restored = HuntState.from_json(state.to_json())
+        assert restored is not None
+        assert restored.in_flight == []
+        bisect.record(state, reproduced=True, control_confirmations=2, max_no_reproduce=1)
         assert state.found == []
         assert state.exonerated == [3]
         assert state.stage is Stage.EXHAUSTED
 
-    def test_exonerated_singleton_does_not_convict_first_core_of_next_set(self):
-        state = bisect.begin(list(range(8)), [0])
-        responses = {
-            (0, 1, 2, 3): True,
-            (4, 5, 6, 7): True,
-            (0, 1): True,
-            (2, 3): False,
-            (0,): True,
-            (1,): False,
-            (4, 5): True,
-            (6, 7): False,
-            (4,): False,
-            (5,): True,
-        }
-
-        while state.stage not in (Stage.CULPRIT, Stage.PLATFORM, Stage.EXHAUSTED):
-            live = bisect.next_live_set(state)
-            assert live is not None
-            reproduced = False if state.stage is Stage.CONTROL else responses[tuple(live)]
-            if state.stage is Stage.CONFIRM and live == [0]:
-                reproduced = False
-            bisect.record(state, reproduced=reproduced, control_confirmations=2, max_no_reproduce=3)
-            if state.exonerated == [0] and state.stage is Stage.PROBE:
-                assert state.found == []
-
+    @given(st.integers(min_value=1, max_value=32), st.integers(min_value=0, max_value=31))
+    @settings(max_examples=64, deadline=None)
+    def test_every_single_culprit_hunt_terminates_with_that_culprit(self, count, raw_culprit):
+        culprit = raw_culprit % count
+        state, probes = run_hunt(list(range(count)), {culprit}, cap=500)
         assert state.stage is Stage.CULPRIT
-        assert state.found == [5]
-        assert state.exonerated == [0]
+        assert state.found == [culprit]
+        assert probes <= 4 * count + 2
+
+    @given(st.integers(min_value=2, max_value=32))
+    @settings(max_examples=32, deadline=None)
+    def test_every_clean_hunt_terminates(self, count):
+        state, probes = run_hunt(list(range(count)), set(), max_no_reproduce=2, cap=500)
+        assert state.stage is Stage.EXHAUSTED
+        assert probes <= 4 * count + 2
 
 
 class TestNonReproduction:
@@ -136,11 +161,10 @@ class TestNonReproduction:
 
 class TestBudget:
     def test_budget_grows_with_depth(self):
-        shallow = HuntState(stage=Stage.PROBE, level=1)
-        deep = HuntState(stage=Stage.PROBE, level=3)
+        shallow = HuntState(stage=Stage.PROBE, level=1, observed_failure_time=0.0)
+        deep = HuntState(stage=Stage.PROBE, level=3, observed_failure_time=0.0)
         kw = {
             "base": 1800,
-            "observed_mttf": 0.0,
             "mttf_multiplier": 4.0,
             "level_multiplier": 1.5,
             "final_multiplier": 4.0,
@@ -148,11 +172,10 @@ class TestBudget:
         assert bisect.probe_seconds(deep, **kw) > bisect.probe_seconds(shallow, **kw)
 
     def test_confirmation_gets_the_longest_look(self):
-        probe = HuntState(stage=Stage.PROBE, level=2)
-        confirm = HuntState(stage=Stage.CONFIRM, level=2)
+        probe = HuntState(stage=Stage.PROBE, level=2, observed_failure_time=900.0)
+        confirm = HuntState(stage=Stage.CONFIRM, level=2, observed_failure_time=900.0)
         kw = {
             "base": 1800,
-            "observed_mttf": 0.0,
             "mttf_multiplier": 4.0,
             "level_multiplier": 1.5,
             "final_multiplier": 4.0,
@@ -160,16 +183,16 @@ class TestBudget:
         assert bisect.probe_seconds(confirm, **kw) == bisect.probe_seconds(probe, **kw) * 4
 
     def test_a_fast_failure_still_gets_the_floor(self):
-        state = HuntState(stage=Stage.PROBE)
+        state = HuntState(stage=Stage.PROBE, observed_failure_time=5.0)
         seconds = bisect.probe_seconds(
-            state, base=1800, observed_mttf=5.0, mttf_multiplier=4.0, level_multiplier=1.5, final_multiplier=4.0
+            state, base=1800, mttf_multiplier=4.0, level_multiplier=1.5, final_multiplier=4.0
         )
         assert seconds == 1800
 
     def test_a_slow_failure_stretches_the_budget(self):
-        state = HuntState(stage=Stage.PROBE)
+        state = HuntState(stage=Stage.PROBE, observed_failure_time=900.0)
         seconds = bisect.probe_seconds(
-            state, base=1800, observed_mttf=900.0, mttf_multiplier=4.0, level_multiplier=1.5, final_multiplier=4.0
+            state, base=1800, mttf_multiplier=4.0, level_multiplier=1.5, final_multiplier=4.0
         )
         assert seconds == 3600
 
@@ -195,6 +218,15 @@ class TestPersistence:
         restored = HuntState.from_json(state.to_json())
 
         assert restored == state
+        assert restored.observed_failure_time == 0.0
+
+    def test_observed_failure_time_survives_a_round_trip(self):
+        state = bisect.begin([0, 1], [0], observed_failure_time=123.5)
+
+        restored = HuntState.from_json(state.to_json())
+
+        assert restored is not None
+        assert restored.observed_failure_time == 123.5
 
     def test_empty_state_is_absent(self):
         assert HuntState.from_json("") is None
@@ -209,148 +241,144 @@ class TestPersistence:
             HuntState.from_json(blob)
 
     @pytest.mark.parametrize(
-        ("changes", "message"),
+        "changes",
         [
-            ({"version": 2}, "unsupported version"),
-            ({"level": float("nan")}, "non-finite number NaN"),
-            ({"control_fails": True}, "control_fails must be an integer from 0"),
-            ({"control_fails": -1}, "control_fails must be an integer from 0"),
-            ({"control_fails": 2**31}, "control_fails must be an integer from 0"),
-            ({"no_reproduce": float("inf")}, "non-finite number Infinity"),
-            ({"pending": {}}, "pending must be a list"),
-            ({"in_flight": {}}, "in_flight must be a list"),
-            ({"pending": [0]}, "pending[0] must be a list"),
-            ({"pending": [[]]}, "pending[0] must not be empty"),
-            ({"pending": [[1, 0]]}, "pending[0] must be a sorted set of core IDs"),
-            ({"pending": [[0, 0]]}, "pending[0] must be a sorted set of core IDs"),
-            ({"pending": [[0], [0]]}, "pending must not contain duplicate sets"),
-            ({"loaded": [-1]}, "loaded core must be an integer from 0"),
-            ({"loaded": [True]}, "loaded core must be an integer from 0"),
-            ({"loaded": [0, 0]}, "loaded must be a sorted set of core IDs"),
-            ({"loaded": [1, 0]}, "loaded must be a sorted set of core IDs"),
-            ({"vector": []}, "vector must be an object"),
-            ({"vector": {"core": -1}}, "vector contains a non-integer core ID"),
-            ({"vector": {"00": -1}}, "vector contains an invalid core ID"),
-            ({"vector": {str(2**31): -1}}, "vector contains an invalid core ID"),
-            ({"vector": {"0": 2**31}}, "vector offsets must be bounded integers"),
-            ({"vector": {"0": True}}, "vector offsets must be bounded integers"),
-            ({"armed": 1}, "armed must be a boolean"),
-            ({"armed": True}, "an armed probe requires its exact vector"),
-            ({"workload": []}, "workload[0] must be a dict"),
-            ({"pending": [[0, 1], [1, 2]]}, "pending sets must be disjoint"),
-            ({"queue": [[0, 1], [1, 2]]}, "queued sets must be disjoint"),
-            ({"guilty_halves": [[0, 1], [1, 2]]}, "guilty sets must be disjoint"),
-            ({"found": [0], "exonerated": [0]}, "found and exonerated sets must be disjoint"),
-            ({"level": 1}, "control stage has impossible search progress"),
+            {"version": 1},
+            {"level": float("nan")},
+            {"control_fails": True},
+            {"control_fails": -1},
+            {"control_fails": 2**31},
+            {"no_reproduce": float("inf")},
+            {"observed_failure_time": -1},
+            {"observed_failure_time": True},
+            {"observed_failure_time": "slow"},
+            {"pending": {}},
+            {"in_flight": {}},
+            {"pending": [0]},
+            {"pending": [[]]},
+            {"pending": [[1, 0]]},
+            {"pending": [[0, 0]]},
+            {"pending": [[0], [0]]},
+            {"loaded": [-1]},
+            {"loaded": [True]},
+            {"loaded": [0, 0]},
+            {"loaded": [1, 0]},
+            {"vector": []},
+            {"vector": {"core": -1}},
+            {"vector": {"00": -1}},
+            {"vector": {str(2**31): -1}},
+            {"vector": {"0": 2**31}},
+            {"vector": {"0": True}},
+            {"armed": 1},
+            {"armed": True},
+            {"workload": []},
+            {"pending": [[0, 1], [1]]},
+            {"found": [0], "exonerated": [0]},
+            {"level": 1},
         ],
     )
-    def test_corrupt_fields_are_rejected_with_the_reason(self, changes, message):
+    def test_corrupt_fields_are_rejected(self, changes):
         raw = json.loads(bisect.begin([0, 1], [0, 1]).to_json())
         raw.update(changes)
 
-        with pytest.raises(InvalidHuntState, match=re.escape(message)):
+        with pytest.raises(InvalidHuntState):
             HuntState.from_json(json.dumps(raw))
 
     @pytest.mark.parametrize(
-        ("changes", "message"),
+        ("stage", "changes", "message"),
         [
-            ({"found": [3]}, "probe stage cannot already have a culprit"),
+            (Stage.CONTROL, {"suspect": -1}, "suspect must be a core ID or null"),
+            (Stage.PROBE, {"pending": [], "queue": [[0, 1], [1, 2]]}, "queued sets must be disjoint"),
+            (Stage.PROBE, {"pending": [], "guilty_halves": [[0, 1], [1, 2]]}, "guilty sets must be disjoint"),
+            (Stage.CONTROL, {"pending": [[0, 4]]}, "search sets must be subsets of candidates"),
+            (Stage.CONTROL, {"suspect": 4}, "suspect must belong to candidates"),
+            (Stage.CONTROL, {"found": [4]}, "resolved search sets must be subsets of candidates"),
+            (Stage.PROBE, {"suspect": 0}, "probe stage cannot have a suspect"),
+            (Stage.PROBE, {"pending": [], "queue": [[0], [1], [2]]}, "probe stage has too many split sets"),
+            (Stage.PROBE, {"pending": [], "parent": [0], "in_flight": [0]}, "probe parent and level are inconsistent"),
             (
-                {"pending": [], "queue": [[0], [1], [2]], "parent": [0, 1, 2], "level": 1},
-                "probe stage has too many split sets",
-            ),
-            (
-                {"pending": [], "queue": [[0], [1]], "parent": [0, 1], "level": 0},
-                "probe parent and level are inconsistent",
-            ),
-            ({"pending": [], "queue": [[0]]}, "probe progress requires a parent set"),
-            (
-                {"pending": [], "queue": [[2]], "parent": [0, 1], "level": 1},
+                Stage.PROBE,
+                {"pending": [], "parent": [0, 1], "in_flight": [2], "level": 1},
                 "split sets must be subsets of their parent",
             ),
             (
-                {"pending": [], "in_flight": [2], "parent": [0, 1], "level": 1},
-                "in-flight set must be a subset of its parent",
+                Stage.PROBE,
+                {"pending": [], "parent": [0, 1, 2, 3], "in_flight": [0, 1], "queue": [[1, 2]], "level": 1},
+                "active split sets must be disjoint",
             ),
             (
-                {"pending": [[0]], "queue": [[0], [1]], "parent": [0, 1], "level": 1},
-                "pending and active split sets must be disjoint",
+                Stage.PROBE,
+                {"pending": [[0]], "parent": [0, 1], "level": 1},
+                "pending sets must be disjoint from the active parent",
             ),
             (
-                {"pending": [], "queue": [[0]], "guilty_halves": [[0]], "parent": [0, 1], "level": 1},
-                "queued and guilty halves must be disjoint",
+                Stage.PROBE,
+                {"pending": [], "parent": [0, 1, 2, 3], "in_flight": [], "queue": [[0], [2, 3]], "level": 1},
+                "a fully queued split must partition its parent",
             ),
-            (
-                {"pending": [], "queue": [[0], [1]], "parent": [0, 1, 2], "level": 1},
-                "a fully requeued split must partition its parent",
-            ),
-            (
-                {"pending": [], "queue": [[0]], "in_flight": [2], "parent": [0, 1, 2], "level": 1},
-                "queued and in-flight halves must partition their parent",
-            ),
-            ({"pending": []}, "probe stage has no remaining work"),
+            (Stage.PROBE, {"pending": [], "in_flight": [0]}, "probe progress requires a parent set"),
+            (Stage.PROBE, {"pending": []}, "probe stage has no remaining work"),
+            (Stage.CONFIRM, {"suspect": None}, "confirm stage requires exactly one suspect and its mask"),
+            (Stage.CONFIRM, {"pending": [[0]]}, "confirm suspect cannot also be pending or deferred"),
+            (Stage.CULPRIT, {"found": []}, "culprit stage requires only confirmed culprits"),
+            (Stage.PLATFORM, {"pending": []}, "platform stage must be a completed stock control"),
+            (Stage.EXHAUSTED, {"exonerated": [], "pending": [[0]]}, "exhausted stage has unresolved work"),
         ],
     )
-    def test_impossible_probe_progress_is_rejected(self, changes, message):
-        raw = json.loads(bisect.begin([0, 1], [0, 1]).to_json())
-        raw.update(stage="probe")
+    def test_each_persisted_state_invariant_reports_its_rejection(self, stage, changes, message):
+        raw = json.loads(_state_at(stage).to_json())
         raw.update(changes)
 
-        with pytest.raises(InvalidHuntState, match=re.escape(message)):
+        with pytest.raises(InvalidHuntState, match=re.escape(f"invalid persisted hunt state: {message}")):
             HuntState.from_json(json.dumps(raw))
 
-    @pytest.mark.parametrize(
-        ("changes", "message"),
-        [
-            ({"in_flight": []}, "confirm stage requires exactly one in-flight suspect"),
-            ({"pending": [[0]]}, "confirm suspect cannot also be pending"),
-            ({"parent": [1]}, "confirm suspect must belong to its parent"),
-        ],
-    )
-    def test_impossible_confirm_progress_is_rejected(self, changes, message):
-        raw = json.loads(bisect.begin([0, 1], [0, 1]).to_json())
-        raw.update(stage="confirm", pending=[], in_flight=[0])
-        raw.update(changes)
+    def test_negative_observed_failure_time_cannot_be_serialized(self):
+        state = bisect.begin([0], [0])
+        state.observed_failure_time = -1
 
-        with pytest.raises(InvalidHuntState, match=re.escape(message)):
+        with pytest.raises(InvalidHuntState, match="observed_failure_time"):
+            state.to_json()
+
+    def test_active_and_resolved_partition_cannot_overlap(self):
+        state = bisect.begin([0, 1, 2, 3], [0])
+        bisect.next_live_set(state)
+        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=3)
+        assert bisect.next_live_set(state) == [0, 1]
+        raw = json.loads(state.to_json())
+        raw["exonerated"] = [0]
+
+        with pytest.raises(InvalidHuntState, match="resolved and active"):
             HuntState.from_json(json.dumps(raw))
 
-    @pytest.mark.parametrize(
-        ("changes", "message"),
-        [
-            (
-                {"stage": "culprit", "pending": [], "in_flight": [0]},
-                "culprit stage requires the confirmed in-flight suspect",
-            ),
-            ({"stage": "platform", "control_fails": 0}, "platform stage must be a completed stock control"),
-            (
-                {"stage": "exhausted", "pending": [], "no_reproduce": 0},
-                "exhausted stage has unresolved work or a verdict",
-            ),
-        ],
-    )
-    def test_impossible_terminal_progress_is_rejected(self, changes, message):
-        raw = json.loads(bisect.begin([0, 1], [0, 1]).to_json())
-        raw.update(changes)
+    def test_split_level_is_bounded_by_candidate_universe(self):
+        raw = json.loads(bisect.begin([0, 1], [0]).to_json())
+        raw.update(stage="probe", level=3)
 
-        with pytest.raises(InvalidHuntState, match=re.escape(message)):
+        with pytest.raises(InvalidHuntState, match="split depth"):
             HuntState.from_json(json.dumps(raw))
 
-    @pytest.mark.parametrize(
-        "changes",
-        [
-            {"stage": "platform", "control_fails": 1},
-            {"stage": "exhausted", "pending": [], "no_reproduce": 1},
-        ],
-    )
-    def test_terminal_state_survives_a_round_trip(self, changes):
-        raw = json.loads(bisect.begin([0, 1], [0, 1]).to_json())
-        raw.update(changes)
+    def test_confirmation_mask_must_match_serialized_universe(self):
+        state = bisect.begin([0, 1], [0])
+        bisect.next_live_set(state)
+        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=3)
+        bisect.next_live_set(state)
+        bisect.record(state, reproduced=True, control_confirmations=2, max_no_reproduce=3)
+        bisect.next_live_set(state)
+        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=3)
+        assert bisect.next_live_set(state) == [1]
+        raw = json.loads(state.to_json())
+        raw["in_flight"] = []
 
-        restored = HuntState.from_json(json.dumps(raw))
+        with pytest.raises(InvalidHuntState, match="leave-one-out mask"):
+            HuntState.from_json(json.dumps(raw))
 
-        assert restored is not None
-        assert restored.stage == Stage(changes["stage"])
+    def test_terminal_states_survive_round_trip(self):
+        culprit, _ = run_hunt([0, 1], {1})
+        platform, _ = run_hunt([0, 1], {1}, stock_dies=True)
+        exhausted, _ = run_hunt([0, 1], set(), max_no_reproduce=1)
+
+        for state in (culprit, platform, exhausted):
+            assert HuntState.from_json(state.to_json()) == state
 
     @pytest.mark.parametrize(
         ("changes", "message"),
@@ -416,6 +444,19 @@ class TestPersistence:
         assert requeued
         assert stages == {Stage.CONTROL, Stage.PROBE, Stage.CONFIRM}
         assert state == uninterrupted
+
+
+def test_a_resumed_confirmation_replays_its_persisted_mask():
+    state = _state_at(Stage.CONFIRM)
+
+    assert bisect.next_live_set(state) == [1, 2, 3]
+
+
+def test_a_confirmation_without_a_suspect_is_rejected():
+    state = HuntState(stage=Stage.CONFIRM)
+
+    with pytest.raises(ValueError, match="confirmation has no suspect"):
+        bisect.record(state, reproduced=True, control_confirmations=1, max_no_reproduce=1)
 
 
 def test_split_puts_the_larger_half_first():

@@ -10,6 +10,72 @@ A per-core CPU stability tester and AMD PBO Curve Optimizer tuner for Linux,
 packaged as a NixOS module with an overlay. Forked from
 [Daaboulex/linux-corecycler](https://github.com/Daaboulex/linux-corecycler).
 
+### Added (2026-09-21 senior review)
+
+- Seed a new tuning session with `corecycler tune --seed-from SESSION_ID`. Seeded offsets
+  are retested from zero confidence; no prior confidence is inherited.
+- `CONTEXT.md` domain glossary and `docs/adr/` for hard-to-reverse decisions, starting
+  with why only live-mask evidence banks confidence.
+- `topo_9950x3d2` test topology (16 cores, 32 threads, V-Cache on both CCDs) and Ring A/B
+  contracts for the dual-V-Cache L3 layout, the `ryzen_smu` sysfs ABI, and the Granite
+  Ridge core-fuse address.
+- History pagination with authoritative counts, transactional in-flight delete guards,
+  and crash finalization of stress runs.
+- `tuner.config.FIELD_BOUNDS` as the one source of widget and validation limits; offsets
+  are validated against the detected command set's CO range.
+
+### Fixed (2026-09-21 senior review)
+
+- 9950X3D2: V-Cache is detected per CCD from its L3 size, so a part with V-Cache on both
+  CCDs marks both; unknown Zen 5 PM-table layouts and truncated tables stay uncalibrated.
+- `ryzen_smu` kernel module: a rejected mailbox command (0xFC-0xFF) was reported as
+  success and a failed SMN read left the previous result readable; both are patched in
+  `nix/ryzen-smu-mailbox.patch`, and the Python driver requires exact-length replies.
+- Per-core CO is refused when an L3 group exceeds the eight-slot layout, when the CCD
+  layout is unknown, or when online/present CPU sets are unproven.
+- Every stress launch binds `systemd-run` to the application with an outer
+  `setpriv --pdeathsig`, so an application crash cannot orphan a payload.
+- Supervisor checks thermal state before launch and before exit handling, polls MCE
+  before stall and containment verdicts, attributes MCEs by physical core across SMT
+  siblings, keeps the process-group id after the leader exits, and preserves the
+  Supervisor's failure kind through the scheduler.
+- Indefinite backends treat an unrequested clean exit as `verdict unavailable`;
+  y-cruncher checksum mismatches and non-UTF-8 mprime results are failures.
+- Tuner: final profile writes that fail cannot complete a session; every CO write is
+  bounded, verified, and escalates to verified stock restoration and quarantine; abort
+  keeps ownership until the worker has provably stopped; every result classification is
+  dispatched explicitly with unknown as an apparatus fault; the soak stage fails closed
+  on thermal data; an interrupted soak earns no verdict.
+- Hunt: control probes drive every physical core to stock; group and control probes are
+  owned by the persisted hunt state (the isolated `hunting_core` marker is gone);
+  confirmation is leave-one-out; several culprits can be convicted in one hunt; a probe
+  that earned no verdict is requeued.
+- History: schema versions newer than the reader are refused; every migration commits
+  its DDL and version marker atomically; the v5 deduplication remaps referenced
+  contexts; pre-v16 sessions are refused on resume with `tune --seed-from` guidance;
+  context identity (`context_hash`, schema v21) covers CPU identity, the full offset
+  vector, scalar, boost and PBO limits, and the tuner refuses an incomplete capture.
+- GUI: manual stress requires a thermal sensor; closing never terminates the worker
+  thread and refuses to close until teardown is confirmed; memory stress runs through the
+  Supervisor with containment; every manual CO write takes a complete backup first and
+  shows the exact plan; a display failure can no longer abort the tuner; loaded CO
+  profiles carry their CPU model and only confirmed offsets; deletion of in-flight
+  records is refused; edited profiles persist on close.
+- Sudo: the invoking home resolves from `SUDO_UID`, ownership repair never follows
+  symlinks, atomic writes use unpredictable `O_NOFOLLOW` temporaries, and state
+  directories are created and repaired before the lock is taken.
+- Live scripts require an isolated `--home` and kill only their own process tree; the
+  Ring B tier is selected by `CORECYCLER_HW_CONTRACTS=1` only, never by argv matching.
+
+### Changed (2026-09-21 senior review)
+
+- Shallow `tuner.persistence` wrappers removed; callers use `HistoryDB` directly. Each
+  table's persisted fields are defined once and derived from its dataclass.
+- `PhysicalCore.ccx` (never populated) and `CPUTopology.vcache_ccd` removed.
+- Unverified PM-table prefix fallback removed; only exact verified layouts calibrate.
+- Backend registration has one source (the decorator); `load_all` discovers modules.
+- `reap_zombies` (which stole unrelated children's exit status) removed.
+
 ### Changed (2026-09-21 fork setup)
 
 - Derive the version from git through setuptools-scm instead of a literal pinned at

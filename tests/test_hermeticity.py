@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from tests._contract_hw import ring_b_requested
+from tests._contract_hw import hw_contracts_requested
 from tests.conftest import _LIVE_TIER
 
 
@@ -45,26 +45,26 @@ class TestNoNetwork:
 
 class TestRingBIsOptIn:
     @pytest.mark.parametrize(
-        ("markexpr", "expected"),
+        "argv",
         [
-            ("", False),
-            ("not slow", False),
-            ("not contract", False),
-            ("not slow and not contract", False),
-            ("contract", True),
-            ("not slow and contract", True),
-            ("contract and hardware", True),
+            (),
+            ("-m", "contract"),
+            ("-m", "not (contract)"),
+            ("-m", "not   contract"),
+            ("-k", "contract"),
         ],
     )
-    def test_only_an_explicit_marker_selection_asks_for_it(self, markexpr, expected):
-        assert ring_b_requested(markexpr, env={}) is expected
+    def test_pytest_selection_never_enables_live_hardware(self, monkeypatch, argv):
+        monkeypatch.setattr("sys.argv", ["pytest", *argv])
+        assert hw_contracts_requested({}) is False
 
-    @pytest.mark.parametrize("flag", ["CORECYCLER_HW_CONTRACTS", "CORECYCLER_HW_PRIVILEGED"])
-    def test_a_live_run_flag_asks_for_it(self, flag):
-        assert ring_b_requested("not slow", env={flag: "1"}) is True
+    def test_only_the_hardware_contract_switch_enables_live_hardware(self):
+        assert hw_contracts_requested({"CORECYCLER_HW_CONTRACTS": "1"}) is True
+        assert hw_contracts_requested({"CORECYCLER_HW_PRIVILEGED": "1"}) is False
+        assert hw_contracts_requested({"CORECYCLER_HW_CONTRACTS": "0"}) is False
 
     def test_nothing_live_is_collected_to_run_in_this_session(self, request):
-        if ring_b_requested(request.config.getoption("markexpr")):
+        if hw_contracts_requested():
             pytest.skip("this run asked for Ring B")
         live = [
             item.nodeid

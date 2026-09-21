@@ -9,11 +9,18 @@ value freezes it at import time and a scheme change is then never seen.
 from __future__ import annotations
 
 from datetime import datetime
+from typing import TYPE_CHECKING
+from weakref import WeakKeyDictionary
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QFont, QPalette
 
 from corecycler.tuner.state import TunerPhase
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+
+    from PySide6.QtWidgets import QWidget
 
 DARK = "dark"
 LIGHT = "light"
@@ -239,6 +246,14 @@ class _Theme:
 theme = _Theme()
 
 
+_SEMANTIC_STYLES: WeakKeyDictionary[QWidget, Callable[[], str]] = WeakKeyDictionary()
+
+
+def set_semantic_style(widget: QWidget, stylesheet: Callable[[], str]) -> None:
+    _SEMANTIC_STYLES[widget] = stylesheet
+    widget.setStyleSheet(stylesheet())
+
+
 def scheme_for(color_scheme: Qt.ColorScheme, palette: QPalette) -> str:
     """The scheme to render in: what the desktop reports, else what its palette shows."""
     if color_scheme == Qt.ColorScheme.Dark:
@@ -261,6 +276,8 @@ def follow(app) -> None:
     def _resolve() -> None:
         palette = app.palette()
         use_scheme(scheme_for(hints.colorScheme(), palette), palette)
+        for widget, stylesheet in list(_SEMANTIC_STYLES.items()):
+            widget.setStyleSheet(stylesheet())
         for widget in app.allWidgets():
             widget.update()
 
@@ -303,6 +320,22 @@ def status_label(status: str) -> str:
     return SESSION_STATUS_LABELS.get(status, status)
 
 
+def format_mhz(value: float | None) -> str:
+    return NOT_AVAILABLE if value is None else f"{value:.0f} MHz"
+
+
+def format_watts(value: float | None) -> str:
+    return NOT_AVAILABLE if value is None else f"{value:.1f} W"
+
+
+def format_volts(value: float | None) -> str:
+    return NOT_AVAILABLE if value is None else f"{value:.3f} V"
+
+
+def format_temperature(value: float | None) -> str:
+    return NOT_AVAILABLE if value is None else f"{value:.1f} C"
+
+
 def duration_str(seconds: float | None) -> str:
     if seconds is None or seconds <= 0:
         return ABSENT
@@ -322,9 +355,10 @@ def span_str(start_iso: str | None, end_iso: str | None) -> str:
     try:
         start = datetime.fromisoformat(start_iso)
         end = datetime.fromisoformat(end_iso)
-    except (ValueError, TypeError):
+        seconds = (end - start).total_seconds()
+    except (TypeError, ValueError):
         return ABSENT
-    return duration_str((end - start).total_seconds())
+    return duration_str(seconds)
 
 
 def _assert_complete() -> None:

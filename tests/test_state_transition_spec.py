@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from itertools import product
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from corecycler.history.db import HistoryDB
@@ -12,43 +14,37 @@ from corecycler.tuner.state import CoreState, TunerPhase
 
 P = TunerPhase
 
-# This is the verdict table in docs/tuner-state-spec.md.
-ADVANCE_RELATION: dict[tuple[TunerPhase, bool], set[TunerPhase]] = {
-    (P.NOT_STARTED, True): {P.COARSE_SEARCH},
-    (P.NOT_STARTED, False): {P.COARSE_SEARCH},
-    (P.COARSE_SEARCH, True): {P.COARSE_SEARCH, P.SETTLED},
-    (P.COARSE_SEARCH, False): {P.FINE_SEARCH, P.SETTLED, P.BACKOFF_PRECONFIRM},
-    (P.FINE_SEARCH, True): {P.FINE_SEARCH, P.SETTLED},
-    (P.FINE_SEARCH, False): {P.SETTLED},
-    (P.SETTLED, True): {P.CONFIRMING},
-    (P.SETTLED, False): {P.CONFIRMING},
-    (P.CONFIRMING, True): {P.CONFIRMED},
-    (P.CONFIRMING, False): {P.CONFIRMING, P.FAILED_CONFIRM},
-    (P.CONFIRMED, True): {P.CONFIRMED},
-    (P.CONFIRMED, False): {P.CONFIRMED},
-    (P.FAILED_CONFIRM, True): {P.BACKOFF_PRECONFIRM},
-    (P.FAILED_CONFIRM, False): {P.BACKOFF_PRECONFIRM},
-    (P.BACKOFF_PRECONFIRM, True): {P.BACKOFF_PRECONFIRM, P.BACKOFF_CONFIRMING},
-    (P.BACKOFF_PRECONFIRM, False): {P.BACKOFF_PRECONFIRM, P.BACKOFF_CONFIRMING},
-    (P.BACKOFF_CONFIRMING, True): {P.CONFIRMED, P.BACKOFF_PRECONFIRM},
-    (P.BACKOFF_CONFIRMING, False): {P.BACKOFF_PRECONFIRM, P.BACKOFF_CONFIRMING},
-    (P.ANNEALING, True): {P.CONFIRMED},
-    (P.ANNEALING, False): {P.CONFIRMED},
-}
 
-# This is the hard-crash table in docs/tuner-state-spec.md.
-CRASH_RELATION: dict[TunerPhase, TunerPhase] = {
-    P.COARSE_SEARCH: P.BACKOFF_PRECONFIRM,
-    P.FINE_SEARCH: P.BACKOFF_PRECONFIRM,
-    P.CONFIRMING: P.BACKOFF_PRECONFIRM,
-    P.CONFIRMED: P.BACKOFF_PRECONFIRM,
-    P.BACKOFF_PRECONFIRM: P.BACKOFF_PRECONFIRM,
-    P.NOT_STARTED: P.NOT_STARTED,
-    P.SETTLED: P.SETTLED,
-    P.FAILED_CONFIRM: P.FAILED_CONFIRM,
-    P.BACKOFF_CONFIRMING: P.BACKOFF_CONFIRMING,
-    P.ANNEALING: P.ANNEALING,
-}
+def _documented_relations() -> tuple[
+    dict[tuple[TunerPhase, bool], set[TunerPhase]],
+    dict[TunerPhase, TunerPhase],
+]:
+    lines = (Path(__file__).parents[1] / "docs" / "tuner-state-spec.md").read_text().splitlines()
+
+    def rows_after(header: str) -> list[list[str]]:
+        start = lines.index(header) + 2
+        rows = []
+        for line in lines[start:]:
+            if not line.startswith("|"):
+                break
+            rows.append([column.strip() for column in line.strip("|").split("|")])
+        return rows
+
+    advance = {}
+    for phase_cell, pass_cell, fail_cell in rows_after("| Phase | PASS -> | FAIL -> |"):
+        phase = P[re.findall(r"[A-Z][A-Z_]+", phase_cell)[0]]
+        advance[(phase, True)] = {P[name] for name in re.findall(r"[A-Z][A-Z_]+", pass_cell)}
+        advance[(phase, False)] = {P[name] for name in re.findall(r"[A-Z][A-Z_]+", fail_cell)}
+
+    crash = {}
+    for before_cell, after_cell in rows_after("| Phase before crash | Phase after crash penalty |"):
+        before = P[re.findall(r"[A-Z][A-Z_]+", before_cell)[0]]
+        after = P[re.findall(r"[A-Z][A-Z_]+", after_cell)[0]]
+        crash[before] = after
+    return advance, crash
+
+
+ADVANCE_RELATION, CRASH_RELATION = _documented_relations()
 
 MAX_OFFSET = -30
 BASELINES = (0, -10)
@@ -62,7 +58,7 @@ def make_engine(db: HistoryDB, **config_overrides) -> TunerEngine:
     from corecycler.engine.topology import CPUTopology, PhysicalCore
 
     topo = CPUTopology()
-    topo.cores[0] = PhysicalCore(core_id=0, ccd=0, ccx=None, logical_cpus=(0,))
+    topo.cores[0] = PhysicalCore(core_id=0, ccd=0, logical_cpus=(0,))
     topo.ccds = 1
     cfg = TunerConfig(
         cores_to_test=[0],
