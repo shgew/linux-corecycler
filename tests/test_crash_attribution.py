@@ -13,7 +13,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 from corecycler.engine.detector import MCEEvent
 from corecycler.history.db import HistoryDB
-from corecycler.tuner import bisect, persistence as tp
+from corecycler.tuner import bisect
+from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine, _pick_report
 from corecycler.tuner.state import CoreState, TunerPhase
