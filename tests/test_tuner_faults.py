@@ -28,6 +28,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from corecycler import __version__
 from corecycler.engine.backends.base import FFTPreset, StressBackend, StressConfig, StressMode
 from corecycler.engine.execution import ThermalWatch
 from corecycler.engine.scheduler import CoreScheduler, SchedulerConfig
@@ -1576,6 +1577,34 @@ class TestResumePathsValidateConfig:
             eng.resume(sid)
         assert run_next.called, "resume bailed on a valid config"
         assert not any("Invalid tuner config" in m for m in logs)
+
+
+class TestResumeNamesTheCreatingBuild:
+    """A session's evidence was judged by the build that wrote it. Resuming under a
+    different build is recorded in the session narrative; the same build says nothing."""
+
+    def _resume_logs(self, db, topo, smu, mock_backend, created_by: str | None) -> list[str]:
+        sid = tp.create_session(db, TunerConfig(cores_to_test=[0]), "", "")
+        if created_by is not None:
+            db._execute_raw("UPDATE tuner_sessions SET app_version=? WHERE id=?", (created_by, sid))
+        eng = make_engine(db, topo, smu, mock_backend)
+        logs: list[str] = []
+        eng.log_message.connect(logs.append)
+        with patch.object(eng, "_run_next"):
+            eng.resume(sid)
+        return logs
+
+    def test_a_foreign_build_is_named(self, db, topo, smu, mock_backend):
+        logs = self._resume_logs(db, topo, smu, mock_backend, "0.0.9+gdeadbee")
+        assert any(m == f"Session created by corecycler 0.0.9+gdeadbee; resuming with {__version__}" for m in logs)
+
+    def test_a_pre_stamp_session_is_named_unknown(self, db, topo, smu, mock_backend):
+        logs = self._resume_logs(db, topo, smu, mock_backend, "")
+        assert any(m == f"Session created by corecycler unknown; resuming with {__version__}" for m in logs)
+
+    def test_the_same_build_says_nothing(self, db, topo, smu, mock_backend):
+        logs = self._resume_logs(db, topo, smu, mock_backend, None)
+        assert not any("Session created by corecycler" in m for m in logs)
 
 
 # ---------------------------------------------------------------------------

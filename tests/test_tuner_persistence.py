@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from corecycler import __version__
 from corecycler.history.db import HistoryDB
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.persistence import (
@@ -49,6 +50,24 @@ class TestTunerSessions:
         reopened.close()
         reopened = HistoryDB(path)
         assert reopened.get_tuner_session(sid).boot_id == "resumed"
+        reopened.close()
+
+    def test_new_sessions_are_stamped_with_the_running_build(self, db):
+        sid = create_session(db, TunerConfig(), "", "")
+        assert get_session(db, sid).app_version == __version__
+
+    def test_v17_sessions_gain_an_empty_app_version(self, tmp_path):
+        path = tmp_path / "legacy.db"
+        db = HistoryDB(path)
+        sid = create_session(db, TunerConfig(), "", "")
+        db._execute_raw("ALTER TABLE tuner_sessions DROP COLUMN app_version")
+        db._execute_raw("UPDATE schema_version SET version=17")
+        db.close()
+
+        reopened = HistoryDB(path)
+        assert reopened.get_tuner_session(sid).app_version == ""
+        fresh = create_session(reopened, TunerConfig(), "", "")
+        assert reopened.get_tuner_session(fresh).app_version == __version__
         reopened.close()
 
     def test_create_and_get_session(self, db):

@@ -16,7 +16,7 @@ if not hasattr(_sys.modules.get("PySide6", None), "__path__"):
 from PySide6.QtCore import QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication
 
-from corecycler import cli
+from corecycler import __version__, cli
 from corecycler.history.db import HistoryDB
 from corecycler.tuner import persistence as tp
 from corecycler.tuner.config import TunerConfig
@@ -127,7 +127,15 @@ class TestArgHandling:
         sid = tp.create_session(db, TunerConfig(), "", "")
         monkeypatch.setattr(cli, "cmd_status", partial(cli.cmd_status, db=db))
         assert cli.cli_main(["status"]) == cli.EXIT_COMPLETED
-        assert f"{sid}" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert f"#{sid}" in out
+        assert f"by {__version__}" in out
+
+    @pytest.mark.parametrize("flag", ["--version", "-V"])
+    def test_version_prints_the_build_and_exits(self, flag, monkeypatch, capsys):
+        monkeypatch.setattr(cli, "cmd_run", lambda **kw: pytest.fail("--version started tuning"))
+        assert cli.cli_main([flag]) == cli.EXIT_COMPLETED
+        assert capsys.readouterr().out == f"corecycler {__version__}\n"
 
 
 class TestStatus:

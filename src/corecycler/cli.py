@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from corecycler import __version__
 from corecycler.config import tools
 from corecycler.config.settings import load_settings
 
@@ -41,6 +42,7 @@ SEARCH_DEFINING_FIELDS = (
 USAGE = """\
 corecycler headless commands:
 
+  corecycler --version            print the installed build and exit
   corecycler doctor               report every external tool and where it resolved
   corecycler status               list tuner sessions; newest one with per-core offsets and live-evidence hours
   corecycler tune [--config F]    start a NEW tuning session and run to the end
@@ -58,6 +60,9 @@ Running the binary with no command opens the GUI.
 
 
 def cli_main(argv: list[str]) -> int:
+    if argv in (["--version"], ["-V"]):
+        print(f"corecycler {__version__}")
+        return EXIT_COMPLETED
     if argv in (["--help"], ["-h"]) or (
         len(argv) == 2 and argv[0] in ("doctor", "status", "tune", "resume") and argv[1] in ("--help", "-h")
     ):
@@ -106,7 +111,7 @@ def cli_main(argv: list[str]) -> int:
 def doctor_lines(resolutions: list[Resolution], unmet: list[str]) -> list[str]:
     """The dependency report, one tool per line, grouped by how much it matters."""
     width = max(len(r.key) for r in resolutions)
-    lines = ["corecycler doctor", ""]
+    lines = [f"corecycler doctor ({__version__})", ""]
     for kind in (tools.BACKEND, tools.CORE, tools.OPTIONAL):
         lines.append(kind)
         for resolution in [r for r in resolutions if tools.TOOLS[r.key].kind == kind]:
@@ -153,7 +158,7 @@ def cmd_status(db=None) -> int:
             done = sum(1 for cs in states.values() if cs.phase in ("confirmed", "hardened"))
             print(
                 f"#{sess.id}  {sess.status:<12} {done}/{len(states)} cores done  "
-                f"created {sess.created_at[:19]}  {sess.cpu_model or ''}"
+                f"created {sess.created_at[:19]} by {sess.app_version or 'unknown'}  {sess.cpu_model or ''}"
             )
         latest = sessions[0]
         try:

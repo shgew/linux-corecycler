@@ -14,6 +14,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from corecycler import __version__
 from corecycler.config.paths import fix_sudo_ownership, user_home
 
 if TYPE_CHECKING:
@@ -162,7 +163,7 @@ class TelemetrySample:
 class HistoryDB:
     """Crash-safe SQLite database for test run history."""
 
-    SCHEMA_VERSION = 17
+    SCHEMA_VERSION = 18
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
@@ -340,7 +341,8 @@ CREATE TABLE IF NOT EXISTS tuner_sessions (
     endurance_round     INTEGER NOT NULL DEFAULT 0,
     endurance_workload  INTEGER NOT NULL DEFAULT 0,
     endurance_index     INTEGER NOT NULL DEFAULT 0,
-    boot_id             TEXT NOT NULL DEFAULT ''
+    boot_id             TEXT NOT NULL DEFAULT '',
+    app_version         TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tuner_core_states (
@@ -706,6 +708,10 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             "WHERE boot_id=''"
         )
 
+    @staticmethod
+    def _migrate_v18(conn: sqlite3.Connection) -> None:
+        HistoryDB._add_columns(conn, "tuner_sessions", [("app_version", "TEXT NOT NULL DEFAULT ''")])
+
     _MIGRATIONS: dict[int, str | callable] = {
         2: _migrate_v2,
         3: _DDL_MIGRATE_V3,
@@ -723,6 +729,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         15: _DDL_MIGRATE_V15,
         16: _migrate_v16,
         17: _migrate_v17,
+        18: _migrate_v18,
     }
 
     # ------------------------------------------------------------------
@@ -1186,10 +1193,10 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             """\
             INSERT INTO tuner_sessions
                 (created_at, updated_at, status, bios_version, cpu_model,
-                 config_json, context_id, notes)
-            VALUES (?,?,?,?,?,?,?,?)
+                 config_json, context_id, notes, app_version)
+            VALUES (?,?,?,?,?,?,?,?,?)
             """,
-            (now, now, "running", bios_version, cpu_model, config_json, context_id, ""),
+            (now, now, "running", bios_version, cpu_model, config_json, context_id, "", __version__),
         )
         return cur.lastrowid
 
@@ -1684,6 +1691,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             endurance_workload=row["endurance_workload"] or 0,
             endurance_index=row["endurance_index"] or 0,
             boot_id=row["boot_id"],
+            app_version=row["app_version"],
         )
 
     def _execute_raw(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
@@ -1906,6 +1914,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                     "endurance_workload",
                     "endurance_index",
                     "boot_id",
+                    "app_version",
                 ),
             )
             counts["tuner_sessions"] = len(maps["tuner_sessions"])
