@@ -48,6 +48,21 @@ class FFTPreset(Enum):
     CUSTOM = "custom"
 
 
+@dataclass(frozen=True, slots=True)
+class DutyCycle:
+    """Millisecond-or-finer load/idle cycling applied to a running payload.
+
+    ``burst_us``/``idle_us`` drive a fixed metronome. ``random_phases`` instead
+    draws a fresh phase length and target duty every phase, so utilisation
+    wanders the whole 0-100% range the way real work does; a phase boundary
+    from idle straight to full load is the deepest Vmin transient available.
+    """
+
+    burst_us: int = 5000
+    idle_us: int = 5000
+    random_phases: bool = False
+
+
 @dataclass(slots=True)
 class StressConfig:
     mode: StressMode = StressMode.SSE
@@ -56,6 +71,13 @@ class StressConfig:
     fft_max: int | None = None
     threads: int = 1
     memory_mb: int | None = None  # for linpack-style tests
+    # Backend-specific algorithm selection (y-cruncher component tests). None
+    # means the backend picks; an explicit tuple is what per-regime confidence
+    # accounting requires, since "whatever the tool defaults to" is not a
+    # workload identity.
+    tests: tuple[str, ...] | None = None
+    duty_cycle: DutyCycle | None = None
+    test_seconds: int | None = None
 
 
 @dataclass(slots=True)

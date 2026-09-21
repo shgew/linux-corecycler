@@ -19,7 +19,7 @@ from tests.test_crash_attribution import (
     BASELINES,
     BEST,
     _make_engine,
-    _seed_hardened_validating,
+    _seed_confirmed_validating,
 )
 
 
@@ -31,7 +31,7 @@ def db(tmp_path):
 
 
 def _seed_validating(eng, db):
-    session = _seed_hardened_validating(eng, db, BEST, BASELINES)
+    session = _seed_confirmed_validating(eng, db, BEST, BASELINES)
     for cs in eng._core_states.values():
         cs.in_test = False
     eng._start_worker = lambda *a, **k: None  # no real worker threads
@@ -104,7 +104,7 @@ class TestIncrementalValidation:
         assert eng.status == "validating"
 
     def test_clean_completion_finalizes(self, db, topo_dual_ccd_x3d, mock_backend):
-        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, endurance=False)
         _seed_validating(eng, db)
         eng._validation_core_order = sorted(BEST)
         eng._validation_stage = 8
@@ -196,6 +196,7 @@ class TestSpectrumAndSoak:
             validate_spectrum=False,
             validate_memory=False,
             validate_soak=False,
+            endurance=False,
         )
         _seed_validating(eng, db)
         eng._validation_core_order = sorted(BEST)
@@ -239,7 +240,7 @@ class TestSpectrumAndSoak:
         assert eng._validation_dirty is True
 
     def test_soak_pass_finalizes(self, db, topo_dual_ccd_x3d, mock_backend):
-        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, endurance=False)
         _seed_validating(eng, db)
         eng._validation_core_order = sorted(BEST)
         eng._validation_stage = 7
@@ -338,7 +339,7 @@ class TestBackoffKeepsPhase:
         eng._on_validation_test_finished(sorted(BEST)[0], passed=False)
 
         cs = eng._core_states[sorted(BEST)[0]]
-        assert cs.phase == TunerPhase.HARDENED
+        assert cs.phase == TunerPhase.CONFIRMED
         assert cs.best_offset == BEST[sorted(BEST)[0]] + 1
 
 
@@ -360,7 +361,7 @@ class TestMemoryValidationStage:
 
     def _seed(self, db, topo, backend, **cfg):
         eng = _make_engine(db, topo, backend, **cfg)
-        _seed_hardened_validating(eng, db, BEST, BASELINES)
+        _seed_confirmed_validating(eng, db, BEST, BASELINES)
         for cs in eng._core_states.values():
             cs.in_test = False
         eng._start_worker = lambda *a, **k: None

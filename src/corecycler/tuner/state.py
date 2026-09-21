@@ -22,12 +22,10 @@ class TunerPhase(StrEnum):
     SETTLED = "settled"
     CONFIRMING = "confirming"
     CONFIRMED = "confirmed"
+    ANNEALING = "annealing"
     FAILED_CONFIRM = "failed_confirm"
     BACKOFF_PRECONFIRM = "backoff_preconfirm"
     BACKOFF_CONFIRMING = "backoff_confirming"
-    HARDENING_T1 = "hardening_t1"
-    HARDENING_T2 = "hardening_t2"
-    HARDENED = "hardened"
 
 
 @dataclass(slots=True)
@@ -50,7 +48,16 @@ class CoreState:
     crash_cooldown: int = 0
     thermal_aborts: int = 0
     cumulative_test_time: float = 0.0
-    hardening_tier_index: int = 0
+    # Cursor into the regime battery for the offset currently under test. An
+    # offset is only accepted once every selected regime has passed at it.
+    battery_index: int = 0
+    # Annealing: consecutive failed probes one step deeper than the current
+    # offset, and the banked-hours bar the next probe has to clear.
+    anneal_strikes: int = 0
+    anneal_bar_hours: float = 0.0
+    # Accumulated suspicion for unattributed failures, persisted so an
+    # accusation survives the reboot it caused.
+    suspicion: float = 0.0
 
 
 @dataclass(slots=True)
@@ -88,3 +95,6 @@ class TunerSession:
     endurance_round: int = 0
     endurance_workload: int = 0
     endurance_index: int = 0
+    # Serialised bisection progress; a probe's answer arrives after the reboot
+    # that killed the process which asked the question.
+    hunt_state: str = ""

@@ -854,7 +854,7 @@ class HistoryTab(QWidget):
             # Count cores
             core_states = tp.load_core_states(self._db, sess.id)
             total = len(core_states)
-            confirmed = sum(1 for cs in core_states.values() if cs.phase in (TunerPhase.CONFIRMED, TunerPhase.HARDENED))
+            confirmed = sum(1 for cs in core_states.values() if cs.phase is TunerPhase.CONFIRMED)
 
             date_str = format_local(sess.created_at)
 

@@ -1,56 +1,82 @@
 # Test-order specification
 
-The auto-tuner picks the next core to test with one of five orders
-(`TunerConfig.test_order`). This is the control-system contract for all five:
-what each order must do, what state it carries, and what happens across an
-interruption. `tests/test_test_order_spec.py` executes every row of this
-chart; a behavior change that is not reflected here fails the suite.
+The auto-tuner selects ordinary search work with one of five
+`TunerConfig.test_order` policies. `tests/test_test_order_spec.py` executes each
+row and invariant below against the real selectors.
 
-## State the selectors read and write
+## Selector state
 
-| State | Kind | Written by | Survives restart? |
+The selectors read persisted `CoreState.phase`, `crash_cooldown`,
+`crash_count`, `best_offset`, `anneal_strikes`, and `anneal_bar_hours` plus the
+persisted per-regime clean-time banks. `_last_tested_core` and
+`_ccd_last_tested` are in-memory cursors rebuilt from real test-log rows after
+a restart.
+For the five ordinary selectors, a core is **available** exactly when
+`phase is not CONFIRMED` and `crash_cooldown == 0`. This includes an
+`ANNEALING` core whose battery has not finished.
+
+## Ordinary orders
+
+| Order | Next ordinary pick | Cursor state | After interruption |
 |---|---|---|---|
-| `CoreState.phase` | persisted (DB) | state machine | yes |
-| `CoreState.crash_cooldown` | persisted (DB) | crash penalty / thermal defer | yes |
-| `CoreState.crash_count` | persisted (DB) | crash penalty | yes |
-| `_last_tested_core` | in-memory cursor | `_run_next` | rebuilt from test log |
-| `_ccd_last_tested` | in-memory cursor | `_run_next` | rebuilt from test log |
+| `sequential` | lowest-id available core; stays on it until it becomes `CONFIRMED` or enters cooldown | none | derived from persisted phases and cooldowns |
+| `round_robin` | next available core after the last tested core, cyclic ascending; first available when no cursor exists | `_last_tested_core` | cursor is the core in the last real test-log row |
+| `weakest_first` | minimum `phase_score + 2 * crash_count`; ties use lowest core id | none | derived from persisted phases and crash counts |
+| `ccd_alternating` | prefer a CCD different from the last tested one; among candidate CCDs choose fewest `CONFIRMED`, then lowest CCD; choose the lowest core id within it | `_last_tested_core` | cursor rebuilt from the test log |
+| `ccd_round_robin` | alternate CCD from the last tested one and, within it, rotate after that CCD's last tested core; fewer than two CCDs degrades to `round_robin` | `_last_tested_core` and `_ccd_last_tested` | both cursors rebuilt from the test log |
 
-A core is **available** iff `phase not in (CONFIRMED, HARDENED)` and
-`crash_cooldown == 0`.
+### `weakest_first` scores
 
-## The five orders
+Lower scores run sooner. `CONFIRMED` is unavailable and therefore has no
+score.
 
-| Order | Next pick | Cursor state | After interruption (resume) |
-|---|---|---|---|
-| `sequential` | lowest-id available core; stays on it until that core reaches a terminal phase | none | derived from persisted phases alone |
-| `round_robin` | next available core after the last tested one, cyclic ascending; first available if the cursor is gone | `_last_tested_core` | cursor = core of the last REAL test-log row |
-| `weakest_first` | minimum of `phase_score + 2 * crash_count`; tie broken by lowest core id | none (derived) | derived from persisted phases and crash counts |
-| `ccd_alternating` | a CCD different from the last-tested one whenever it has available work; among candidate CCDs the fewest-confirmed (then lowest index); lowest core id within | `_last_tested_core` | cursor rebuilt from test log |
-| `ccd_round_robin` | alternate CCD from the last-tested one; within the chosen CCD rotate to the core after that CCD's last-tested; fewer than 2 CCDs degrades to `round_robin` | `_last_tested_core` + `_ccd_last_tested` | both cursors rebuilt from test log |
+| Phase | Score |
+|---|---:|
+| `FINE_SEARCH` | 0 |
+| `FAILED_CONFIRM` | 0 |
+| `BACKOFF_PRECONFIRM` | 0 |
+| `BACKOFF_CONFIRMING` | 1 |
+| `CONFIRMING` | 1 |
+| `COARSE_SEARCH` | 2 |
+| `SETTLED` | 3 |
+| `NOT_STARTED` | 4 |
+| `ANNEALING` | 5 |
 
-`weakest_first` phase scores (lower = sooner): FINE_SEARCH / FAILED_CONFIRM /
-BACKOFF_PRECONFIRM / HARDENING_T1 / HARDENING_T2 = 0, BACKOFF_CONFIRMING /
-CONFIRMING = 1, COARSE_SEARCH = 2, SETTLED = 3, NOT_STARTED = 4.
+## Annealing fall-through
 
-## Invariants that hold for EVERY order
+The ordinary selector always runs first. Only if it returns no core does
+`_pick_next_core` ask for an annealing candidate. A candidate must:
 
-1. Never picks a core in a terminal phase (CONFIRMED, HARDENED).
-2. Never picks a core with `crash_cooldown > 0`.
-3. Picking a core decrements every OTHER core's cooldown by 1.
-4. `pick == None` means either every core is terminal (the session completes)
-   or every non-terminal core is cooling — then all cooldowns drain by 1 and
-   the pick repeats, so the tuner can never deadlock while work remains.
-5. The picked core is flagged `in_test` and persisted BEFORE its worker
-   starts (crash attribution), and cleared on any delivered verdict.
+- be `CONFIRMED` with a non-null `best_offset`;
+- have a one-fine-step-deeper offset inside `max_offset`;
+- have `anneal_strikes < anneal_max_strikes`; and
+- have banked at least its current annealing bar in **every** regime at its
+  best offset (equivalently, the weakest-regime bank meets the bar).
+
+Selecting it immediately changes the core to `ANNEALING`, sets
+`current_offset = best_offset + direction * fine_step`, and resets
+`battery_index = 0`. If no ordinary or eligible annealing core exists, the
+picker returns `None`.
+
+## Invariants for every order
+
+1. An ordinary selector never picks `CONFIRMED` and never picks a core with
+   `crash_cooldown > 0`.
+2. An ordinary core takes precedence over every annealing fall-through
+   candidate.
+3. Picking a core decrements every **other** core's cooldown by one.
+4. If every unfinished ordinary core is cooling and no annealing candidate is
+   eligible, repeated scheduler cooldown drains eventually make ordinary work
+   available; cooldown cannot deadlock the tuner.
+5. The picked core is marked `in_test` and persisted before its worker starts,
+   then cleared on every delivered result.
 
 ## Interruption contract
 
-- The cursors are in-memory only; the test log is their source of truth.
-  `_reconstruct_scheduling_position()` rebuilds them on resume so cycling
-  continues where it stopped instead of restarting at core 0.
-- Synthetic crash-recovery rows (logged with `duration_seconds = NULL`) never
-  move the cursors — they record a reboot, not a test.
-- Crash penalties on resume only apply when the machine actually rebooted
-  since the session's last persisted write (`_rebooted_since`); a plain app
-  exit mid-test clears `in_test` without a penalty and without moving offsets.
+- `_reconstruct_scheduling_position()` rebuilds the in-memory cursors from the
+  real test log so cyclic orders continue where they stopped.
+- Synthetic crash-recovery rows (`duration_seconds = NULL`) do not move either
+  cursor because they are evidence records, not completed tests.
+- Resume applies crash penalties only after an actual reboot since the last
+  execution checkpoint. A same-boot process exit clears stale `in_test`
+  bookkeeping without moving offsets or scheduling cursors.

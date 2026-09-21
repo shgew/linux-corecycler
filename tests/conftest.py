@@ -671,6 +671,20 @@ def no_real_sleep_inhibitor(monkeypatch):
     monkeypatch.setattr(inhibit, "_shared", inhibit._SharedLock())
 
 
+@pytest.fixture(autouse=True)
+def no_real_freeze_monitor(monkeypatch):
+    """No hermetic test may spawn the 1 ms micro-freeze thread.
+
+    It is a real OS thread writing a breadcrumb under the invoking user's home,
+    so leaking one per engine both corrupts live state and starves the suite.
+    The monitor's own tests replace these again.
+    """
+    from corecycler.engine import microfreeze
+
+    monkeypatch.setattr(microfreeze.MicroFreezeMonitor, "start", lambda self: None)
+    monkeypatch.setattr(microfreeze.MicroFreezeMonitor, "stop", lambda self: None)
+
+
 @pytest.fixture
 def sleep_lock(no_real_sleep_inhibitor, monkeypatch):
     """The shared inhibitor with a parked stand-in for systemd-inhibit.

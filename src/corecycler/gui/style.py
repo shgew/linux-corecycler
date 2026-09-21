@@ -48,9 +48,6 @@ _SEMANTIC: dict[str, dict[str, str]] = {
         "PHASE_CONFIRMING": "#3296c8",
         "PHASE_CONFIRMED": "#32b432",
         "PHASE_FAILED_CONFIRM": "#dc8050",
-        "PHASE_HARDENING_T1": "#b39ddb",
-        "PHASE_HARDENING_T2": "#a084d6",
-        "PHASE_HARDENED": "#66bb6a",
     },
     LIGHT: {
         "COLOR_PASS": "#266b2a",
@@ -81,9 +78,6 @@ _SEMANTIC: dict[str, dict[str, str]] = {
         "PHASE_CONFIRMING": "#1f5f80",
         "PHASE_CONFIRMED": "#1f7a1f",
         "PHASE_FAILED_CONFIRM": "#8f3a10",
-        "PHASE_HARDENING_T1": "#5e35b1",
-        "PHASE_HARDENING_T2": "#4527a0",
-        "PHASE_HARDENED": "#266b2a",
     },
 }
 
@@ -101,9 +95,7 @@ PHASE_LABELS: dict[TunerPhase, str] = {
     TunerPhase.FAILED_CONFIRM: "Failed confirm",
     TunerPhase.BACKOFF_PRECONFIRM: "Backing off",
     TunerPhase.BACKOFF_CONFIRMING: "Backoff confirm",
-    TunerPhase.HARDENING_T1: "Hardening 1",
-    TunerPhase.HARDENING_T2: "Hardening 2",
-    TunerPhase.HARDENED: "Hardened",
+    TunerPhase.ANNEALING: "Annealing deeper",
 }
 
 PHASE_TO_GRID: dict[TunerPhase, str] = {
@@ -116,9 +108,7 @@ PHASE_TO_GRID: dict[TunerPhase, str] = {
     TunerPhase.FAILED_CONFIRM: "backoff",
     TunerPhase.BACKOFF_PRECONFIRM: "backoff",
     TunerPhase.BACKOFF_CONFIRMING: "backoff",
-    TunerPhase.HARDENING_T1: "queued",
-    TunerPhase.HARDENING_T2: "queued",
-    TunerPhase.HARDENED: "passed",
+    TunerPhase.ANNEALING: "queued",
 }
 
 GRID_STATE_LABELS: dict[str, str] = {
@@ -207,9 +197,7 @@ def _phase_colors(c: dict[str, str]) -> dict[TunerPhase, str]:
         TunerPhase.FAILED_CONFIRM: c["PHASE_FAILED_CONFIRM"],
         TunerPhase.BACKOFF_PRECONFIRM: c["COLOR_ORANGE"],
         TunerPhase.BACKOFF_CONFIRMING: c["COLOR_WARN_SOFT"],
-        TunerPhase.HARDENING_T1: c["PHASE_HARDENING_T1"],
-        TunerPhase.HARDENING_T2: c["PHASE_HARDENING_T2"],
-        TunerPhase.HARDENED: c["PHASE_HARDENED"],
+        TunerPhase.ANNEALING: c["PHASE_CONFIRMING"],
     }
 
 

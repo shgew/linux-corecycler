@@ -67,14 +67,14 @@ The Auto-Tuner automates the entire PBO Curve Optimizer search via runtime SMU w
 (requires `ryzen_smu`). For each core it runs a coarse-to-fine search:
 
 1. **Coarse search** -- from `start_offset` (default 0), step by `coarse_step`
-   (default -5) toward `max_offset`, running a short test (`search_duration`, default
+   (default -5) toward `max_offset`, running a short test (`search_duration_seconds`, default
    60s) per step. A pass goes more aggressive; a fail bounds the limit. If the first
    coarse probe fails, fine-step backoff explores the gap toward baseline.
 2. **Fine search** -- from the last passing coarse value, step by `fine_step`
    (default -1) toward the failure point to narrow the exact limit.
-3. **Confirmation** -- a longer test (`confirm_duration`, default 300s) validates the
+3. **Confirmation** -- a longer test (`confirm_duration_seconds`, default 300s) validates the
    best offset. On failure, a **smart backoff** finds the nearest stable offset: a quick
-   pre-confirm filter (`search_duration x backoff_preconfirm_multiplier`, default 2x), a
+   pre-confirm filter (`search_duration_seconds x backoff_preconfirm_multiplier`, default 2x), a
    **midpoint jump** after `midpoint_jump_threshold` (default 3) consecutive pre-confirm
    fails, then **binary search** to the boundary. Backoff stops at the BIOS baseline
    (from `inherit_current`), not zero -- unless the baseline itself crashes, in which
@@ -85,7 +85,7 @@ The Auto-Tuner automates the entire PBO Curve Optimizer search via runtime SMU w
    - **Stage 1 -- per-core, all offsets live**: all confirmed offsets applied, each core
      stressed in turn. Catches shared-VRM power-delivery interactions.
    - **Stage 2 -- all-core simultaneous**: one pinned stress process per core at once
-     for `validate_duration` -- full package-power worst case, per-core verdicts.
+     for `validate_duration_seconds` -- full package-power worst case, per-core verdicts.
    - **Stage 3 -- alternating half-core load**: half loaded, half idle, then swap
      (split by CCD when available). Catches boost-ramp voltage transients.
    - **Stage 4 -- rapid transitions** (`validate_transitions`): fast load/idle cycling
@@ -106,16 +106,19 @@ The Auto-Tuner automates the entire PBO Curve Optimizer search via runtime SMU w
    never a back-off. Any back-off marks the pass dirty -- completion requires one final
    clean pass. If a failing core reaches its baseline with real failures persisting,
    the tuner reverts everything to baseline and PAUSES with an honest message instead
-   of declaring completion. A reboot mid-validation with no attributable evidence is
-   recorded as an unattributed incident; repeated incidents pause for your decision.
-5. **Result** -- each core gets a confirmed, cross-validated best offset. Export it as
-   JSON or load it into the Curve Optimizer tab.
+   of declaring completion. A reboot mid-validation that no evidence attributes does
+   not pause and does not guess: it opens the [attribution hunt](#flows).
+5. **Endurance** (`endurance`, on by default) -- instead of declaring a result,
+   validation restarts in rounds whose slots double in length. The vector keeps being
+   re-proven, and a core that banks enough clean time earns an annealing probe a step
+   deeper. Turn endurance off to get a terminal `completed` session instead.
+6. **Result** -- `corecycler report` prints each core's offset with the evidence behind
+   it. Export it as JSON or load it into the Curve Optimizer tab.
 
 A confirmed offset has passed the configured workloads and durations, not every
 possible workload indefinitely. The search targets the most aggressive passing
 candidate within its bounds; intermittent failures limit how precisely that
-boundary can be established. With `endurance=true`, validation continues in
-progressively longer rounds rather than declaring a final result.
+boundary can be established.
 
 The active-clock warning compares APERF/MPERF against nominal frequency. It does
 not prove clock stretching or CO instability and never changes a stress verdict.
@@ -123,20 +126,31 @@ The saved `stretch_threshold_pct` field controls this warning for existing sessi
 A contradictory-failure circuit breaker pauses with the new failure bound intact;
 an earlier passing run does not make a later failure invalid.
 
-### CO isolation
+### Offset masks
 
-During per-core search the **only** non-baseline offset on the CPU is the core under
-test -- all others are reverted to baseline before and after each test, so a crash is
-never wrongly blamed on a different core. During multi-core validation isolation is
-deliberately off (all confirmed offsets are live to test interactions); on a stage
-failure or a partial SMU write, all cores revert to baseline before pausing.
+Which cores hold a live offset during a slot is a deliberate variable, not an
+implementation detail, because it decides what a crash can prove.
+
+- **Live mask** -- the default for per-core search, validation, and endurance. Every
+  core other than the one under test sits at its own best-known offset, which is the
+  only condition the machine actually operates in. An idle core at a deep offset can
+  take the box down, and a search that parks everyone at stock is structurally unable
+  to see that.
+- **Isolated mask** -- one core at its offset, every other core at stock. Only the
+  attribution hunt uses it, for leave-one-out confirmation. Its result is a
+  hypothesis about a core's limit, never proof of one, so nothing banks confidence
+  from an isolated run.
+
+Because the live mask is the norm, being the only core under load proves nothing
+about who crashed; attribution is a separate experiment. On a stage failure or a
+partial SMU write, all cores revert to baseline before pausing.
 
 ### Crash safety
 
 Hard crashes can occur during CO tuning. Recovery backs off attributable failures,
-hunts ambiguous failures in isolation, and stops when evidence or hardware control
-is unavailable. It cannot guarantee a reboot-free machine. Three mechanisms bound
-recovery:
+hunts ambiguous ones by varying the offset mask, and stops when evidence or hardware
+control is unavailable. It cannot guarantee a reboot-free machine. Three mechanisms
+bound recovery:
 
 1. **CO write-ahead journal** -- every CO value is recorded in SQLite *before* it is
    written to the SMU, and marked "survived" only after a test completes with it
@@ -147,12 +161,14 @@ recovery:
 2. **CO=0 is the recovery floor** -- crash backoff never goes past stock. If an
    inherited baseline crashes, it moves toward 0 rather than being reapplied
    unchanged. Stock is not proof of stability: hardware errors at stock pause.
-3. **Resume-crash circuit breaker** -- consecutive crash-resumes without a passing
-   non-hunt test are counted. Hunt passes, thermal stops, apparatus faults, and plain
-   app restarts do not clear the counter. Finding and backing off a hunt culprit does.
-   After `resume_crash_quarantine_threshold` (default 3), the tuner forces every core
-   to CO=0 and marks the session `quarantined`, never resumed automatically.
-   Reopening requires an explicit decision and retains only previously survived values.
+3. **Repeated crash-resumes ask a different question** -- consecutive crash-resumes
+   without a passing non-hunt test are counted. Hunt passes, thermal stops, apparatus
+   faults, and plain app restarts do not clear the counter. Finding and backing off a
+   hunt culprit does. After `resume_crash_quarantine_threshold` (default 3) the tuner
+   does not dead-end: it starts the attribution hunt, whose first probe runs every
+   core at CO=0. If the machine dies there too, the fault is not in the offsets and
+   the tuner says so. `quarantined` is now reserved for the one case it always meant
+   literally: stock restoration itself failed, so offsets may still be resident.
 
 An interrupted session is detected on next launch and offered for resume. Resume
 rebuilds journal evidence from that session only and verifies baseline restoration
@@ -167,12 +183,30 @@ not simply the immediately previous boot. Unreadable or unidentified forensic
 history pauses before offsets are reapplied. Hardware errors at stock or on an
 unmapped/unselected core also pause without blaming another core.
 
-An ambiguous validation reboot triggers an isolated hunt, not an automatic penalty
-against whichever core was under load. During endurance, the hunt replays the
-interrupted workload's backend, instruction set, FFT size, thread count and load
-profile, for at least the interrupted slot's duration, with other cores at stock.
-A fruitless hunt does not prove the all-offsets-live profile stable; repeated
-unattributed incidents remain bounded by the configured pause/quarantine limits.
+An unattributed crash never pauses and never guesses. Search runs the **live offset
+mask** -- every core other than the one under test sits at its own best-known offset,
+the only condition the machine actually operates in -- so being the sole core under
+load proves nothing about who crashed. A crash that no kernel machine check and no
+un-survived CO journal write names starts the attribution hunt:
+
+1. **Stock control run** -- every core at CO=0 under the same workload. It has to
+   reproduce `control_run_confirmations` times to call a platform fault, which stops
+   the tuner from spending a week chasing a board current limit as if it were CO.
+2. **Group bisection over the live mask** -- half the cores keep their offsets, half
+   drop to stock. A crash means the culprit is in the live half; log2(n) probes.
+   Both halves failing means two culprits, and both subtrees are pursued.
+3. **Leave-one-out confirmation** -- the named core alone at its offset, at four
+   times the base probe budget, because a false clean at the leaf costs the answer.
+4. **Suspicion fallback** -- when nothing reproduces inside budget, every core that
+   held a live offset accrues suspicion weighted by offset depth and by whether it
+   was loaded or idle. It only acts on a two-to-one separation after at least three
+   unattributed failures; a near-tie refuses to act, which is exactly where a guess
+   would be worst.
+
+Probe budgets are `max(probe_base_seconds, probe_mttf_multiplier x observed
+time-to-failure)`, grown per bisection level and again for the final confirmation.
+A hunt that convicts nobody is recorded as such; it is never read as proof that the
+live profile is stable.
 
 ### State machine
 
@@ -188,7 +222,121 @@ NOT_STARTED -> COARSE_SEARCH -> FINE_SEARCH -> SETTLED -> CONFIRMING -> CONFIRME
                                                     - midpoint jump    clean pass before DONE)
                                                     - binary search
                                                     - baseline floor
+
+CONFIRMED -> ANNEALING -> CONFIRMED        (deeper on a pass; back, with a doubled
+                                            bar and a strike, on a fail)
 ```
+
+`CONFIRMED` is the only phase a core rests in. Each offset must survive the whole
+**regime battery** before it counts: one slot per regime (`boost`, `current`,
+`transient`, `coupled`), a pass with regimes remaining re-testing the *same* offset
+under the next one, and any failure ending the slot immediately -- a short fail is
+conclusive, a short pass is not. Slot time is split across regimes by how often each
+has actually caught something on this silicon, with a floor (`regime_floor_pct`) so a
+quiet regime is never scheduled away: its silence is the thing being proven.
+
+Clean time banks per `(operating point, core, regime, offset)`, so confidence survives
+reboots and is invalidated the moment the operating point changes. Once a core has
+banked `anneal_bank_hours` in its **weakest** regime, it earns one probe a step deeper.
+A pass makes that the new answer; a fail returns it to the proven offset, doubles the
+bar, and counts a strike, stopping after `anneal_max_strikes`. With endurance enabled
+there is no terminus: the vector keeps being re-proven and occasionally improved for
+as long as the machine is left running, which is why an overnight run and a week-long
+run differ in confidence rather than in kind.
+
+`corecycler report [SESSION_ID] [--json]` prints the per-core answer with the banked
+hours, failure classes, and regime yield behind it.
+
+#### Phase reference
+
+Every core carries exactly one phase. `docs/tuner-state-spec.md` is the normative
+transition contract; this table is what each phase means in practice.
+
+| Phase | What the core is doing | Entered from | Leaves to |
+|---|---|---|---|
+| `not_started` | No slot has run yet. The entry step applies `start_offset` and the verdict is ignored. | session start | `coarse_search` |
+| `coarse_search` | Stepping by `coarse_step` toward `max_offset`, `search_duration_seconds` per regime, restricted to the regimes named in `coarse_regimes`. | `not_started` | deeper `coarse_search`, `settled` at the limit, `fine_search` or `backoff_preconfirm` on a fail |
+| `fine_search` | Narrowing by `fine_step` between the last pass and the first fail, including the gap below a failed first coarse probe. | `coarse_search` | `fine_search`, `settled` |
+| `settled` | A candidate is chosen and waiting for the long confirmation run. | `coarse_search`, `fine_search` | `confirming` |
+| `confirming` | `confirm_duration_seconds` at the candidate, full battery. | `settled` | `confirmed` on a pass; retry up to `max_confirm_retries`, then `failed_confirm` |
+| `failed_confirm` | The candidate did not hold. No offset is trusted until backoff finds one. | `confirming` | `backoff_preconfirm` |
+| `backoff_preconfirm` | Smart backoff: a short filter run (`search_duration_seconds x backoff_preconfirm_multiplier`), a midpoint jump after `midpoint_jump_threshold` consecutive filter fails, then binary search between the known bounds. | `failed_confirm`, `backoff_confirming`, any crash penalty | `backoff_confirming` once a value survives the filter; pauses if the baseline itself fails |
+| `backoff_confirming` | Full-length confirmation of a backoff candidate. | `backoff_preconfirm` | `confirmed` on a pass, back to `backoff_preconfirm` on a fail |
+| `confirmed` | The core's answer, and the only phase a core rests in. | `confirming`, `backoff_confirming`, `annealing` | `annealing` when it has earned a probe; `backoff_preconfirm` on a crash penalty |
+| `annealing` | One probe a fine step deeper than `best_offset`, paid for with banked clean time. | `confirmed` | `confirmed` either way: promoted on a pass, restored plus a strike and a doubled bar on a fail |
+
+### Flows
+
+#### Entry points
+
+`corecycler` with no command opens the GUI; the Auto-Tuner tab drives the same engine
+the CLI does. `corecycler tune [--config F]` starts a new session headless and runs to
+the end. `corecycler resume [SESSION_ID]` continues one (newest eligible if omitted).
+`corecycler status` lists sessions, `corecycler report` prints the answer and its
+evidence, and `corecycler doctor` is the preflight for external tools. A `QLockFile`
+allows one instance, so GUI and CLI cannot fight over the SMU.
+
+#### Session statuses
+
+The status is the session's flow, and the CLI exit code follows it.
+
+| Status | Flow | Exit code |
+|---|---|---|
+| `running` | Per-core search, backoff, or an annealing probe | -- |
+| `validating` | Multi-core validation stages, or an endurance round | -- |
+| `hunting` | Attribution hunt: who crashed the machine | -- |
+| `paused` | Stopped on an instrument failure and waiting for you | 3 |
+| `quarantined` | Stock restoration itself failed; offsets may still be resident | 4 |
+| `aborted` | Deliberate stop; baselines restored, progress resumable | 6, or 130 from SIGINT |
+| `completed` | Every core confirmed and validation clean, endurance off | 0 |
+| `idle` | No session in flight | -- |
+
+#### The five things a session can be doing
+
+1. **Per-core search** (`running`) -- one core per slot walks the phases above under
+   the live offset mask. Core selection follows `test_order`
+   ([Test orderings](#test-orderings)), and `docs/test-order-spec.md` is normative.
+2. **Multi-core validation** (`validating`) -- stages 1-7, run once every core is
+   `confirmed`. A stage failure backs off the failing core, re-proves it solo, and
+   reruns only that stage; any back-off marks the pass dirty and owes one final clean
+   pass.
+3. **Endurance** (`validating`, `endurance=true`) -- instead of completing, validation
+   restarts in rounds whose slots double from `endurance_slot_seconds` up to
+   `endurance_slot_max_seconds`. A failing slot backs its core off one fine step and
+   the round restarts. This is the state an unattended machine lives in.
+4. **Annealing** (`running`) -- entered only when no ordinary core needs a slot, so it
+   never delays the search. One core, one step deeper, one battery.
+5. **Attribution hunt** (`hunting`) -- opened by an unattributed crash or by reaching
+   `resume_crash_quarantine_threshold` crash-resumes. It replays the load that was
+   running and varies only the offset mask.
+
+#### Attribution hunt stages
+
+| Stage | Question | Outcome |
+|---|---|---|
+| `control` | Does the machine die with every core at CO=0? | `platform` after `control_run_confirmations` reproductions; otherwise bisection starts |
+| `probe` | Which half of the live mask carries the culprit? | Recurses into the failing half, or into both halves when both fail |
+| `confirm` | Does the named core alone reproduce it, at 4x the probe budget? | `culprit` on a reproduction; back to `probe` otherwise |
+| `culprit` | -- | The core is backed off one step and its banked confidence is discarded |
+| `platform` | -- | Tuner stops and reports a platform fault with the MCE, dmesg, thermal and PPT/TDC/EDC evidence. The answer is not in the offsets |
+| `exhausted` | Nothing reproduced inside budget | Falls back to the suspicion model, which acts only on a 2:1 separation after at least three unattributed failures |
+
+A probe that is interrupted by a thermal stop, an apparatus fault, or a deliberate
+abort is returned to the head of the queue rather than counted as an answer, so a
+clean stop costs no attribution progress.
+
+#### Interrupting a run
+
+| Action | Effect |
+|---|---|
+| **Pause** (GUI) or `SIGTERM` | Finishes the current test, saves the cursor, exits 3. Resumable |
+| **Abort** (GUI) or `SIGINT` / Ctrl+C | Stops the workload, reverts every core to its session baseline, marks the session `aborted`, exits 130. Resumable |
+| Crash, freeze, or reboot | The write-ahead journal and the persisted boot ID reconstruct what was resident; recovery runs on next launch |
+| `kill -9`, closing the terminal | Outside the safe model: no restoration runs, though a reboot clears CO anyway |
+
+On the next launch an interrupted session is detected and offered for resume. Resume
+attributes any crash from evidence first, restores baselines, verifies them through
+the SMU, and only then continues from the persisted cursor.
 
 ### Configuration options
 
@@ -209,14 +357,22 @@ NOT_STARTED -> COARSE_SEARCH -> FINE_SEARCH -> SETTLED -> CONFIRMING -> CONFIRME
 | Test Order | sequential | see below | Core testing order |
 | Stretch Threshold | 3.0% | 0-20% | Clock-stretch failure threshold (0 = off, requires root) |
 | Abort on Consecutive Failures | 0 | >= 0 | Abort if N cores fail at start_offset (0 = off) |
-| Resume Crash Quarantine Threshold | 3 | 1-20 | Crash-resumes (no surviving test between) before forcing CO=0 and quarantining |
+| Resume Crash Quarantine Threshold | 3 | 1-20 | Crash-resumes (no surviving test between) before the attribution hunt opens with a stock control run |
 | Allow Missing Thermal Sensor | false | true/false | Permit running with no readable temperature sensor (false = fail closed) |
 | Inherit Current CO | false | true/false | Read current SMU offsets as starting points |
+| Regime Floor Pct | 15.0 | 0-100 | Smallest share of slot time any regime may be scheduled down to |
+| Anneal Bank Hours | 6.0 | > 0 | Clean hours in the weakest regime before a core probes a step deeper |
+| Anneal Max Strikes | 3 | 1-10 | Failed deeper probes before a core stops probing |
+| Control Run Confirmations | 2 | >= 1 | Stock reproductions required to call a platform fault |
+| Probe Base Seconds | 1800 | >= 1 | Floor on an attribution probe's budget |
+| Suspicion Separation | 2.0 | >= 1 | Score ratio the top suspect needs before the fallback acts |
+| Suspicion Min Failures | 3 | >= 1 | Unattributed failures required before the fallback may act |
 
-Abort on Consecutive Failures, Resume Crash Quarantine Threshold and Allow Missing
-Thermal Sensor are not in the panel: set them in the JSON that `corecycler tune
---config` loads. The Backoff Pre-Confirm Multiplier (2.0) and Midpoint Jump
-Threshold (3) use sensible defaults and are not exposed at all.
+Abort on Consecutive Failures, Resume Crash Quarantine Threshold, Allow Missing
+Thermal Sensor, the battery, and every annealing/hunt knob are not in the panel: set
+them in the JSON that `corecycler tune --config` loads. The Backoff Pre-Confirm
+Multiplier (2.0) and Midpoint Jump Threshold (3) use sensible defaults and are not
+exposed at all.
 
 ### How each backend uses Mode and FFT Preset
 

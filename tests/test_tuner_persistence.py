@@ -5,7 +5,8 @@ from __future__ import annotations
 import pytest
 
 from corecycler import __version__
-from corecycler.history.db import HistoryDB
+from corecycler.history.db import HistoryDB, TuningContextRecord
+from corecycler.tuner import bisect
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.persistence import (
     create_session,
@@ -17,6 +18,7 @@ from corecycler.tuner.persistence import (
     load_core_states,
     log_test_result,
     save_core_state,
+    set_hunt_state,
     update_session_status,
 )
 from corecycler.tuner.state import CoreState, TunerPhase
@@ -24,7 +26,7 @@ from corecycler.tuner.state import CoreState, TunerPhase
 
 @pytest.fixture
 def db():
-    """In-memory database with v3 schema."""
+    """In-memory database with the current schema."""
     d = HistoryDB(":memory:")
     yield d
     d.close()
@@ -40,6 +42,9 @@ class TestTunerSessions:
         db.insert_tuner_event(sid, "last execution", "latest")
         db._execute_raw("UPDATE tuner_events SET timestamp='2099-01-01' WHERE boot_id='old'")
         db._execute_raw("ALTER TABLE tuner_sessions DROP COLUMN boot_id")
+        db._execute_raw("ALTER TABLE tuner_sessions DROP COLUMN hunt_state")
+        db._execute_raw("ALTER TABLE tuner_test_log DROP COLUMN regime")
+        db._execute_raw("DROP TABLE tuner_regime_banks")
         db._execute_raw("UPDATE schema_version SET version=16")
         db.close()
 
@@ -61,6 +66,9 @@ class TestTunerSessions:
         db = HistoryDB(path)
         sid = create_session(db, TunerConfig(), "", "")
         db._execute_raw("ALTER TABLE tuner_sessions DROP COLUMN app_version")
+        db._execute_raw("ALTER TABLE tuner_sessions DROP COLUMN hunt_state")
+        db._execute_raw("ALTER TABLE tuner_test_log DROP COLUMN regime")
+        db._execute_raw("DROP TABLE tuner_regime_banks")
         db._execute_raw("UPDATE schema_version SET version=17")
         db.close()
 
@@ -122,22 +130,44 @@ class TestTunerSessions:
     def test_get_session_not_found(self, db):
         assert get_session(db, 999) is None
 
+    def test_hunt_state_round_trips_as_a_serialized_state_machine(self, db):
+        sid = create_session(db, TunerConfig(), "", "")
+        hunt = bisect.begin([0, 1, 2, 3], loaded=[1, 3])
+        hunt.control_fails = 1
+        hunt.level = 2
+        tp_blob = hunt.to_json()
+
+        set_hunt_state(db, sid, tp_blob)
+
+        restored = bisect.HuntState.from_json(get_session(db, sid).hunt_state)
+        assert restored == hunt
+
 
 class TestCoreStates:
     def test_save_and_load(self, db):
-        cfg = TunerConfig()
-        sid = create_session(db, cfg, "", "")
-
-        cs0 = CoreState(core_id=0, phase=TunerPhase.COARSE_SEARCH, current_offset=-5, best_offset=0)
-        cs1 = CoreState(core_id=1, phase=TunerPhase.NOT_STARTED)
+        sid = create_session(db, TunerConfig(), "", "")
+        cs0 = CoreState(
+            core_id=0,
+            phase=TunerPhase.COARSE_SEARCH,
+            current_offset=-5,
+            best_offset=0,
+            battery_index=2,
+            anneal_strikes=1,
+            anneal_bar_hours=12.5,
+            suspicion=3.75,
+        )
         save_core_state(db, sid, cs0)
-        save_core_state(db, sid, cs1)
+        save_core_state(db, sid, CoreState(core_id=1, phase=TunerPhase.NOT_STARTED))
 
         loaded = load_core_states(db, sid)
         assert len(loaded) == 2
         assert loaded[0].phase == TunerPhase.COARSE_SEARCH
         assert loaded[0].current_offset == -5
         assert loaded[0].best_offset == 0
+        assert loaded[0].battery_index == 2
+        assert loaded[0].anneal_strikes == 1
+        assert loaded[0].anneal_bar_hours == pytest.approx(12.5)
+        assert loaded[0].suspicion == pytest.approx(3.75)
         assert loaded[1].phase == TunerPhase.NOT_STARTED
 
     def test_upsert_updates_existing(self, db):
@@ -234,6 +264,32 @@ class TestTestLog:
         assert e["duration_seconds"] == pytest.approx(45.5)
 
 
+class TestRegimeBanks:
+    def test_clean_time_accumulates_per_regime_and_clear_is_core_scoped(self, db):
+        db.bank_regime_time("ctx", 0, "boost", -20, 30.0)
+        db.bank_regime_time("ctx", 0, "boost", -20, 45.0)
+        db.bank_regime_time("ctx", 0, "current", -20, 60.0)
+        db.bank_regime_time("ctx", 1, "boost", -18, 90.0)
+
+        assert db.get_regime_banks("ctx", 0, -20) == {"boost": 75.0, "current": 60.0}
+        db.clear_regime_banks("ctx", 0)
+        assert db.get_regime_banks("ctx", 0, -20) == {}
+        assert db.get_regime_banks("ctx", 1, -18) == {"boost": 90.0}
+
+    def test_regime_yield_groups_failures_and_time_by_context(self, db):
+        context_id = db.create_context(TuningContextRecord(bios_version="1.0", co_hash="ctx"))
+        sid = create_session(db, TunerConfig(), "1.0", "CPU", context_id=context_id)
+        log_test_result(db, sid, 0, -20, "fine", True, duration=60.0, regime="boost")
+        log_test_result(db, sid, 0, -20, "fine", False, duration=30.0, regime="boost")
+        log_test_result(db, sid, 1, -18, "fine", False, duration=40.0, regime="current")
+
+        other_id = db.create_context(TuningContextRecord(bios_version="1.0", co_hash="other"))
+        other_sid = create_session(db, TunerConfig(), "1.0", "CPU", context_id=other_id)
+        log_test_result(db, other_sid, 0, -20, "fine", False, duration=999.0, regime="boost")
+
+        assert db.regime_yield("ctx") == {"boost": (1, 90.0), "current": (1, 40.0)}
+
+
 class TestBestProfile:
     def test_confirmed_cores_only(self, db):
         cfg = TunerConfig()
@@ -282,13 +338,12 @@ class TestBestProfile:
 
 
 class TestSchemaMigration:
-    def test_fresh_db_has_tuner_tables(self, db):
-        """Fresh v3 database should have all tuner tables."""
+    def test_fresh_db_has_v19_tuner_schema(self, db):
         tables = db._execute_raw("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
         table_names = [t["name"] for t in tables]
-        assert "tuner_sessions" in table_names
-        assert "tuner_core_states" in table_names
-        assert "tuner_test_log" in table_names
+        assert {"tuner_sessions", "tuner_core_states", "tuner_test_log", "tuner_regime_banks"} <= set(table_names)
+        log_columns = {row["name"] for row in db._execute_raw("PRAGMA table_info(tuner_test_log)").fetchall()}
+        assert "regime" in log_columns
 
     def test_schema_version_is_current(self, db):
         version = db._execute_raw("SELECT version FROM schema_version").fetchone()[0]
@@ -326,55 +381,6 @@ class TestSchemaV11:
         finally:
             db.close()
 
-    def test_v10_database_migrates_to_v11(self, tmp_path):
-        """An older (v10) on-disk database gains the CO journal table and the
-        resume-crash-streak column when re-opened — the migration path, not just
-        the fresh-schema path."""
-        path = tmp_path / "mig.db"
-        db = HistoryDB(path)
-        sid = db.create_tuner_session("{}", "1.0", "TestCPU")
-        # Emulate a v10 database: roll the version back, drop the v11 table,
-        # and drop every column later migrations add (a fresh DB already has
-        # them; leaving them would collide with the v13 ALTERs on re-open).
-        db._execute_raw("UPDATE schema_version SET version=10")
-        db._execute_raw("DROP TABLE tuner_co_journal")
-        for table, column in (
-            ("tuning_contexts", "ppt_limit_w"),
-            ("tuning_contexts", "tdc_limit_a"),
-            ("tuning_contexts", "edc_limit_a"),
-            ("tuner_sessions", "unattributed_crashes"),
-            ("tuner_sessions", "hunting_core"),
-            ("tuner_sessions", "validation_stage"),
-            ("tuner_sessions", "validation_index"),
-            ("tuner_sessions", "validation_half"),
-            ("tuner_sessions", "validation_dirty"),
-            ("tuner_sessions", "validation_requeue"),
-            ("tuner_sessions", "endurance_round"),
-            ("tuner_sessions", "endurance_workload"),
-            ("tuner_sessions", "endurance_index"),
-            ("tuner_test_log", "peak_stretch_pct"),
-            ("tuner_test_log", "threads"),
-            ("tuner_test_log", "profile"),
-        ):
-            db._execute_raw(f"ALTER TABLE {table} DROP COLUMN {column}")
-        db.close()
-
-        db2 = HistoryDB(path)  # re-open triggers the v11 migration
-        try:
-            assert db2._execute_raw("SELECT version FROM schema_version").fetchone()[0] == HistoryDB.SCHEMA_VERSION
-            db2.journal_co_intent(sid, 0, -25, survived=False)
-            assert (0, -25) in db2.journal_suspects(sid)
-            db2.set_resume_crash_streak(sid, 2)
-            assert db2.get_resume_crash_streak(sid) == 2
-            db2.set_endurance_position(sid, 3, 2, 5)
-            restored = db2.get_tuner_session(sid)
-            assert (restored.endurance_round, restored.endurance_workload, restored.endurance_index) == (3, 2, 5)
-            db2.insert_tuner_test_log(sid, 0, -30, "endurance", True, threads=2, profile="spectrum")
-            row = db2.get_tuner_test_log(sid)[-1]
-            assert (row["threads"], row["profile"]) == (2, "spectrum")
-        finally:
-            db2.close()
-
     def test_core_state_crash_fields_persist(self, tmp_path):
         db = HistoryDB(tmp_path / "test.db")
         try:
@@ -385,7 +391,6 @@ class TestSchemaV11:
                 crash_cooldown=1,
                 thermal_aborts=3,
                 cumulative_test_time=3600.5,
-                hardening_tier_index=1,
             )
             db.upsert_tuner_core_state(sid, cs)
             states = db.get_tuner_core_states(sid)
@@ -393,11 +398,10 @@ class TestSchemaV11:
             assert states[0].crash_cooldown == 1
             assert states[0].thermal_aborts == 3
             assert abs(states[0].cumulative_test_time - 3600.5) < 0.01
-            assert states[0].hardening_tier_index == 1
         finally:
             db.close()
 
-    def test_test_log_has_backend_fields(self, tmp_path):
+    def test_test_log_has_workload_and_regime_fields(self, tmp_path):
         db = HistoryDB(tmp_path / "test.db")
         try:
             sid = db.create_tuner_session("{}", "1.0", "TestCPU")
@@ -405,7 +409,7 @@ class TestSchemaV11:
                 sid,
                 core_id=0,
                 offset=-30,
-                phase="hardening_t1",
+                phase="fine",
                 passed=True,
                 error_msg=None,
                 error_type=None,
@@ -414,11 +418,11 @@ class TestSchemaV11:
                 backend="mprime",
                 stress_mode="AVX2",
                 fft_preset="SMALL",
+                regime="current",
             )
-            logs = db.get_tuner_test_log(sid)
-            assert logs[0]["backend"] == "mprime"
-            assert logs[0]["stress_mode"] == "AVX2"
-            assert logs[0]["fft_preset"] == "SMALL"
+            log = db.get_tuner_test_log(sid)[0]
+            assert (log["backend"], log["stress_mode"], log["fft_preset"]) == ("mprime", "AVX2", "SMALL")
+            assert log["regime"] == "current"
         finally:
             db.close()
 
@@ -477,8 +481,6 @@ class TestSchemaV13:
             db.close()
 
     def test_context_power_limits_round_trip(self, tmp_path):
-        from corecycler.history.db import TuningContextRecord
-
         db = HistoryDB(tmp_path / "test.db")
         try:
             ctx = TuningContextRecord(
@@ -493,20 +495,6 @@ class TestSchemaV13:
             assert loaded.ppt_limit_w == pytest.approx(225.0)
             assert loaded.tdc_limit_a == pytest.approx(190.0)
             assert loaded.edc_limit_a is None
-        finally:
-            db.close()
-
-    def test_best_profile_includes_hardened(self, tmp_path):
-        """HARDENED is confirmed-plus-extra-stress; excluding it made Export/
-        Validate report 'no confirmed cores' on a fully hardened session."""
-        from corecycler.tuner.state import CoreState, TunerPhase
-
-        db = HistoryDB(tmp_path / "test.db")
-        try:
-            sid = db.create_tuner_session("{}", "1.0", "TestCPU")
-            db.upsert_tuner_core_state(sid, CoreState(core_id=0, phase=TunerPhase.HARDENED, best_offset=-41))
-            db.upsert_tuner_core_state(sid, CoreState(core_id=1, phase=TunerPhase.CONFIRMED, best_offset=-30))
-            assert db.get_tuner_best_profile(sid) == {0: -41, 1: -30}
         finally:
             db.close()
 

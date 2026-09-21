@@ -334,11 +334,12 @@ class TestStalenessRecovery:
         assert tab._hwmon_fail_count == 0, "fail count should be reset on success"
 
 
-class TestLoadToCOEnabledForHardened:
-    """A session whose cores all reached HARDENED (the terminal phase with
-    hardening tiers on — the default) must still offer Load to CO: hardened is
-    confirmed plus extra stress. The gate only knowing CONFIRMED left every
-    finished default-config session with a dead button."""
+class TestLoadToCOEnabledForConfirmed:
+    """A finished session must offer Load to CO.
+
+    CONFIRMED is the single terminal phase, so the gate has exactly one
+    value to recognise; getting it wrong leaves every finished session with
+    a dead button."""
 
     def _detail_ns(self):
         ns = types.SimpleNamespace()
@@ -377,10 +378,10 @@ class TestLoadToCOEnabledForHardened:
             MethodType(HistoryTab._show_tuner_session_detail, ns)(sess)
         return ns
 
-    def test_all_hardened_session_enables_load(self):
+    def test_all_confirmed_session_enables_load(self):
         from corecycler.tuner.state import TunerPhase
 
-        ns = self._run_detail([TunerPhase.HARDENED] * 4)
+        ns = self._run_detail([TunerPhase.CONFIRMED] * 4)
         ns._load_co_btn.setEnabled.assert_called_with(True)
 
     def test_unfinished_session_with_values_enables_load(self):

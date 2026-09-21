@@ -26,24 +26,3 @@ class TestPerCoreFreqText:
         assert CoreFreqBar._freq_text(4321.0, 0.0) == "4321MHz"
 
 
-class TestRealTestCount:
-    def test_excludes_synthetic_crash_rows(self):
-        entries = [
-            {"passed": True, "duration_seconds": 60.0},
-            {"passed": False, "duration_seconds": None, "error_type": "crash"},
-            {"passed": True, "duration_seconds": 300.0},
-        ]
-        assert TunerTab._real_test_count(entries) == 2
-
-    def test_all_real_counted(self):
-        entries = [
-            {"passed": True, "duration_seconds": 60.0},
-            {"passed": False, "duration_seconds": 1.0},
-        ]
-        assert TunerTab._real_test_count(entries) == 2
-
-    def test_empty(self):
-        assert TunerTab._real_test_count([]) == 0
-
-    def test_only_synthetic_counts_zero(self):
-        assert TunerTab._real_test_count([{"passed": False, "duration_seconds": None}]) == 0

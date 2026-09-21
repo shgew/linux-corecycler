@@ -37,6 +37,8 @@ src/corecycler/
     scheduler.py       Per-core cycling, variable load, idle tests
     parallel.py        All-core simultaneous lanes (validation stages)
     execution.py       The one supervised loop: launch, poll, stall/thermal/MCE, verdicts
+    duty.py            Sub-millisecond load/idle cycling (SIGSTOP/SIGCONT metronome)
+    microfreeze.py     Scheduling-hitch telemetry and the pre-freeze breadcrumb (never a verdict)
     containment.py     systemd cgroup scopes (AllowedCPUs) and the kernel cpuset record
     detector.py        MCE and kernel-error detection from dmesg + the systemd journal
     backends/          Auto-registered stress backends (mprime, stress_ng, ycruncher, stressapptest)
@@ -55,8 +57,12 @@ src/corecycler/
   tuner/             Automated PBO Curve Optimizer tuner
     config.py          TunerConfig dataclass (search parameters with defaults)
     state.py           TunerPhase StrEnum, CoreState / TunerSession dataclasses
+    regime.py          The four confidence regimes, the offset masks, and the workload battery
+    bisect.py          Attribution hunt state machine: control, bisection, leave-one-out confirmation
+    report.py          The per-core answer with the banked evidence behind it
     persistence.py     Session CRUD, core-state upsert, test log, CO write-ahead journal
-    engine.py          TunerEngine: state machine, scheduling, crash recovery, staged validation (1-7)
+    engine.py          TunerEngine: state machine, scheduling, crash recovery, staged validation (1-7),
+                       endurance rounds, annealing, and hunt orchestration
   gui/               Qt tabs (config, results, monitor, smu, tuner, memory, history), core grid,
                      and the missing-tool prompt that records a backend's path
     style.py           Display standards: the desktop draws the widgets, this holds only the
@@ -70,6 +76,36 @@ tests/               Pytest suite (unit, property/Hypothesis fuzz, fault-injecti
 The backend registry (`engine/backends/__init__.py`) auto-discovers backends via the
 `@register_backend` decorator -- the GUI populates combo boxes and the factory from it,
 so no GUI file changes when a backend is added.
+
+## Tuner control flow
+
+Both entry points converge on one `TunerEngine`; the GUI adds widgets, not a second
+state machine. Per-core phases are specified in
+[docs/tuner-state-spec.md](tuner-state-spec.md), core selection in
+[docs/test-order-spec.md](test-order-spec.md), and the operator-facing view of both in
+[docs/usage.md](usage.md#flows).
+
+```text
+ corecycler tune|resume ─┐                    ┌─ per-core search  (status: running)
+                         ├─ TunerEngine ──────┼─ validation 1..7  (status: validating)
+ GUI Auto-Tuner tab ─────┘        │           ├─ endurance rounds (status: validating)
+                                  │           ├─ annealing probe  (status: running)
+                                  │           └─ attribution hunt (status: hunting)
+                                  │
+                    every slot ───┤ regime battery: boost -> current -> transient -> coupled
+                                  │ (any FAIL ends the slot; every regime must pass to advance)
+                                  │
+                                  └─ CoreScheduler / ParallelStress -> Supervisor
+                                       -> containment.contain -> backend subprocess
+```
+
+A slot is the unit of work: one core (or one lane set), one offset, one mask, one
+regime. Its `StressResult` is the only boundary from an external process back into
+the engine, and the engine never manufactures a verdict a slot did not earn.
+
+Crash recovery runs before anything else on resume: attribute from evidence, restore
+baselines, verify them through the SMU, then continue from the persisted cursor. An
+unattributed crash routes into `tuner/bisect.py` rather than pausing for a human.
 
 ## Development
 

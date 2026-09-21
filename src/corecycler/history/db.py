@@ -163,7 +163,7 @@ class TelemetrySample:
 class HistoryDB:
     """Crash-safe SQLite database for test run history."""
 
-    SCHEMA_VERSION = 18
+    SCHEMA_VERSION = 19
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
@@ -342,7 +342,8 @@ CREATE TABLE IF NOT EXISTS tuner_sessions (
     endurance_workload  INTEGER NOT NULL DEFAULT 0,
     endurance_index     INTEGER NOT NULL DEFAULT 0,
     boot_id             TEXT NOT NULL DEFAULT '',
-    app_version         TEXT NOT NULL DEFAULT ''
+    app_version         TEXT NOT NULL DEFAULT '',
+    hunt_state          TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS tuner_core_states (
@@ -364,7 +365,10 @@ CREATE TABLE IF NOT EXISTS tuner_core_states (
     crash_cooldown      INTEGER NOT NULL DEFAULT 0,
     thermal_aborts      INTEGER NOT NULL DEFAULT 0,
     cumulative_test_time REAL   NOT NULL DEFAULT 0.0,
-    hardening_tier_index INTEGER NOT NULL DEFAULT 0,
+    battery_index       INTEGER NOT NULL DEFAULT 0,
+    anneal_strikes      INTEGER NOT NULL DEFAULT 0,
+    anneal_bar_hours    REAL    NOT NULL DEFAULT 0.0,
+    suspicion           REAL    NOT NULL DEFAULT 0.0,
     updated_at          TEXT    NOT NULL,
     UNIQUE(session_id, core_id)
 );
@@ -386,7 +390,8 @@ CREATE TABLE IF NOT EXISTS tuner_test_log (
     tested_at           TEXT    NOT NULL,
     peak_stretch_pct    REAL,
     threads             INTEGER,
-    profile             TEXT
+    profile             TEXT,
+    regime              TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_tuner_log_session ON tuner_test_log(session_id, core_id);
 
@@ -408,6 +413,17 @@ CREATE TABLE IF NOT EXISTS tuner_co_journal (
     updated_at  TEXT    NOT NULL,
     UNIQUE(session_id, core_id)
 );
+
+CREATE TABLE IF NOT EXISTS tuner_regime_banks (
+    context_hash TEXT    NOT NULL,
+    core_id      INTEGER NOT NULL,
+    regime       TEXT    NOT NULL,
+    offset_value INTEGER NOT NULL,
+    clean_seconds REAL   NOT NULL DEFAULT 0.0,
+    updated_at   TEXT    NOT NULL,
+    UNIQUE(context_hash, core_id, regime, offset_value)
+);
+CREATE INDEX IF NOT EXISTS idx_regime_bank_core ON tuner_regime_banks(context_hash, core_id);
 """
     ).replace("__SCHEMA_VERSION__", str(SCHEMA_VERSION))
 
@@ -712,6 +728,80 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
     def _migrate_v18(conn: sqlite3.Connection) -> None:
         HistoryDB._add_columns(conn, "tuner_sessions", [("app_version", "TEXT NOT NULL DEFAULT ''")])
 
+    # v18 -> v19: the search contract changed. Hardening tiers are gone (the
+    # per-slot regime battery replaced them), a slot now carries a battery
+    # cursor, and confidence is banked per (context, core, regime) so it
+    # survives sessions instead of dying with one. Rebuild rather than ALTER:
+    # hardening_tier_index has to disappear, and a fresh database must be
+    # byte-identical to a migrated one.
+    @staticmethod
+    def _migrate_v19(conn: sqlite3.Connection) -> None:
+        HistoryDB._add_columns(conn, "tuner_sessions", [("hunt_state", "TEXT NOT NULL DEFAULT ''")])
+        HistoryDB._add_columns(conn, "tuner_test_log", [("regime", "TEXT")])
+        conn.executescript(HistoryDB._DDL_MIGRATE_V19)
+
+    _DDL_MIGRATE_V19 = """\
+BEGIN IMMEDIATE;
+CREATE TABLE tuner_core_states_v19 (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          INTEGER NOT NULL REFERENCES tuner_sessions(id) ON DELETE CASCADE,
+    core_id             INTEGER NOT NULL,
+    phase               TEXT    NOT NULL DEFAULT 'not_started',
+    current_offset      INTEGER NOT NULL DEFAULT 0,
+    best_offset         INTEGER,
+    coarse_fail_offset  INTEGER,
+    confirm_attempts    INTEGER NOT NULL DEFAULT 0,
+    baseline_offset     INTEGER NOT NULL DEFAULT 0,
+    backoff_mode        INTEGER NOT NULL DEFAULT 0,
+    consecutive_backoff_fails INTEGER NOT NULL DEFAULT 0,
+    backoff_fail_bound  INTEGER,
+    backoff_pass_bound  INTEGER,
+    in_test             INTEGER NOT NULL DEFAULT 0,
+    crash_count         INTEGER NOT NULL DEFAULT 0,
+    crash_cooldown      INTEGER NOT NULL DEFAULT 0,
+    thermal_aborts      INTEGER NOT NULL DEFAULT 0,
+    cumulative_test_time REAL   NOT NULL DEFAULT 0.0,
+    battery_index       INTEGER NOT NULL DEFAULT 0,
+    anneal_strikes      INTEGER NOT NULL DEFAULT 0,
+    anneal_bar_hours    REAL    NOT NULL DEFAULT 0.0,
+    suspicion           REAL    NOT NULL DEFAULT 0.0,
+    updated_at          TEXT    NOT NULL,
+    UNIQUE(session_id, core_id)
+);
+INSERT INTO tuner_core_states_v19 (
+    id, session_id, core_id, phase, current_offset, best_offset,
+    coarse_fail_offset, confirm_attempts, baseline_offset, backoff_mode,
+    consecutive_backoff_fails, backoff_fail_bound, backoff_pass_bound,
+    in_test, crash_count, crash_cooldown, thermal_aborts,
+    cumulative_test_time, updated_at
+)
+SELECT
+    id, session_id, core_id,
+    CASE phase WHEN 'hardening_t1' THEN 'confirmed'
+               WHEN 'hardening_t2' THEN 'confirmed'
+               WHEN 'hardened' THEN 'confirmed'
+               ELSE phase END,
+    current_offset, best_offset,
+    coarse_fail_offset, confirm_attempts, baseline_offset, backoff_mode,
+    consecutive_backoff_fails, backoff_fail_bound, backoff_pass_bound,
+    in_test, crash_count, crash_cooldown, thermal_aborts,
+    cumulative_test_time, updated_at
+FROM tuner_core_states;
+DROP TABLE tuner_core_states;
+ALTER TABLE tuner_core_states_v19 RENAME TO tuner_core_states;
+CREATE TABLE IF NOT EXISTS tuner_regime_banks (
+    context_hash TEXT    NOT NULL,
+    core_id      INTEGER NOT NULL,
+    regime       TEXT    NOT NULL,
+    offset_value INTEGER NOT NULL,
+    clean_seconds REAL   NOT NULL DEFAULT 0.0,
+    updated_at   TEXT    NOT NULL,
+    UNIQUE(context_hash, core_id, regime, offset_value)
+);
+CREATE INDEX IF NOT EXISTS idx_regime_bank_core ON tuner_regime_banks(context_hash, core_id);
+COMMIT;
+"""
+
     _MIGRATIONS: dict[int, str | callable] = {
         2: _migrate_v2,
         3: _DDL_MIGRATE_V3,
@@ -730,6 +820,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         16: _migrate_v16,
         17: _migrate_v17,
         18: _migrate_v18,
+        19: _migrate_v19,
     }
 
     # ------------------------------------------------------------------
@@ -1422,6 +1513,10 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         ).fetchall()
         return [dict(r) for r in rows]
 
+    def set_hunt_state(self, session_id: int, blob: str) -> None:
+        """Persist bisection progress before the probe that may end the process."""
+        self.__conn.execute("UPDATE tuner_sessions SET hunt_state=? WHERE id=?", (blob, session_id))
+
     def set_hunting_core(self, session_id: int, core_id: int | None) -> None:
         """Persist which core an isolated hunt slot is stressing BEFORE the
         slot starts: a hard crash mid-slot then names its proven culprit on
@@ -1477,7 +1572,8 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             "crash_count",
             "crash_cooldown",
             "thermal_aborts",
-            "hardening_tier_index",
+            "battery_index",
+            "anneal_strikes",
         ):
             v = getattr(cs, name)
             if v < 0:
@@ -1499,9 +1595,9 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                  backoff_mode, consecutive_backoff_fails,
                  backoff_fail_bound, backoff_pass_bound, in_test,
                  crash_count, crash_cooldown, thermal_aborts,
-                 cumulative_test_time,
-                 hardening_tier_index, updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 cumulative_test_time, battery_index, anneal_strikes,
+                 anneal_bar_hours, suspicion, updated_at)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(session_id, core_id) DO UPDATE SET
                 phase=excluded.phase,
                 current_offset=excluded.current_offset,
@@ -1518,7 +1614,10 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                 crash_cooldown=excluded.crash_cooldown,
                 thermal_aborts=excluded.thermal_aborts,
                 cumulative_test_time=excluded.cumulative_test_time,
-                hardening_tier_index=excluded.hardening_tier_index,
+                battery_index=excluded.battery_index,
+                anneal_strikes=excluded.anneal_strikes,
+                anneal_bar_hours=excluded.anneal_bar_hours,
+                suspicion=excluded.suspicion,
                 updated_at=excluded.updated_at
             """,
             (
@@ -1539,7 +1638,10 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                 cs.crash_cooldown,
                 cs.thermal_aborts,
                 cs.cumulative_test_time,
-                cs.hardening_tier_index,
+                cs.battery_index,
+                cs.anneal_strikes,
+                cs.anneal_bar_hours,
+                cs.suspicion,
                 now,
             ),
         )
@@ -1571,11 +1673,85 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                 crash_cooldown=r["crash_cooldown"] or 0,
                 thermal_aborts=r["thermal_aborts"],
                 cumulative_test_time=r["cumulative_test_time"] or 0.0,
-                hardening_tier_index=r["hardening_tier_index"] or 0,
+                battery_index=r["battery_index"] or 0,
+                anneal_strikes=r["anneal_strikes"] or 0,
+                anneal_bar_hours=r["anneal_bar_hours"] or 0.0,
+                suspicion=r["suspicion"] or 0.0,
             )
             self._check_core_state_sane(loaded)  # fail closed on a corrupted row
             result[loaded.core_id] = loaded
         return result
+
+    # ------------------------------------------------------------------
+    # Per-regime confidence banks
+    # ------------------------------------------------------------------
+
+    def bank_regime_time(
+        self, context_hash: str, core_id: int, regime: str, offset_value: int, seconds: float
+    ) -> None:
+        """Credit clean time to one (context, core, regime, offset) bucket.
+
+        Keyed on the context hash rather than the session so confidence
+        accumulates across reboots and sessions, and is invalidated the moment
+        the operating point it was earned under changes.
+        """
+        self.__conn.execute(
+            """\
+            INSERT INTO tuner_regime_banks
+                (context_hash, core_id, regime, offset_value, clean_seconds, updated_at)
+            VALUES (?,?,?,?,?,?)
+            ON CONFLICT(context_hash, core_id, regime, offset_value) DO UPDATE SET
+                clean_seconds = clean_seconds + excluded.clean_seconds,
+                updated_at = excluded.updated_at
+            """,
+            (context_hash, core_id, regime, offset_value, float(seconds), self._now_iso()),
+        )
+
+    def get_regime_banks(self, context_hash: str, core_id: int, offset_value: int) -> dict[str, float]:
+        rows = self.__conn.execute(
+            "SELECT regime, clean_seconds FROM tuner_regime_banks "
+            "WHERE context_hash=? AND core_id=? AND offset_value=?",
+            (context_hash, core_id, offset_value),
+        ).fetchall()
+        return {r["regime"]: r["clean_seconds"] for r in rows}
+
+    def clear_regime_banks(self, context_hash: str, core_id: int) -> None:
+        """Drop a core's banked confidence: its offset moved, so nothing it
+        earned at the old depth says anything about the new one."""
+        self.__conn.execute(
+            "DELETE FROM tuner_regime_banks WHERE context_hash=? AND core_id=?",
+            (context_hash, core_id),
+        )
+
+    def regime_bank_summary(self, context_hash: str) -> list[dict[str, object]]:
+        rows = self.__conn.execute(
+            "SELECT core_id, regime, offset_value, clean_seconds FROM tuner_regime_banks "
+            "WHERE context_hash=? ORDER BY core_id, regime",
+            (context_hash,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def regime_yield(self, context_hash: str) -> dict[str, tuple[int, float]]:
+        """(failures, seconds) per regime across every session in a context.
+
+        This is how the scheduler learns which regimes actually catch things
+        on this silicon. It is context-scoped for the same reason the banks
+        are: a different operating point is a different experiment.
+        """
+        rows = self.__conn.execute(
+            """\
+            SELECT l.regime AS regime,
+                   SUM(CASE WHEN l.passed = 0 THEN 1 ELSE 0 END) AS failures,
+                   COALESCE(SUM(l.duration_seconds), 0.0) AS seconds
+            FROM tuner_test_log l
+            JOIN tuner_sessions s ON s.id = l.session_id
+            JOIN tuning_contexts c ON c.id = s.context_id
+            WHERE c.co_hash = ? AND l.regime IS NOT NULL
+            GROUP BY l.regime
+            """,
+            (context_hash,),
+        ).fetchall()
+        return {r["regime"]: (int(r["failures"]), float(r["seconds"])) for r in rows}
 
     def insert_tuner_test_log(
         self,
@@ -1594,6 +1770,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         peak_stretch_pct: float | None = None,
         threads: int | None = None,
         profile: str | None = None,
+        regime: str | None = None,
     ) -> int:
         cur = self.__conn.execute(
             """\
@@ -1601,8 +1778,8 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                 (session_id, core_id, offset_tested, phase, passed,
                  error_message, error_type, duration_seconds, run_id,
                  backend, stress_mode, fft_preset, tested_at, peak_stretch_pct,
-                 threads, profile)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 threads, profile, regime)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 session_id,
@@ -1621,6 +1798,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                 peak_stretch_pct,
                 threads,
                 profile,
+                regime,
             ),
         )
         return cur.lastrowid
@@ -1646,10 +1824,9 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
         return {r["core_id"]: r["best_offset"] for r in rows}
 
     def get_tuner_best_profile(self, session_id: int) -> dict[int, int]:
-        # HARDENED is confirmed-plus-extra-stress, so it counts as confirmed here.
         rows = self.__conn.execute(
             "SELECT core_id, best_offset FROM tuner_core_states "
-            "WHERE session_id=? AND phase IN ('confirmed','hardened') "
+            "WHERE session_id=? AND phase='confirmed' "
             "AND best_offset IS NOT NULL",
             (session_id,),
         ).fetchall()
@@ -1692,6 +1869,7 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
             endurance_index=row["endurance_index"] or 0,
             boot_id=row["boot_id"],
             app_version=row["app_version"],
+            hunt_state=row["hunt_state"],
         )
 
     def _execute_raw(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
@@ -1755,7 +1933,10 @@ CREATE INDEX IF NOT EXISTS idx_tuner_events_session ON tuner_events(session_id);
                 "crash_cooldown",
                 "thermal_aborts",
                 "cumulative_test_time",
-                "hardening_tier_index",
+                "battery_index",
+                "anneal_strikes",
+                "anneal_bar_hours",
+                "suspicion",
                 "updated_at",
             ),
             {"session_id": "tuner_sessions"},

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sys as _sys
 from functools import partial
 from pathlib import Path
@@ -106,7 +107,9 @@ class TestArgHandling:
     def test_help_never_starts_tuning(self, args, monkeypatch, capsys):
         monkeypatch.setattr(cli, "cmd_run", lambda **kw: pytest.fail("help started tuning"))
         assert cli.cli_main(args) == cli.EXIT_COMPLETED
-        assert "corecycler tune" in capsys.readouterr().out
+        out = capsys.readouterr().out
+        assert "corecycler tune" in out
+        assert "corecycler report" in out
 
     @pytest.mark.parametrize(
         "args",
@@ -157,7 +160,7 @@ class TestStatus:
             sid,
             CoreState(
                 core_id=0,
-                phase=TunerPhase.HARDENED,
+                phase=TunerPhase.CONFIRMED,
                 current_offset=-10,
                 best_offset=-10,
                 baseline_offset=0,
@@ -187,7 +190,7 @@ class TestStatus:
             sid,
             CoreState(
                 core_id=0,
-                phase=TunerPhase.HARDENED,
+                phase=TunerPhase.CONFIRMED,
                 current_offset=-40,
                 best_offset=-40,
                 baseline_offset=0,
@@ -211,7 +214,7 @@ class TestStatus:
 
         assert cli.cmd_status(db=db) == cli.EXIT_COMPLETED
         out = capsys.readouterr().out
-        assert "endurance round 0, workload 1/5, slot 1" in out
+        assert "endurance round 0, workload 1/7, slot 1" in out
         assert "core 0 @ -40: 0.3h live evidence (mprime AVX2 SMALL 2T 0.3h)" in out
 
     def test_an_unreadable_config_still_lists_sessions(self, db, capsys):
@@ -223,6 +226,57 @@ class TestStatus:
         assert f"#{sid}" in out
         assert "config unreadable" in out
 
+class TestReport:
+    def test_empty_db(self, db, capsys):
+        assert cli.cmd_report(db=db) == cli.EXIT_COMPLETED
+        assert capsys.readouterr().out == "no tuner sessions\n"
+
+    def test_unknown_session_id_is_refused(self, db, capsys):
+        assert cli.cmd_report(session_id=999, db=db) == cli.EXIT_REFUSED
+        assert "no tuner session 999" in capsys.readouterr().err
+
+    def test_bad_argument_shape_is_refused(self, capsys):
+        assert cli._dispatch_report(["1", "2"]) == cli.EXIT_REFUSED
+        assert "expected [SESSION_ID] [--json]" in capsys.readouterr().err
+    def test_non_integer_session_id_is_refused_by_the_cli(self, capsys):
+        assert cli.cli_main(["report", "latest"]) == cli.EXIT_REFUSED
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "corecycler report: invalid session id 'latest'\n"
+
+    def test_cli_opens_history_and_reports_the_latest_session(self, tmp_path, monkeypatch, capsys):
+        from corecycler.history import db as history_db
+
+        path = tmp_path / "report.sqlite"
+        seeded = HistoryDB(path)
+        tp.create_session(seeded, TunerConfig(), "Old BIOS", "Old CPU")
+        latest = tp.create_session(seeded, TunerConfig(), "New BIOS", "New CPU")
+        seeded.close()
+        monkeypatch.setattr(history_db, "HistoryDB", lambda: HistoryDB(path))
+
+        assert cli.cli_main(["report"]) == cli.EXIT_COMPLETED
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert captured.out.startswith(f"session #{latest}  running  New CPU\n")
+
+    def test_json_reports_per_core_offsets(self, db, monkeypatch, capsys):
+        sid = tp.create_session(db, TunerConfig(cores_to_test=[0, 1]), "Test BIOS", "Test CPU")
+        tp.save_core_state(
+            db,
+            sid,
+            CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30),
+        )
+        tp.save_core_state(
+            db,
+            sid,
+            CoreState(core_id=1, phase=TunerPhase.CONFIRMED, current_offset=-22, best_offset=-22),
+        )
+        monkeypatch.setattr(cli, "cmd_report", partial(cli.cmd_report, db=db))
+
+        assert cli.cli_main(["report", str(sid), "--json"]) == cli.EXIT_COMPLETED
+        report = json.loads(capsys.readouterr().out)
+        assert report["session"] == sid
+        assert [(core["core"], core["offset"]) for core in report["cores"]] == [(0, -30), (1, -22)]
 
 class TestRunOutcomes:
     def _run(self, db, behavior, **kw):

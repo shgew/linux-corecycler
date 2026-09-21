@@ -582,7 +582,7 @@ class TestTunerSessionDetail:
         tp.save_core_state(
             db,
             sid,
-            CoreState(core_id=0, phase=TunerPhase.HARDENED, current_offset=-30, best_offset=-30),
+            CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-30, best_offset=-30),
         )
         tp.save_core_state(
             db,

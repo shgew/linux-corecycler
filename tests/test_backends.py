@@ -19,7 +19,7 @@ from corecycler.engine.backends.base import (
 )
 from corecycler.engine.backends.mprime import FFT_RANGES, MODE_TO_CPU_FLAGS, MprimeBackend
 from corecycler.engine.backends.stress_ng import StressNgBackend, _mode_to_method
-from corecycler.engine.backends.ycruncher import MODE_TO_ALGORITHMS, YCruncherBackend
+from corecycler.engine.backends.ycruncher import MODE_TO_ALGORITHMS, VALID_COMPONENT_TESTS, YCruncherBackend
 
 # ===========================================================================
 # Base class tests
@@ -644,7 +644,7 @@ class TestYCruncherBackend:
             "BKT",
         ]
 
-    def test_get_command_avx2_enables_all_algorithms(self, tmp_path):
+    def test_get_command_avx2_uses_curve_optimizer_algorithms(self, tmp_path):
         backend = YCruncherBackend()
         backend._binary = "/bin/y-cruncher"
         cmd = backend.get_command(StressConfig(mode=StressMode.AVX2), tmp_path)
@@ -656,7 +656,33 @@ class TestYCruncherBackend:
             "stress",
             "-M:1024M",
             "-D:30",
+            "BKT",
+            "FFTv4",
+            "N63",
+            "VT3",
         ]
+
+    def test_get_command_uses_explicit_component_tests(self, tmp_path: Path) -> None:
+        backend = YCruncherBackend()
+        backend._binary = "/bin/y-cruncher"
+        cmd = backend.get_command(StressConfig(mode=StressMode.AVX2, tests=("BKT", "VT3")), tmp_path)
+        assert cmd[-2:] == ["BKT", "VT3"]
+
+    def test_get_command_rejects_unknown_component_tests(self, tmp_path: Path) -> None:
+        backend = YCruncherBackend()
+        backend._binary = "/bin/y-cruncher"
+        with pytest.raises(ValueError) as exc_info:
+            backend.get_command(StressConfig(tests=("UNKNOWN", "BKT", "BAD")), tmp_path)
+        assert str(exc_info.value) == "Unknown y-cruncher component test(s): BAD, UNKNOWN"
+
+    @pytest.mark.parametrize(("test_seconds", "duration_arg"), [(45, "-D:45"), (0, "-D:1")])
+    def test_get_command_uses_clamped_test_duration(
+        self, tmp_path: Path, test_seconds: int, duration_arg: str
+    ) -> None:
+        backend = YCruncherBackend()
+        backend._binary = "/bin/y-cruncher"
+        cmd = backend.get_command(StressConfig(test_seconds=test_seconds), tmp_path)
+        assert duration_arg in cmd
 
     def test_get_command_is_headless_never_blocks(self, tmp_path):
         backend = YCruncherBackend()
@@ -761,13 +787,15 @@ class TestYCruncherModeMapping:
     def test_sse_is_scalar_only(self):
         assert MODE_TO_ALGORITHMS[StressMode.SSE] == ("BKT",)
 
-    def test_avx2_enables_all_by_default(self):
-        assert MODE_TO_ALGORITHMS[StressMode.AVX2] == ()
+    def test_avx2_uses_curve_optimizer_algorithms_by_default(self):
+        assert MODE_TO_ALGORITHMS[StressMode.AVX2] == ("BKT", "FFTv4", "N63", "VT3")
+
+    def test_avx512_uses_curve_optimizer_algorithms_by_default(self):
+        assert MODE_TO_ALGORITHMS[StressMode.AVX512] == ("BKT", "FFTv4", "N63", "VT3")
 
     def test_algorithms_are_valid_ycruncher_names(self):
-        valid = {"BKT", "BBP", "SFTv4", "SNT", "SVT", "FFTv4", "NTT63", "N63", "VSTv3", "VT3"}
         for algos in MODE_TO_ALGORITHMS.values():
-            assert set(algos) <= valid
+            assert set(algos) <= VALID_COMPONENT_TESTS
 
 
 # ===========================================================================

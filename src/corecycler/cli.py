@@ -45,6 +45,8 @@ corecycler headless commands:
   corecycler --version            print the installed build and exit
   corecycler doctor               report every external tool and where it resolved
   corecycler status               list tuner sessions; newest one with per-core offsets and live-evidence hours
+  corecycler report [SESSION_ID] [--json]
+                                  per-core offsets with the banked evidence behind each
   corecycler tune [--config F]    start a NEW tuning session and run to the end
   corecycler resume [SESSION_ID [--config F]]
                                   resume a session (newest if omitted); --config replaces its
@@ -64,7 +66,9 @@ def cli_main(argv: list[str]) -> int:
         print(f"corecycler {__version__}")
         return EXIT_COMPLETED
     if argv in (["--help"], ["-h"]) or (
-        len(argv) == 2 and argv[0] in ("doctor", "status", "tune", "resume") and argv[1] in ("--help", "-h")
+        len(argv) == 2
+        and argv[0] in ("doctor", "status", "report", "tune", "resume")
+        and argv[1] in ("--help", "-h")
     ):
         print(USAGE)
         return EXIT_COMPLETED
@@ -76,6 +80,8 @@ def cli_main(argv: list[str]) -> int:
     if command in ("doctor", "status") and args:
         print(f"corecycler {command}: unexpected arguments", file=sys.stderr)
         return EXIT_REFUSED
+    if command == "report":
+        return _dispatch_report(args)
     if command == "doctor":
         return cmd_doctor()
     if command == "status":
@@ -137,6 +143,49 @@ def cmd_doctor() -> int:
     return EXIT_REFUSED if unmet else EXIT_COMPLETED
 
 
+def _dispatch_report(args: list[str]) -> int:
+    """Parse ``report [SESSION_ID] [--json]``; an unreadable shape refuses."""
+    as_json = "--json" in args
+    rest = [a for a in args if a != "--json"]
+    if len(rest) > 1 or (rest and rest[0].startswith("-")):
+        print("corecycler report: expected [SESSION_ID] [--json]", file=sys.stderr)
+        return EXIT_REFUSED
+    session_id = None
+    if rest:
+        try:
+            session_id = int(rest[0])
+        except ValueError:
+            print(f"corecycler report: invalid session id {rest[0]!r}", file=sys.stderr)
+            return EXIT_REFUSED
+    return cmd_report(session_id=session_id, as_json=as_json)
+
+
+def cmd_report(session_id: int | None = None, as_json: bool = False, db=None) -> int:
+    from corecycler.history.db import HistoryDB
+    from corecycler.tuner import report as tuner_report
+
+    own_db = db is None
+    if db is None:
+        db = HistoryDB()
+    try:
+        if session_id is None:
+            sessions = db.list_tuner_sessions(limit=1)
+            if not sessions:
+                print("no tuner sessions")
+                return EXIT_COMPLETED
+            session_id = sessions[0].id
+        try:
+            data = tuner_report.build(db, session_id)
+        except ValueError as e:
+            print(f"corecycler report: {e}", file=sys.stderr)
+            return EXIT_REFUSED
+        print(tuner_report.to_json(data) if as_json else "\n".join(tuner_report.render(data)))
+        return EXIT_COMPLETED
+    finally:
+        if own_db:
+            db.close()
+
+
 def cmd_status(db=None) -> int:
     from corecycler.history.db import HistoryDB
     from corecycler.tuner import persistence as tp
@@ -155,7 +204,7 @@ def cmd_status(db=None) -> int:
             states = tp.load_core_states(db, sess.id)
             if index == 0:
                 latest_states = states
-            done = sum(1 for cs in states.values() if cs.phase in ("confirmed", "hardened"))
+            done = sum(1 for cs in states.values() if cs.phase == "confirmed")
             print(
                 f"#{sess.id}  {sess.status:<12} {done}/{len(states)} cores done  "
                 f"created {sess.created_at[:19]} by {sess.app_version or 'unknown'}  {sess.cpu_model or ''}"

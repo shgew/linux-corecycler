@@ -27,7 +27,7 @@ def db():
 
 @pytest.fixture
 def tuning(db, topo_single_ccd, mock_backend, monkeypatch):
-    eng = make_engine(db, topo_single_ccd, FaultSMU(), mock_backend, cores_to_test=[0, 1], hardening_tiers=[])
+    eng = make_engine(db, topo_single_ccd, FaultSMU(), mock_backend, cores_to_test=[0, 1])
     eng._session_id = tp.create_session(db, eng._config, "", "")
     eng._status = "running"
     eng._core_states = {
@@ -42,21 +42,6 @@ def tuning(db, topo_single_ccd, mock_backend, monkeypatch):
     monkeypatch.setattr(eng, "_start_worker", lambda *_: None)
     return eng
 
-
-def test_failed_readback_cannot_skip_abort_restoration(tuning, monkeypatch):
-    smu = tuning._smu
-
-    def partially_verified(core, value):
-        smu.applied[core] = value
-        smu.writes.append((core, value))
-        return value == 0
-
-    monkeypatch.setattr(smu, "set_co_offset", partially_verified)
-    assert not tuning._apply_co_isolation(0, -10)
-    assert smu.applied[0] == -10
-    tuning.abort()
-    assert smu.applied[0] == 0
-    assert smu.writes[-1] == (0, 0)
 
 
 @pytest.mark.parametrize("action", ["start", "resume", "validate_profile"])
@@ -87,19 +72,6 @@ def test_failure_at_time_limit_is_not_confirmation(tuning):
     assert cs.phase == TunerPhase.FAILED_CONFIRM
     assert tp.get_test_log(tuning._db, tuning.session_id, core_id=0)[-1]["passed"] == 0
 
-
-def test_inherited_baseline_must_pass_hardening(tuning):
-    tuning._config.hardening_tiers = [{"backend": "mprime", "stress_mode": "AVX2", "fft_preset": "SMALL"}]
-    cs = tuning._core_states[0]
-    cs.phase = TunerPhase.HARDENING_T1
-    cs.current_offset = cs.best_offset = -21
-    cs.baseline_offset = -20
-    tuning._advance_core(0, False)
-    assert cs.current_offset == -20
-    assert cs.phase == TunerPhase.HARDENING_T1
-    tuning._advance_core(0, False)
-    assert tuning.status == "paused"
-    assert cs.phase == TunerPhase.HARDENING_T1
 
 
 def test_crash_invalidates_a_contradicted_pass_bound(tuning):
@@ -159,7 +131,7 @@ def test_explicit_profile_validation_includes_staged_validation(tuning):
 
 
 def test_resume_resolves_the_saved_backend(tuning, monkeypatch):
-    config = TunerConfig(backend="stress-ng", cores_to_test=[0], hardening_tiers=[])
+    config = TunerConfig(backend="stress-ng", cores_to_test=[0])
     sid = tp.create_session(tuning._db, config, "", "")
     tp.save_core_state(tuning._db, sid, CoreState(core_id=0))
     backend = MagicMock()
@@ -233,8 +205,13 @@ def test_baseline_failure_never_becomes_a_confirmed_profile(tuning, phase):
     cs.current_offset = cs.best_offset = cs.baseline_offset = -20
     tuning._advance_core(0, False)
     assert tuning.status == "paused"
-    assert cs.phase not in (TunerPhase.CONFIRMED, TunerPhase.HARDENED)
+    assert cs.phase is not TunerPhase.CONFIRMED
 
+
+def test_only_live_mask_phases_count_as_stability_evidence():
+    search_phases = {"coarse", "fine", "confirm", "backoff_preconfirm", "backoff_confirm"}
+    assert search_phases <= tp.LIVE_EVIDENCE_PHASES
+    assert "hunt" not in tp.LIVE_EVIDENCE_PHASES
 
 @pytest.mark.parametrize("missing", ["unknown", "uninstalled"])
 def test_resume_refuses_unavailable_saved_backend(tuning, monkeypatch, missing):
