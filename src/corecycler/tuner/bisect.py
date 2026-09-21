@@ -319,10 +319,10 @@ def _validate_state(state: HuntState) -> None:
             raise _invalid("split sets must be subsets of their parent")
         if in_flight and not set(in_flight) <= parent_cores:
             raise _invalid("in-flight set must be a subset of its parent")
-        if not _disjoint(pending + queue + guilty):
-            raise _invalid("pending and active split sets must be disjoint")
         if queue and guilty and not _disjoint(queue + guilty):
             raise _invalid("queued and guilty halves must be disjoint")
+        if not _disjoint(pending + queue + guilty):
+            raise _invalid("pending and active split sets must be disjoint")
         if len(queue) == 2 and (in_flight or guilty or set(queue[0] + queue[1]) != parent_cores):
             raise _invalid("a fully requeued split must partition its parent")
         if queue and in_flight and (not _disjoint(queue + [in_flight]) or set(queue[0] + in_flight) != parent_cores):

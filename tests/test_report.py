@@ -230,6 +230,25 @@ def test_report_exposes_banked_confidence_failures_and_session_counters(db):
     }
 
 
+def test_accepted_offsets_are_recommended_for_bios_application(db):
+    session_id = tp.create_session(db, TunerConfig(cores_to_test=[0]), "Test BIOS", "Test CPU")
+    tp.save_core_state(
+        db,
+        session_id,
+        CoreState(
+            core_id=0,
+            phase=TunerPhase.CONFIRMED,
+            current_offset=-30,
+            best_offset=-30,
+        ),
+    )
+    tp.update_session_status(db, session_id, "completed")
+
+    assert "Accepted offsets are volatile SMU overlays; enter them in BIOS to keep them across a reboot." in render(
+        build(db, session_id)
+    )
+
+
 def test_unproven_candidate_is_not_recommended_for_bios_application(db):
     report = build(db, _seed_evidence_report(db))
 

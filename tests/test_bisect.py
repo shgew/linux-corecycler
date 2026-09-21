@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import pytest
 
@@ -198,58 +199,191 @@ class TestPersistence:
     def test_empty_state_is_absent(self):
         assert HuntState.from_json("") is None
 
-    @pytest.mark.parametrize("blob", [" ", "not json", "{}", '{"stage":"nonsense"}', "[]"])
+    def test_state_must_be_a_string(self):
+        with pytest.raises(InvalidHuntState, match="state must be a string"):
+            HuntState.from_json(None)
+
+    @pytest.mark.parametrize("blob", [" ", "not json", "{", '{"stage":"nonsense"}', "[]"])
     def test_nonempty_unusable_state_is_explicitly_invalid(self, blob):
         with pytest.raises(InvalidHuntState):
             HuntState.from_json(blob)
 
     @pytest.mark.parametrize(
-        ("field", "value"),
+        ("changes", "message"),
         [
-            ("version", 2),
-            ("stage", "nonsense"),
-            ("control_fails", True),
-            ("control_fails", -1),
-            ("control_fails", 2**31),
-            ("level", float("nan")),
-            ("no_reproduce", float("inf")),
-            ("loaded", [True]),
-            ("loaded", [-1]),
-            ("loaded", [0, 0]),
-            ("loaded", [1, 0]),
-            ("pending", [[]]),
-            ("pending", [[0, 0]]),
-            ("pending", [[0], [0]]),
-            ("queue", [[0]]),
-            ("armed", 1),
-            ("vector", {"0": True}),
-            ("workload", []),
+            ({"version": 2}, "unsupported version"),
+            ({"level": float("nan")}, "non-finite number NaN"),
+            ({"control_fails": True}, "control_fails must be an integer from 0"),
+            ({"control_fails": -1}, "control_fails must be an integer from 0"),
+            ({"control_fails": 2**31}, "control_fails must be an integer from 0"),
+            ({"no_reproduce": float("inf")}, "non-finite number Infinity"),
+            ({"pending": {}}, "pending must be a list"),
+            ({"in_flight": {}}, "in_flight must be a list"),
+            ({"pending": [0]}, "pending[0] must be a list"),
+            ({"pending": [[]]}, "pending[0] must not be empty"),
+            ({"pending": [[1, 0]]}, "pending[0] must be a sorted set of core IDs"),
+            ({"pending": [[0, 0]]}, "pending[0] must be a sorted set of core IDs"),
+            ({"pending": [[0], [0]]}, "pending must not contain duplicate sets"),
+            ({"loaded": [-1]}, "loaded core must be an integer from 0"),
+            ({"loaded": [True]}, "loaded core must be an integer from 0"),
+            ({"loaded": [0, 0]}, "loaded must be a sorted set of core IDs"),
+            ({"loaded": [1, 0]}, "loaded must be a sorted set of core IDs"),
+            ({"vector": []}, "vector must be an object"),
+            ({"vector": {"core": -1}}, "vector contains a non-integer core ID"),
+            ({"vector": {"00": -1}}, "vector contains an invalid core ID"),
+            ({"vector": {str(2**31): -1}}, "vector contains an invalid core ID"),
+            ({"vector": {"0": 2**31}}, "vector offsets must be bounded integers"),
+            ({"vector": {"0": True}}, "vector offsets must be bounded integers"),
+            ({"armed": 1}, "armed must be a boolean"),
+            ({"armed": True}, "an armed probe requires its exact vector"),
+            ({"workload": []}, "workload[0] must be a dict"),
+            ({"pending": [[0, 1], [1, 2]]}, "pending sets must be disjoint"),
+            ({"queue": [[0, 1], [1, 2]]}, "queued sets must be disjoint"),
+            ({"guilty_halves": [[0, 1], [1, 2]]}, "guilty sets must be disjoint"),
+            ({"found": [0], "exonerated": [0]}, "found and exonerated sets must be disjoint"),
+            ({"level": 1}, "control stage has impossible search progress"),
         ],
     )
-    def test_decoded_types_bounds_and_sets_are_validated(self, field, value):
-        raw = json.loads(bisect.begin([0, 1], [0]).to_json())
-        raw[field] = value
-        with pytest.raises(InvalidHuntState):
+    def test_corrupt_fields_are_rejected_with_the_reason(self, changes, message):
+        raw = json.loads(bisect.begin([0, 1], [0, 1]).to_json())
+        raw.update(changes)
+
+        with pytest.raises(InvalidHuntState, match=re.escape(message)):
+            HuntState.from_json(json.dumps(raw))
+
+    @pytest.mark.parametrize(
+        ("changes", "message"),
+        [
+            ({"found": [3]}, "probe stage cannot already have a culprit"),
+            (
+                {"pending": [], "queue": [[0], [1], [2]], "parent": [0, 1, 2], "level": 1},
+                "probe stage has too many split sets",
+            ),
+            (
+                {"pending": [], "queue": [[0], [1]], "parent": [0, 1], "level": 0},
+                "probe parent and level are inconsistent",
+            ),
+            ({"pending": [], "queue": [[0]]}, "probe progress requires a parent set"),
+            (
+                {"pending": [], "queue": [[2]], "parent": [0, 1], "level": 1},
+                "split sets must be subsets of their parent",
+            ),
+            (
+                {"pending": [], "in_flight": [2], "parent": [0, 1], "level": 1},
+                "in-flight set must be a subset of its parent",
+            ),
+            (
+                {"pending": [[0]], "queue": [[0], [1]], "parent": [0, 1], "level": 1},
+                "pending and active split sets must be disjoint",
+            ),
+            (
+                {"pending": [], "queue": [[0]], "guilty_halves": [[0]], "parent": [0, 1], "level": 1},
+                "queued and guilty halves must be disjoint",
+            ),
+            (
+                {"pending": [], "queue": [[0], [1]], "parent": [0, 1, 2], "level": 1},
+                "a fully requeued split must partition its parent",
+            ),
+            (
+                {"pending": [], "queue": [[0]], "in_flight": [2], "parent": [0, 1, 2], "level": 1},
+                "queued and in-flight halves must partition their parent",
+            ),
+            ({"pending": []}, "probe stage has no remaining work"),
+        ],
+    )
+    def test_impossible_probe_progress_is_rejected(self, changes, message):
+        raw = json.loads(bisect.begin([0, 1], [0, 1]).to_json())
+        raw.update(stage="probe")
+        raw.update(changes)
+
+        with pytest.raises(InvalidHuntState, match=re.escape(message)):
+            HuntState.from_json(json.dumps(raw))
+
+    @pytest.mark.parametrize(
+        ("changes", "message"),
+        [
+            ({"in_flight": []}, "confirm stage requires exactly one in-flight suspect"),
+            ({"pending": [[0]]}, "confirm suspect cannot also be pending"),
+            ({"parent": [1]}, "confirm suspect must belong to its parent"),
+        ],
+    )
+    def test_impossible_confirm_progress_is_rejected(self, changes, message):
+        raw = json.loads(bisect.begin([0, 1], [0, 1]).to_json())
+        raw.update(stage="confirm", pending=[], in_flight=[0])
+        raw.update(changes)
+
+        with pytest.raises(InvalidHuntState, match=re.escape(message)):
+            HuntState.from_json(json.dumps(raw))
+
+    @pytest.mark.parametrize(
+        ("changes", "message"),
+        [
+            (
+                {"stage": "culprit", "pending": [], "in_flight": [0]},
+                "culprit stage requires the confirmed in-flight suspect",
+            ),
+            ({"stage": "platform", "control_fails": 0}, "platform stage must be a completed stock control"),
+            (
+                {"stage": "exhausted", "pending": [], "no_reproduce": 0},
+                "exhausted stage has unresolved work or a verdict",
+            ),
+        ],
+    )
+    def test_impossible_terminal_progress_is_rejected(self, changes, message):
+        raw = json.loads(bisect.begin([0, 1], [0, 1]).to_json())
+        raw.update(changes)
+
+        with pytest.raises(InvalidHuntState, match=re.escape(message)):
             HuntState.from_json(json.dumps(raw))
 
     @pytest.mark.parametrize(
         "changes",
         [
-            {"stage": "confirm", "pending": [], "in_flight": []},
-            {"stage": "confirm", "pending": [], "in_flight": [0, 1]},
-            {"stage": "confirm", "pending": [], "in_flight": [0], "queue": [[1]]},
-            {"stage": "probe", "pending": [], "queue": [[0]], "parent": []},
-            {"stage": "probe", "pending": [], "queue": [[0], [0]], "parent": [0, 1], "level": 1},
-            {"stage": "culprit", "pending": [], "found": []},
-            {"stage": "exhausted", "pending": [[0, 1]]},
-            {"armed": True},
+            {"stage": "platform", "control_fails": 1},
+            {"stage": "exhausted", "pending": [], "no_reproduce": 1},
         ],
     )
-    def test_stage_invariants_are_validated(self, changes):
-        raw = json.loads(bisect.begin([0, 1], [0]).to_json())
+    def test_terminal_state_survives_a_round_trip(self, changes):
+        raw = json.loads(bisect.begin([0, 1], [0, 1]).to_json())
         raw.update(changes)
-        with pytest.raises(InvalidHuntState):
-            HuntState.from_json(json.dumps(raw))
+
+        restored = HuntState.from_json(json.dumps(raw))
+
+        assert restored is not None
+        assert restored.stage == Stage(changes["stage"])
+
+    @pytest.mark.parametrize(
+        ("changes", "message"),
+        [
+            ({"armed": 1}, "armed must be a boolean"),
+            ({"vector": {2**31: -1}}, "vector must map bounded integer core IDs"),
+            ({"workload": []}, "workload[0] must be a dict"),
+        ],
+    )
+    def test_in_memory_corruption_cannot_be_serialised(self, changes, message):
+        state = bisect.begin([0, 1], [0, 1])
+        for field, value in changes.items():
+            setattr(state, field, value)
+
+        with pytest.raises(InvalidHuntState, match=re.escape(message)):
+            state.to_json()
+
+    def test_non_string_vector_keys_are_rejected(self):
+        with pytest.raises(InvalidHuntState, match="vector core IDs must be strings"):
+            bisect._vector({0: -1})
+
+    def test_unknown_in_memory_stage_is_rejected(self):
+        state = bisect.begin([0], [0])
+        state.stage = "unknown"
+
+        with pytest.raises(InvalidHuntState, match="unknown stage"):
+            state.to_json()
+
+    def test_probe_without_pending_work_exhausts(self):
+        state = HuntState(stage=Stage.PROBE, loaded=[0])
+
+        assert bisect.next_live_set(state) is None
+        assert state.stage is Stage.EXHAUSTED
 
     def test_fresh_process_resume_matches_uninterrupted_search(self):
         uninterrupted, _ = run_hunt(list(range(8)), {6})

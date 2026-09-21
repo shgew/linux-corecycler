@@ -331,6 +331,48 @@ class TestReport:
         assert captured.out == ""
         assert captured.err == "corecycler report: cannot read tuner history: boom\n"
 
+    def test_first_history_failure_is_reported_when_close_also_fails(self, monkeypatch, capsys):
+        from corecycler.history import db as history_db
+
+        closed = []
+
+        class BrokenHistory:
+            def list_tuner_sessions(self, *, limit):
+                raise RuntimeError("read failed")
+
+            def close(self):
+                closed.append(True)
+                raise RuntimeError("close failed")
+
+        monkeypatch.setattr(history_db, "HistoryDB", BrokenHistory)
+
+        assert cli.cmd_report() == cli.EXIT_REFUSED
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "corecycler report: cannot read tuner history: read failed\n"
+        assert closed == [True]
+
+    def test_close_failure_is_reported_when_report_succeeds(self, monkeypatch, capsys):
+        from corecycler.history import db as history_db
+
+        closed = []
+
+        class BrokenHistory:
+            def list_tuner_sessions(self, *, limit):
+                return []
+
+            def close(self):
+                closed.append(True)
+                raise RuntimeError("close failed")
+
+        monkeypatch.setattr(history_db, "HistoryDB", BrokenHistory)
+
+        assert cli.cmd_report() == cli.EXIT_REFUSED
+        captured = capsys.readouterr()
+        assert captured.out == ""
+        assert captured.err == "corecycler report: cannot read tuner history: close failed\n"
+        assert closed == [True]
+
     def test_json_reports_per_core_offsets(self, db, monkeypatch, capsys):
         sid = tp.create_session(db, TunerConfig(cores_to_test=[0, 1]), "Test BIOS", "Test CPU")
         tp.save_core_state(

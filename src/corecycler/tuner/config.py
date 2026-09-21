@@ -205,6 +205,8 @@ class TunerConfig:
     def validate(self) -> list[str]:
         """Return list of validation errors, empty if config is valid."""
         defaults = type(self)()
+        if not isinstance(self.coarse_regimes, list):
+            return ["coarse_regimes must be a list of regime names"]
         errors = [
             f"{field.name} has an invalid type or non-finite value"
             for field in dataclasses.fields(self)
@@ -259,9 +261,7 @@ class TunerConfig:
             if missing:
                 errors.append(f"battery does not cover regimes: {', '.join(missing)}")
             valid_regimes = {str(r) for r in regime.Regime}
-            if not isinstance(self.coarse_regimes, list):
-                errors.append("coarse_regimes must be a list of regime names")
-            elif not self.coarse_regimes:
+            if not self.coarse_regimes:
                 errors.append("coarse_regimes must name at least one regime")
             else:
                 invalid_coarse = [

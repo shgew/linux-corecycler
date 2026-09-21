@@ -733,6 +733,42 @@ COMMIT;
         assert dst.journal_survived_values(sess.id) == {3: -30}
         dst.close()
 
+    def test_merge_skips_orphaned_regime_bank_between_valid_rows(self, tmp_path):
+        import sqlite3
+
+        src_path = tmp_path / "src-orphan.db"
+        src = HistoryDB(src_path)
+        first = src.create_context(TuningContextRecord(bios_version="A", co_hash="first"))
+        orphan = src.create_context(TuningContextRecord(bios_version="B", co_hash="orphan"))
+        last = src.create_context(TuningContextRecord(bios_version="C", co_hash="last"))
+        src.bank_regime_time(first, 0, "boost", -20, 10.0)
+        src.bank_regime_time(last, 2, "boost", -30, 30.0)
+        src._execute_raw("DELETE FROM tuning_contexts WHERE id=?", (orphan,))
+        src.close()
+
+        conn = sqlite3.connect(src_path)
+        conn.execute(
+            "INSERT INTO tuner_regime_banks "
+            "(context_id, core_id, regime, offset_value, clean_seconds, updated_at) "
+            "VALUES (?, 1, 'boost', -25, 20.0, 'now')",
+            (orphan,),
+        )
+        conn.commit()
+        conn.close()
+
+        dst = HistoryDB(tmp_path / "dst-orphan.db")
+        dst_first = dst.create_context(TuningContextRecord(bios_version="A", co_hash="first"))
+        dst_last = dst.create_context(TuningContextRecord(bios_version="C", co_hash="last"))
+        try:
+            dst.merge_from(src_path)
+
+            assert dst.get_regime_banks(dst_first, 0, -20) == {"boost": 10.0}
+            assert dst.get_regime_banks(dst_last, 2, -30) == {"boost": 30.0}
+            rows = dst._execute_raw("SELECT core_id FROM tuner_regime_banks ORDER BY core_id").fetchall()
+            assert [row["core_id"] for row in rows] == [0, 2]
+        finally:
+            dst.close()
+
     def test_merge_migrates_old_schema_source_first(self, tmp_path):
         import sqlite3
 
@@ -812,6 +848,59 @@ COMMIT;
         assert reopened.regime_bank_summary(ctx_a) == []
         assert reopened.regime_bank_summary(ctx_b) == []
         reopened.close()
+
+    def test_v20_rejects_context_identity_without_foreign_key(self, tmp_path):
+        import sqlite3
+
+        path = tmp_path / "unsafe-identity.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """\
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+INSERT INTO schema_version VALUES (19);
+CREATE TABLE tuner_regime_banks (
+    context_id INTEGER NOT NULL,
+    core_id INTEGER NOT NULL,
+    regime TEXT NOT NULL,
+    offset_value INTEGER NOT NULL,
+    clean_seconds REAL NOT NULL DEFAULT 0.0,
+    updated_at TEXT NOT NULL,
+    UNIQUE(context_id, core_id, regime, offset_value)
+);
+"""
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            with pytest.raises(RuntimeError, match="^Invalid tuner_regime_banks schema: unsafe context identity$"):
+                HistoryDB._migrate_v20(conn)
+        finally:
+            conn.close()
+
+    def test_v20_rejects_unknown_context_key(self, tmp_path):
+        import sqlite3
+
+        path = tmp_path / "unsafe-key.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """\
+CREATE TABLE schema_version (version INTEGER NOT NULL);
+INSERT INTO schema_version VALUES (19);
+CREATE TABLE tuner_regime_banks (
+    context_key TEXT NOT NULL,
+    core_id INTEGER NOT NULL,
+    regime TEXT NOT NULL,
+    offset_value INTEGER NOT NULL,
+    clean_seconds REAL NOT NULL DEFAULT 0.0,
+    updated_at TEXT NOT NULL
+);
+"""
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            with pytest.raises(RuntimeError, match="^Invalid tuner_regime_banks schema: unsafe context key$"):
+                HistoryDB._migrate_v20(conn)
+        finally:
+            conn.close()
 
 
 class TestAdoptLegacyRootDb:

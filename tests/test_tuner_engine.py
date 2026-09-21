@@ -1048,6 +1048,26 @@ class TestBackoffAlgorithm:
         assert cs.phase == TunerPhase.BACKOFF_CONFIRMING
         assert cs.backoff_pass_bound == -4
 
+    def test_backoff_preconfirm_pass_converges_on_proven_bound(self, db, simple_topology, mock_smu, mock_backend):
+        eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
+        cs = CoreState(
+            core_id=0,
+            phase=TunerPhase.BACKOFF_PRECONFIRM,
+            current_offset=-6,
+            best_offset=-5,
+            backoff_mode=True,
+            backoff_fail_bound=-7,
+            backoff_pass_bound=-5,
+        )
+        eng._core_states = {0: cs}
+
+        eng._advance_core(0, passed=True)
+
+        assert cs.phase == TunerPhase.BACKOFF_CONFIRMING
+        assert cs.best_offset == -6
+        assert cs.current_offset == -6
+        assert cs.backoff_pass_bound == -6
+
     def test_convergence_guard_at_baseline(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
         cs = CoreState(
@@ -2958,3 +2978,83 @@ class TestEventLoopDeferral:
             eng._start_worker(99, 60)  # core 99 does not exist → start failure
         otf.assert_not_called()  # NOT re-entered synchronously
         qtimer.singleShot.assert_called_once()
+
+
+class TestWorkerCheckpoint:
+    @staticmethod
+    def _prepare_hunt_without_state(eng):
+        eng._session_id = tp.create_session(eng._db, eng._config, "", "")
+        eng._core_states = {0: CoreState(core_id=0, current_offset=-5)}
+        eng._hunting = True
+        eng._hunt = None
+
+    def test_without_session_persists_nothing(self, engine):
+        engine._checkpoint_worker({"profile": "sustained"}, [0])
+
+        assert tp.get_latest_session(engine._db) is None
+
+    def test_missing_hunt_state_pauses_without_arming(self, engine):
+        self._prepare_hunt_without_state(engine)
+        lines = []
+        engine.log_message.connect(lines.append)
+
+        engine._checkpoint_worker({"profile": "sustained"}, [0])
+
+        session = tp.get_session(engine._db, engine._session_id)
+        assert "Hunt state vanished before worker launch; pausing." in lines
+        assert engine.status == "paused"
+        assert session is not None
+        assert session.status == "paused"
+        assert session.hunt_state == ""
+
+    def test_per_core_launch_stops_when_checkpoint_pauses(self, engine):
+        self._prepare_hunt_without_state(engine)
+        worker = MagicMock()
+        with (
+            patch("corecycler.tuner.engine.CoreScheduler"),
+            patch("corecycler.tuner.engine._TunerWorker", return_value=worker),
+            patch.object(engine, "_start_freeze_monitor") as start_freeze_monitor,
+        ):
+            engine._start_worker(0, 1)
+
+        assert engine.status == "paused"
+        worker.start.assert_not_called()
+        start_freeze_monitor.assert_not_called()
+        assert engine._freeze is None
+
+    def test_rapid_transition_launch_stops_when_checkpoint_pauses(self, engine):
+        self._prepare_hunt_without_state(engine)
+        engine._smu = None
+        engine._validation_core_order = [0]
+        worker = MagicMock()
+        with (
+            patch("corecycler.tuner.engine.CoreScheduler"),
+            patch("corecycler.tuner.engine._RapidTransitionWorker", return_value=worker),
+            patch.object(engine, "_start_freeze_monitor") as start_freeze_monitor,
+        ):
+            engine._run_validation_stage4()
+
+        assert engine.status == "paused"
+        worker.start.assert_not_called()
+        start_freeze_monitor.assert_not_called()
+        assert engine._freeze is None
+
+    def test_parallel_launch_stops_when_checkpoint_pauses(self, engine):
+        self._prepare_hunt_without_state(engine)
+        worker = MagicMock()
+        with (
+            patch("corecycler.tuner.engine.ParallelStress"),
+            patch("corecycler.tuner.engine._ParallelWorker", return_value=worker),
+            patch.object(engine, "_start_freeze_monitor") as start_freeze_monitor,
+        ):
+            engine._start_multi_core_worker([0], 1)
+
+        assert engine.status == "paused"
+        worker.start.assert_not_called()
+        start_freeze_monitor.assert_not_called()
+        assert engine._freeze is None
+
+
+@pytest.mark.parametrize("payload", ["{", '{"core": 0}'])
+def test_parallel_pass_durations_rejects_malformed_or_non_list_payload(payload):
+    assert TunerEngine._parallel_pass_durations(payload) == {}

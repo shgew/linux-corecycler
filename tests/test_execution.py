@@ -784,6 +784,18 @@ class TestHelpers:
         kill_process_group(proc)
         assert proc.poll() is not None
 
+    def test_waitid_os_error_reports_process_as_not_exited(self, monkeypatch):
+        class Process:
+            pid = 4321
+            returncode = None
+
+        def unavailable(*_args):
+            raise OSError("waitid unavailable")
+
+        monkeypatch.setattr(execution.os, "waitid", unavailable)
+
+        assert not execution._exited_without_reaping(Process())
+
     def test_kill_process_group_tolerates_an_already_dead_process(self):
         proc = subprocess.Popen(_child("pass"), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         proc.wait(timeout=5)

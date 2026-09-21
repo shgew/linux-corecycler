@@ -224,6 +224,9 @@ class TestConfigValidationFailsClosed:
         errors = self._cfg(fine_step=0).validate()
         assert any("fine_step" in e for e in errors)
 
+    def test_fine_step_must_not_exceed_coarse_step(self):
+        assert self._cfg(coarse_step=1, fine_step=2).validate() == ["fine_step (2) must be <= coarse_step (1)"]
+
     @pytest.mark.parametrize(
         ("settings", "message"),
         [
@@ -243,6 +246,9 @@ class TestConfigValidationFailsClosed:
             ({"suspicion_min_failures": 0}, "suspicion_min_failures must be >= 1"),
             ({"anneal_bank_hours": 0}, "anneal_bank_hours must be > 0"),
             ({"anneal_max_strikes": 0}, "anneal_max_strikes must be 1-10"),
+            ({"max_temperature_c": 59}, "max_temperature_c must be 60-110, got 59"),
+            ({"max_thermal_retries": -1}, "max_thermal_retries must be >= 0"),
+            ({"thermal_cooldown_seconds": -1}, "thermal_cooldown_seconds must be >= 0"),
         ],
     )
     def test_battery_and_hunt_knob_ranges_are_rejected(self, settings, message):
@@ -257,9 +263,19 @@ class TestConfigValidationFailsClosed:
             "battery does not cover regimes: boost, coupled, transient"
         ]
 
+    def test_coarse_regimes_must_be_a_list(self):
+        assert self._cfg(coarse_regimes="current").validate() == ["coarse_regimes must be a list of regime names"]
+
     def test_coarse_regimes_must_name_known_regimes(self):
         assert self._cfg(coarse_regimes=["unknown"]).validate() == [
             "coarse_regimes[0] must be one of ['boost', 'coupled', 'current', 'transient']"
+        ]
+
+    def test_coarse_regimes_must_be_present_in_battery(self):
+        current = [entry for entry in TunerConfig().battery if entry["regime"] == "current"]
+        assert self._cfg(battery=current, coarse_regimes=["coupled", "boost"]).validate() == [
+            "battery does not cover regimes: boost, coupled, transient",
+            "coarse_regimes not present in battery: boost, coupled",
         ]
 
     def test_at_least_one_coarse_regime_is_required(self):

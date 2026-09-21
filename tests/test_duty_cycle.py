@@ -179,6 +179,20 @@ def test_resume_os_error_is_telemetry_only(monkeypatch: pytest.MonkeyPatch, capl
     assert "resume denied" in caplog.text
 
 
+def test_intentional_idle_clock_includes_completed_and_open_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = iter([10.0, 12.0, 14.0, 20.0, 23.0])
+    driver = DutyCycleDriver(DutyCycle(), 123)
+    monkeypatch.setattr(duty.time, "monotonic", lambda: next(clock))
+    monkeypatch.setattr(duty.os, "killpg", lambda _pgid, _signal: None)
+
+    driver._stop_payload()
+    assert driver.intentional_idle_seconds == 2.0
+    driver._continue_payload()
+    assert driver.intentional_idle_seconds == 4.0
+    driver._stop_payload()
+    assert driver.intentional_idle_seconds == 7.0
+
+
 def test_execution_starts_and_stops_driver_with_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     events: list[str] = []
 
@@ -233,6 +247,29 @@ def test_execution_starts_and_stops_driver_with_payload(monkeypatch: pytest.Monk
     supervisor._finish([run], time.monotonic(), 0.0)
 
     assert events == ["start", "stop", "kill"]
+
+
+def test_driver_stop_failure_is_a_startup_fault(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    class FailingDriver:
+        def stop(self) -> None:
+            raise RuntimeError("worker did not stop")
+
+    supervisor = execution.Supervisor.__new__(execution.Supervisor)
+    supervisor.stop_on_first_failure = False
+    supervisor.stop_event = threading.Event()
+    run = _LaneRun(Lane(core_id=4, cpus=(4,), work_dir=tmp_path))
+    run.duty_driver = FailingDriver()
+    monkeypatch.setattr(execution.time, "monotonic", lambda: 13.0)
+
+    supervisor._stop_duty_driver(run, 10.0)
+
+    assert run.verdict == StressResult(
+        core_id=4,
+        passed=False,
+        duration_seconds=3.0,
+        error_message="Failed to stop duty-cycle driver: worker did not stop",
+        error_type="startup",
+    )
 
 
 def test_driver_start_failure_cannot_bypass_payload_termination(
