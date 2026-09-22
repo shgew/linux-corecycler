@@ -224,6 +224,30 @@ class TestPause:
         tab._on_pause()
         assert not tab._resume_btn.isEnabled()
 
+    def test_a_self_pause_with_no_test_running_releases_the_tested_core(self, tab):
+        eng = _engine(status="paused")
+        eng.test_in_flight = False
+        tab._engine = eng
+        tab._on_worker_started(0)
+        states = []
+        tab.tuner_core_testing.connect(lambda c, s: states.append((c, s)))
+        tab._on_status_changed("paused")
+        assert tab._active_test_core is None
+        assert not tab._tuner_timer.isActive()
+        assert len(states) == 1
+        assert states[0][0] == 0
+        assert states[0][1] != "testing"
+
+    def test_a_pause_requested_mid_test_keeps_the_running_core(self, tab):
+        eng = _engine(status="paused")
+        eng.test_in_flight = True
+        tab._engine = eng
+        tab._on_worker_started(0)
+        tab._on_status_changed("paused")
+        assert tab._active_test_core == 0
+        assert tab._tuner_timer.isActive()
+        tab._tuner_timer.stop()
+
 
 def _accepting_dialog(monkeypatch, *, accept=True, clear_selection=False):
     real = tt.QDialog

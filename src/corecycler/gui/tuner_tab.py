@@ -848,6 +848,13 @@ class TunerTab(QWidget):
         if status == "paused":
             self._pause_btn.setEnabled(False)
             self._resume_btn.setEnabled(True)
+            # A self-pause after a test that could not run never emits test_completed.
+            if self._engine is not None and not self._engine.test_in_flight and self._active_test_core is not None:
+                cs = self._engine.core_states.get(self._active_test_core)
+                if cs is not None:
+                    self.tuner_core_testing.emit(self._active_test_core, _PHASE_TO_GRID.get(cs.phase, "pending"))
+                self._active_test_core = None
+                self._tuner_timer.stop()
         elif status in ("running", "validating", "hunting"):
             self._pause_btn.setEnabled(True)
             self._resume_btn.setEnabled(False)
