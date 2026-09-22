@@ -295,3 +295,19 @@ class TestFixSudoOwnership:
         paths._record_created(f)
         with patch("os.geteuid", return_value=0), patch("os.chown", side_effect=OSError):
             paths.fix_sudo_ownership(f)
+
+    def test_external_creation_tracker_never_follows_a_replacement_symlink(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("SUDO_UID", "1000")
+        monkeypatch.setenv("SUDO_GID", "1000")
+        target = tmp_path / "tracked"
+        missing = tmp_path / "missing"
+        repair = paths.track_created_paths(target, missing)
+        victim = tmp_path / "victim"
+        victim.write_text("safe")
+        target.symlink_to(victim)
+
+        with patch("os.geteuid", return_value=0), patch("os.chown") as chown:
+            repair()
+
+        chown.assert_not_called()
+        assert victim.read_text() == "safe"

@@ -69,6 +69,41 @@ class TestStressGuards:
         assert tab._stress_btn.isEnabled()
         assert not tab._stop_btn.isEnabled()
 
+    def test_force_stop_waits_for_telemetry_and_confirms_stress_teardown(self):
+        tab = _tab()
+        tab._update_timer = MagicMock()
+        tab._memory_worker = MagicMock()
+        tab._memory_worker.isRunning.return_value = True
+        tab._stress_worker = MagicMock()
+        tab._stress_worker.isRunning.return_value = True
+        tab._stress_worker.force_teardown.return_value = True
+        tab._stress_worker.wait.return_value = False
+
+        assert tab.force_stop() is False
+        tab._update_timer.stop.assert_called_once_with()
+        tab._memory_worker.wait.assert_called_once_with()
+        tab._stress_worker.force_teardown.assert_called_once_with()
+        tab._stress_worker.wait.assert_called_once_with(5000)
+
+    def test_force_stop_succeeds_without_a_stress_worker(self):
+        tab = _tab()
+        tab._memory_worker = MagicMock()
+        tab._memory_worker.isRunning.return_value = False
+        tab._stress_worker = None
+
+        assert tab.force_stop() is True
+
+    def test_force_stop_reports_payload_teardown_failure(self):
+        tab = _tab()
+        tab._memory_worker = MagicMock()
+        tab._memory_worker.isRunning.return_value = False
+        tab._stress_worker = MagicMock()
+        tab._stress_worker.isRunning.return_value = True
+        tab._stress_worker.force_teardown.return_value = False
+
+        assert tab.force_stop() is False
+        tab._stress_worker.wait.assert_not_called()
+
 
 class TestMemoryTelemetryWorker:
     def test_inventory_spd_and_temperatures_are_sampled_by_worker(self, monkeypatch):

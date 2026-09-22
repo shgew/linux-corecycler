@@ -600,7 +600,7 @@ class TunerTab(QWidget):
             return
 
         config = self._get_config()
-        errors = config.validate(self._co_range())
+        errors = config.validate(self._co_range()) + config.backend_availability_errors()
         if errors:
             QMessageBox.warning(self, "Invalid Configuration", "\n".join(errors))
             return
@@ -740,7 +740,7 @@ class TunerTab(QWidget):
         except ValueError as exc:
             QMessageBox.warning(self, "Invalid Configuration", str(exc))
             return
-        errors = config.validate(self._co_range())
+        errors = config.validate(self._co_range()) + config.backend_availability_errors()
         if errors:
             QMessageBox.warning(self, "Invalid Configuration", "\n".join(errors))
             return
@@ -967,6 +967,8 @@ class TunerTab(QWidget):
 
     @Slot(str)
     def _on_status_changed(self, status: str) -> None:
+        if status in (*ACTIVE_STATUSES, "paused"):
+            self._set_running_state(True)
         if status == "validating":
             self._status_label.setText("Status: Validating")
         else:
@@ -1282,10 +1284,11 @@ class TunerTab(QWidget):
         if self._engine:
             self._engine.abort()
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         """Stop the tuner for app exit, leaving its session paused and resumable."""
         if self._engine:
-            self._engine.shutdown()
+            return self._engine.shutdown()
+        return True
 
     @property
     def is_running(self) -> bool:

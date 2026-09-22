@@ -51,3 +51,19 @@ def test_tune_refuses_when_capability_confinement_is_unproven(monkeypatch, capsy
 
     assert main_mod.main() == cli.EXIT_REFUSED
     assert "capability confinement" in capsys.readouterr().err
+
+
+def test_gui_refuses_when_capability_confinement_is_unproven(monkeypatch, capsys):
+    from corecycler import capabilities, cli
+
+    monkeypatch.setattr(sys, "argv", ["corecycler"])
+    monkeypatch.setattr(main_mod, "setup_logging", lambda: None)
+    monkeypatch.setattr(capabilities, "confine", lambda: capabilities.ConfinementResult(safe=False, has_rawio=True))
+    monkeypatch.setattr(
+        main_mod,
+        "_bootstrap_sudo_session",
+        lambda: (_ for _ in ()).throw(AssertionError("unsafe GUI started")),
+    )
+
+    assert main_mod.main() == cli.EXIT_REFUSED
+    assert "capability confinement" in capsys.readouterr().err

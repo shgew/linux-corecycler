@@ -9,14 +9,14 @@ from __future__ import annotations
 import csv
 import json
 import sys as _sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 if not hasattr(_sys.modules.get("PySide6", None), "__path__"):
     pytest.skip("GUI tests require real PySide6", allow_module_level=True)
 
-from corecycler.history.db import HistoryDB, RunRecord
+from corecycler.history.db import HistoryDB, RunRecord, TuningContextRecord
 from corecycler.tuner.config import TunerConfig
 
 
@@ -54,6 +54,30 @@ def _seed_session(db, status="completed"):
     return sid
 
 
+def _seed_context_run(db, context_hash, notes, backend):
+    context_id = db.get_or_create_context(
+        TuningContextRecord(
+            bios_version="2402",
+            cpu_model="Test 8C",
+            physical_cores=4,
+            context_hash=context_hash,
+            notes=notes,
+        )
+    )
+    db.create_run(
+        RunRecord(
+            context_id=context_id,
+            backend=backend,
+            stress_mode="SSE",
+            cpu_model="Test 8C",
+            status="completed",
+            total_cores=4,
+            cores_passed=4,
+        )
+    )
+    return context_id
+
+
 def _tab(db):
     _qapp()
     from corecycler.gui.history_tab import HistoryTab
@@ -68,6 +92,53 @@ def _yes():
 
 
 class TestViews:
+    def test_sorted_context_selection_refresh_and_delete_keep_the_same_context(self, db):
+        from PySide6.QtCore import Qt
+
+        selected_id = _seed_context_run(db, "first", "a-note", "selected-backend")
+        other_id = _seed_context_run(db, "second", "z-note", "other-backend")
+        tab = _tab(db)
+        tab._view_mode = tab.VIEW_GROUPED
+        tab.refresh()
+        tab._context_table.sortItems(5, Qt.SortOrder.AscendingOrder)
+
+        tab._context_table.selectRow(0)
+        assert tab._displayed_runs[0].backend == "selected-backend"
+
+        tab._refresh_preserve_context()
+        selected_row = tab._context_table.currentRow()
+        assert tab._context_table.item(selected_row, 0).data(Qt.ItemDataRole.UserRole) == selected_id
+
+        with patch("corecycler.gui.history_tab.QMessageBox.question", return_value=_yes()):
+            tab._delete_contexts([selected_row])
+
+        assert db.get_context(selected_id) is None
+        assert db.get_context(other_id) is not None
+
+    def test_sorted_context_menu_updates_the_selected_context(self, db, monkeypatch):
+        from PySide6.QtCore import Qt
+
+        from corecycler.gui import history_tab as history_module
+
+        selected_id = _seed_context_run(db, "first", "a-note", "selected-backend")
+        other_id = _seed_context_run(db, "second", "z-note", "other-backend")
+        tab = _tab(db)
+        tab._view_mode = tab.VIEW_GROUPED
+        tab.refresh()
+        tab._context_table.sortItems(5, Qt.SortOrder.AscendingOrder)
+        tab._context_table.selectRow(0)
+        actions = []
+        menu = MagicMock()
+        menu.addAction.side_effect = lambda _label, callback: actions.append(callback)
+        monkeypatch.setattr(history_module, "QMenu", lambda _parent: menu)
+        monkeypatch.setattr(history_module.QInputDialog, "getText", lambda *args, **kwargs: ("updated", True))
+
+        tab._show_context_table_menu(tab._context_table.rect().center())
+        actions[0]()
+
+        assert db.get_context(selected_id).notes == "updated"
+        assert db.get_context(other_id).notes == "z-note"
+
     def test_all_view_shows_seeded_runs(self, db):
         _seed_run(db, "2026-07-20T10:00:00+00:00")
         _seed_run(db, "2026-07-21T10:00:00+00:00")

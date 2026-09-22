@@ -70,6 +70,7 @@ def db():
 @pytest.fixture(autouse=True)
 def no_modal(monkeypatch):
     monkeypatch.setattr(tt, "QMessageBox", MagicMock())
+    monkeypatch.setattr(TunerConfig, "backend_availability_errors", lambda self: [])
     # A missing backend prompts for its path; default to the user declining.
     monkeypatch.setattr(tt, "ensure_tool", lambda parent, key: False)
     return tt.QMessageBox
@@ -189,6 +190,17 @@ class TestStart:
         assert not engine_cls.called
         assert no_modal.warning.called
 
+    def test_refuses_when_a_battery_backend_is_unavailable(self, tab, no_modal, monkeypatch):
+        engine_cls = MagicMock()
+        monkeypatch.setattr(tt, "TunerEngine", engine_cls)
+        monkeypatch.setattr(TunerConfig, "backend_availability_errors", lambda self: ["missing battery backend"])
+        no_modal.warning.return_value = no_modal.StandardButton.Yes
+
+        tab._on_start()
+
+        assert not engine_cls.called
+        assert "missing battery backend" in no_modal.warning.call_args.args[2]
+
     def test_an_engine_that_refuses_to_start_leaves_the_ui_idle(self, tab, no_modal, monkeypatch):
         eng = _engine(status="idle")
         monkeypatch.setattr(tt, "TunerEngine", MagicMock(return_value=eng))
@@ -211,6 +223,16 @@ class TestStart:
 
 
 class TestPause:
+    def test_startup_self_pause_acquires_tuner_ownership(self, tab):
+        states = []
+        tab.tuner_running_changed.connect(states.append)
+        tab._engine = _engine(status="paused")
+
+        tab._on_status_changed("paused")
+
+        assert states == [True]
+        assert not tab._config_container.isEnabled()
+
     def test_pause_hands_control_to_resume(self, tab):
         eng = _engine()
         tab._engine = eng
@@ -295,6 +317,17 @@ class TestResume:
         monkeypatch.setattr(tt, "TunerEngine", MagicMock(return_value=eng))
         tab._on_resume()
         assert eng.resume.call_args.args == (sid,)
+
+    def test_resume_refuses_when_a_saved_battery_backend_is_unavailable(self, tab, no_modal, monkeypatch):
+        _seed_session(tab._db, "paused")
+        engine_cls = MagicMock()
+        monkeypatch.setattr(tt, "TunerEngine", engine_cls)
+        monkeypatch.setattr(TunerConfig, "backend_availability_errors", lambda self: ["missing battery backend"])
+
+        tab._on_resume()
+
+        assert not engine_cls.called
+        assert "missing battery backend" in no_modal.warning.call_args.args[2]
 
     def test_the_picker_resumes_the_chosen_session(self, tab, monkeypatch):
         first = _seed_session(tab._db, "paused")
@@ -908,13 +941,14 @@ class TestForceStop:
 
     def test_exit_shutdown_pauses_instead_of_aborting(self, tab):
         eng = _engine()
+        eng.shutdown.return_value = True
         tab._engine = eng
-        tab.shutdown()
+        assert tab.shutdown() is True
         assert eng.shutdown.called
         assert not eng.abort.called
 
     def test_exit_shutdown_without_an_engine_is_a_noop(self, tab):
-        tab.shutdown()
+        assert tab.shutdown() is True
         assert tab._engine is None
 
 

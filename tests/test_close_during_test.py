@@ -101,7 +101,7 @@ class TestCloseDuringTest:
         engine.test_in_flight = True
         window._tuner_tab._engine = engine
         order = []
-        engine.shutdown.side_effect = lambda: order.append("shutdown")
+        engine.shutdown.side_effect = lambda: (order.append("shutdown"), True)[1]
         close = window._history_db.close
         window._history_db = MagicMock()
         window._history_db.close.side_effect = lambda: order.append("db-close")
@@ -111,6 +111,20 @@ class TestCloseDuringTest:
         assert order == ["shutdown", "db-close"]
         assert not engine.abort.called
         close()
+
+    def test_tuner_teardown_failure_keeps_the_window_and_database_open(self, window, no_modal, db):
+        engine = MagicMock(status="paused", test_in_flight=True)
+        engine.shutdown.return_value = False
+        window._tuner_tab._engine = engine
+        _answer(no_modal, "Yes")
+
+        event = _close(window)
+
+        assert event.ignore.called
+        assert not event.accept.called
+        assert window._closing is False
+        assert db.list_runs(limit=1) == []
+        window._tuner_tab._engine = None
 
     def test_answering_no_keeps_everything_alive(self, window, no_modal, db):
         window._worker = _running_worker()
@@ -137,9 +151,9 @@ class TestCloseDuringTest:
             property(lambda self: True),
             raising=False,
         )
-        tuner_stop = MagicMock()
+        tuner_stop = MagicMock(return_value=True)
         monkeypatch.setattr(window._tuner_tab, "shutdown", tuner_stop)
-        memory_stop = MagicMock()
+        memory_stop = MagicMock(return_value=True)
         monkeypatch.setattr(window._memory_tab, "force_stop", memory_stop)
         window._memory_tab._stress_worker = _running_worker()
         _answer(no_modal, "Yes")
@@ -147,6 +161,20 @@ class TestCloseDuringTest:
         assert event.accept.called
         assert tuner_stop.called
         assert memory_stop.called
+
+    def test_memory_teardown_failure_keeps_the_window_and_database_open(self, window, no_modal, db, monkeypatch):
+        memory_stop = MagicMock(return_value=False)
+        monkeypatch.setattr(window._memory_tab, "force_stop", memory_stop)
+        window._memory_tab._stress_worker = _running_worker()
+        _answer(no_modal, "Yes")
+
+        event = _close(window)
+
+        assert event.ignore.called
+        assert not event.accept.called
+        assert window._closing is False
+        assert db.list_runs(limit=1) == []
+        window._memory_tab._stress_worker = None
 
     def test_signals_delivered_after_close_never_touch_the_closed_database(self, window, db):
         assert _close(window).accept.called

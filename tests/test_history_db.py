@@ -1035,3 +1035,21 @@ class TestRecoverableSessions:
         first = self._session(db, "profile_quarantined")
         second = self._session(db, "running")
         assert [s.id for s in db.list_recoverable_tuner_sessions()] == [second, first]
+
+
+def test_sudo_created_history_state_is_returned_to_the_invoking_user(tmp_path, monkeypatch):
+    from unittest.mock import patch
+
+    monkeypatch.setenv("SUDO_UID", "1000")
+    monkeypatch.setenv("SUDO_GID", "1000")
+    db_path = tmp_path / "corecycler" / "history" / "history.db"
+    with patch("os.geteuid", return_value=0), patch("os.chown") as chown:
+        db = HistoryDB(db_path)
+        try:
+            repaired = {call.args[0] for call in chown.call_args_list}
+            assert db_path.parent in repaired
+            assert db_path in repaired
+            assert db_path.with_name("history.db-wal") in repaired
+            assert db_path.with_name("history.db-shm") in repaired
+        finally:
+            db.close()

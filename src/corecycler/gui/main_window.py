@@ -936,10 +936,18 @@ class MainWindow(QMainWindow):
             with contextlib.suppress(RuntimeError, TypeError):
                 self._worker.finished.disconnect(self._on_worker_finished)
 
-        if tuner_running:
-            self._tuner_tab.shutdown()
-        if memory_running:
-            self._memory_tab.force_stop()
+        if tuner_running and not self._tuner_tab.shutdown():
+            self._closing = False
+            QMessageBox.warning(self, "Teardown incomplete", "The tuner worker could not be confirmed stopped.")
+            event.ignore()
+            return
+        if memory_running and not self._memory_tab.force_stop():
+            self._closing = False
+            QMessageBox.warning(
+                self, "Teardown incomplete", "The memory stress payload could not be confirmed stopped."
+            )
+            event.ignore()
+            return
 
         try:
             profile = self._config_tab.get_profile()

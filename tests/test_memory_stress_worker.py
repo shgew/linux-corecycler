@@ -88,6 +88,22 @@ class TestStressWorker:
         assert seen == [(False, "Unknown tool: bogus-tool")]
         factory.assert_not_called()
 
+    def test_force_teardown_stops_and_delegates_to_the_active_supervisor(self):
+        from corecycler.gui.memory_tab import _StressWorker
+
+        _qapp()
+        worker = _StressWorker("stressapptest", 1, detector_factory=MagicMock)
+        supervisor = MagicMock()
+        supervisor.force_teardown.return_value = False
+        worker._supervisor = supervisor
+
+        assert worker.force_teardown() is False
+        assert worker._stop_event.is_set()
+        supervisor.force_teardown.assert_called_once_with()
+
+        worker._supervisor = None
+        assert worker.force_teardown() is True
+
 
 class TestMemoryStressBackend:
     def test_builds_supervised_payload_commands(self, tmp_path):

@@ -321,7 +321,10 @@ def main() -> int:
         return cli.cli_main(argv)
 
     setup_logging()
-    capabilities.confine()
+    confinement = capabilities.confine()
+    if not confinement.safe:
+        print("corecycler: capability confinement could not be proven safe", file=sys.stderr)
+        return cli.EXIT_REFUSED
 
     # Silence the warning categories that fire for session services root cannot use
     os.environ.setdefault(

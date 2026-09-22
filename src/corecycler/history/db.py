@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from corecycler import __version__
-from corecycler.config.paths import fix_sudo_ownership, user_home
+from corecycler.config.paths import ensure_directory, track_created_paths, user_home
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -313,8 +313,14 @@ class HistoryDB:
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self._db_path = Path(db_path)
+        self._repair_ownership = None
         if str(self._db_path) != ":memory:":
-            self._db_path.parent.mkdir(parents=True, exist_ok=True)
+            ensure_directory(self._db_path.parent)
+            self._repair_ownership = track_created_paths(
+                self._db_path,
+                self._db_path.with_name(self._db_path.name + "-wal"),
+                self._db_path.with_name(self._db_path.name + "-shm"),
+            )
 
         self.__conn = sqlite3.connect(
             str(self._db_path),
@@ -335,16 +341,8 @@ class HistoryDB:
                 f"Move the file aside and restart to rebuild."
             )
         self._create_schema()
-        if str(self._db_path) != ":memory:":
-            # A sudo run must not leave the shared DB (or its WAL sidecars)
-            # root-owned, or the next non-sudo run cannot write it.
-            fix_sudo_ownership(
-                self._db_path.parent.parent,  # .../corecycler (mkdir -p may create it as root)
-                self._db_path.parent,
-                self._db_path,
-                self._db_path.with_name(self._db_path.name + "-wal"),
-                self._db_path.with_name(self._db_path.name + "-shm"),
-            )
+        if self._repair_ownership is not None:
+            self._repair_ownership()
 
     # ------------------------------------------------------------------
     # Schema
@@ -2150,10 +2148,5 @@ CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
 
     def close(self) -> None:
         self.__conn.close()
-        if str(self._db_path) != ":memory:":
-            # WAL sidecars may have been recreated (root-owned) during the run.
-            fix_sudo_ownership(
-                self._db_path,
-                self._db_path.with_name(self._db_path.name + "-wal"),
-                self._db_path.with_name(self._db_path.name + "-shm"),
-            )
+        if self._repair_ownership is not None:
+            self._repair_ownership()

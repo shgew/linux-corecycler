@@ -8,6 +8,10 @@ import pwd
 import secrets
 import stat
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 _CREATED_INODES: dict[Path, tuple[int, int]] = {}
 
@@ -47,6 +51,36 @@ def _validate_no_symlinks(path: Path) -> None:
             return
         if stat.S_ISLNK(details.st_mode):
             raise OSError(f"refusing symlink in application path: {current}")
+
+
+def track_created_paths(*paths: Path) -> Callable[[], None]:
+    """Return an ownership repair callback limited to paths absent now."""
+    missing: list[Path] = []
+    for path in paths:
+        path = path.absolute()
+        _validate_no_symlinks(path)
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            missing.append(path)
+
+    created: list[Path] = []
+
+    def repair() -> None:
+        for path in missing:
+            if path in created:
+                continue
+            try:
+                details = path.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(details.st_mode):
+                continue
+            _record_created(path, details)
+            created.append(path)
+        fix_sudo_ownership(*created)
+
+    return repair
 
 
 def ensure_directory(path: Path) -> Path:

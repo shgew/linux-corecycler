@@ -98,6 +98,7 @@ class _StressWorker(QThread):
         self._supervisor_factory = supervisor_factory or execution.Supervisor
         self._detector_factory = detector_factory
         self._stop_event = threading.Event()
+        self._supervisor: execution.Supervisor | None = None
         self._cancelled = False
 
     def run(self) -> None:
@@ -117,7 +118,7 @@ class _StressWorker(QThread):
                 require_sensor=True,
                 read=HWMonReader().max_cpu_temp,
             )
-            supervisor = self._supervisor_factory(
+            self._supervisor = self._supervisor_factory(
                 backend=backend,
                 detector=detector,
                 thermal=thermal,
@@ -136,7 +137,7 @@ class _StressWorker(QThread):
                 memory_mb=default_memory_mb(),
                 test_seconds=seconds,
             )
-            result = supervisor.run([lane], lambda _lane: config, seconds + 60.0).get(0)
+            result = self._supervisor.run([lane], lambda _lane: config, seconds + 60.0).get(0)
             if self._cancelled:
                 self.done.emit(False, "Memory stress stopped")
             elif result is None:
@@ -147,10 +148,17 @@ class _StressWorker(QThread):
                 self.done.emit(False, result.error_message or result.error_type or "Memory stress failed")
         except (OSError, RuntimeError, ValueError) as exc:
             self.done.emit(False, str(exc))
+        finally:
+            self._supervisor = None
 
     def stop(self) -> None:
         self._cancelled = True
         self._stop_event.set()
+
+    def force_teardown(self) -> bool:
+        self.stop()
+        supervisor = self._supervisor
+        return supervisor is None or supervisor.force_teardown()
 
 
 @dataclass(frozen=True, slots=True)
@@ -582,11 +590,18 @@ class MemoryTab(QWidget):
             self._stress_status.setText("Stopping...")
             self._stress_worker.stop()
 
-    def force_stop(self) -> None:
-        """Stop any running memory stress test on app exit."""
-        if self._stress_worker and self._stress_worker.isRunning():
-            self._stress_worker.stop()
-            self._stress_worker.wait(3000)
+    def force_stop(self) -> bool:
+        """Stop background telemetry and confirm any memory stress has ended."""
+        self._update_timer.stop()
+        if self._memory_worker.isRunning():
+            self._memory_worker.wait()
+        worker = self._stress_worker
+        if worker is None or not worker.isRunning():
+            return True
+        worker.stop()
+        if not worker.force_teardown():
+            return False
+        return worker.wait(5000)
 
     @Slot(bool, str)
     def _on_stress_done(self, passed: bool, output: str) -> None:

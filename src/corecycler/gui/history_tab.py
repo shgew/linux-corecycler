@@ -391,26 +391,22 @@ class HistoryTab(QWidget):
         if not self._db:
             return
 
-        # remember which context was selected
         selected_ctx_id = None
         if self._view_mode == self.VIEW_GROUPED:
             ctx_rows = sorted({idx.row() for idx in self._context_table.selectionModel().selectedRows()})
-            if ctx_rows and ctx_rows[0] < len(self._contexts):
-                selected_ctx_id = self._contexts[ctx_rows[0]].id
+            if ctx_rows:
+                selected_ctx_id = self._context_table.item(ctx_rows[0], 0).data(Qt.ItemDataRole.UserRole)
 
         self._reload_data()
         self._update_summary()
 
         if self._view_mode == self.VIEW_GROUPED and selected_ctx_id is not None:
-            # Rebuild context table but restore selection without clearing detail
             self._populate_context_table()
-            for i, ctx in enumerate(self._contexts):
-                if ctx.id == selected_ctx_id:
-                    self._context_table.selectRow(i)
-                    # Force refresh - selectRow may not fire signal if same row index
+            for row in range(self._context_table.rowCount()):
+                if self._context_table.item(row, 0).data(Qt.ItemDataRole.UserRole) == selected_ctx_id:
+                    self._context_table.selectRow(row)
                     self._on_context_selected()
                     return
-            # Context was deleted (all its runs gone) - fall through to full refresh
         elif self._view_mode == self.VIEW_ALL:
             self._populate_runs_table(self._runs)
             self._clear_detail()
@@ -548,6 +544,8 @@ class HistoryTab(QWidget):
 
             for col, (text, align) in enumerate(items):
                 cell = _SortableItem(str(text), sort_keys[col], align)
+                if col == 0:
+                    cell.setData(Qt.ItemDataRole.UserRole, ctx.id)
                 if col == 4:
                     cell.setForeground(QColor(row_color))
                 if col == 0 and bios_changed:
@@ -602,24 +600,20 @@ class HistoryTab(QWidget):
             self._runs_table.setRowCount(0)
             return
 
-        row = rows[0]
-        if row < len(self._contexts):
-            ctx = self._contexts[row]
-            runs = self._context_runs.get(ctx.id, [])
-        else:
-            # Ungrouped row
-            runs = self._context_runs.get(None, [])
-
+        ctx_id = self._context_table.item(rows[0], 0).data(Qt.ItemDataRole.UserRole)
+        runs = self._context_runs.get(ctx_id, [])
         self._populate_runs_table(runs)
         self._clear_detail()
 
     @Slot()
     def _show_context_table_menu(self, pos) -> None:
         rows = sorted({idx.row() for idx in self._context_table.selectionModel().selectedRows()})
-        if not rows or rows[0] >= len(self._contexts):
+        if not rows:
             return
-
-        ctx = self._contexts[rows[0]]
+        ctx_id = self._context_table.item(rows[0], 0).data(Qt.ItemDataRole.UserRole)
+        if ctx_id is None:
+            return
+        ctx = next(context for context in self._contexts if context.id == ctx_id)
         menu = QMenu(self)
         menu.addAction("Add Note...", lambda: self._add_context_note(ctx))
         menu.exec(self._context_table.viewport().mapToGlobal(pos))
@@ -1268,12 +1262,11 @@ class HistoryTab(QWidget):
     def _delete_contexts(self, rows: list[int]) -> None:
         if not self._db:
             return
-        ctx_ids = []
-        for row in rows:
-            if row < len(self._contexts):
-                ctx_id = self._contexts[row].id
-                if ctx_id is not None:
-                    ctx_ids.append(ctx_id)
+        ctx_ids = [
+            ctx_id
+            for row in rows
+            if (ctx_id := self._context_table.item(row, 0).data(Qt.ItemDataRole.UserRole)) is not None
+        ]
         if not ctx_ids:
             return
 
