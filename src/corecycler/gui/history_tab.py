@@ -1262,11 +1262,11 @@ class HistoryTab(QWidget):
     def _delete_contexts(self, rows: list[int]) -> None:
         if not self._db:
             return
-        ctx_ids = [
-            ctx_id
-            for row in rows
-            if (ctx_id := self._context_table.item(row, 0).data(Qt.ItemDataRole.UserRole)) is not None
-        ]
+        ctx_ids = []
+        for row in rows:
+            item = self._context_table.item(row, 0)
+            if item is not None and (ctx_id := item.data(Qt.ItemDataRole.UserRole)) is not None:
+                ctx_ids.append(ctx_id)
         if not ctx_ids:
             return
 

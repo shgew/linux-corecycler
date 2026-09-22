@@ -399,6 +399,7 @@ class TestEngineInitiatedStops:
         from corecycler.gui.tuner_tab import TunerTab
 
         ns = self._ns()
+        ns._set_running_state = MethodType(TunerTab._set_running_state, ns)
         MethodType(TunerTab._on_status_changed, ns)("paused")
         ns._resume_btn.setEnabled.assert_called_with(True)
         ns._pause_btn.setEnabled.assert_called_with(False)

@@ -186,7 +186,7 @@ class TestMemoryStressLifecycle:
         tab._stress_worker = worker
         tab.force_stop()
         assert worker.stop.called
-        assert worker.wait.call_args.args == (3000,)
+        assert worker.wait.call_args.args == (5000,)
         assert not worker.terminate.called
 
     def test_force_stop_leaves_a_finished_worker_alone(self, tab):
