@@ -36,7 +36,7 @@ from corecycler.engine.microfreeze import MicroFreezeMonitor
 from corecycler.engine.parallel import ParallelStress
 from corecycler.engine.scheduler import CoreScheduler, SchedulerConfig
 from corecycler.history.context import capture_system_context
-from corecycler.history.db import LegacySession
+from corecycler.history.db import RESUMABLE_STATUSES, LegacySession
 from corecycler.inhibit import SleepInhibitor
 from corecycler.monitor.cpu_usage import read_cpu_times as _read_all_cpu_times
 from corecycler.monitor.msr import MSRReader
@@ -1120,6 +1120,27 @@ class TunerEngine(QObject):
         self.log_message.emit("Tuner paused - will stop after current test")
 
     def abort(self) -> None:
+        clear_hunt = not self._hunting
+        if not self._stop_and_restore("Abort"):
+            return
+        if clear_hunt and self._session_id is not None:
+            self._db.set_hunt_state(self._session_id, "")
+        self._transition_status("aborted")
+        self._set_status("idle")
+        self.log_message.emit("Tuner aborted")
+
+    def shutdown(self) -> None:
+        """Stop for application exit: restore baselines and leave the session
+        paused, so closing the window never discards a resumable search."""
+        if not self._stop_and_restore("Shutdown"):
+            return
+        session = self._db.get_tuner_session(self._session_id) if self._session_id is not None else None
+        if session is not None and session.status in RESUMABLE_STATUSES:
+            self._transition_status("paused")
+            self._set_status("idle")
+            self.log_message.emit("Tuner paused for application exit")
+
+    def _stop_and_restore(self, action: str) -> bool:
         self._abort_requested = True
         self._stop_freeze_monitor()
         if self._worker is not None:
@@ -1133,24 +1154,22 @@ class TunerEngine(QObject):
                     self._worker.terminate()
                     stopped = self._worker.wait(3000)
                 if not stopped:
-                    self.log_message.emit("Abort incomplete: stress worker is still alive; tuner ownership is retained")
-                    return
+                    self.log_message.emit(
+                        f"{action} incomplete: stress worker is still alive; tuner ownership is retained"
+                    )
+                    return False
             self._worker.deleteLater()
             self._worker = None
         self._clear_all_in_test()
         if self._revert_all_to_baseline(force=True):
-            return
+            return False
         self._validation_stage = 0
         self._in_requeue = False
         self._soaking = False
         if self._hunting:
             self._hunting = False
             self._requeue_hunt_probe()
-        elif self._session_id is not None:
-            self._db.set_hunt_state(self._session_id, "")
-        self._transition_status("aborted")
-        self._set_status("idle")
-        self.log_message.emit("Tuner aborted")
+        return True
 
     def validate_profile(self, session_id: int) -> None:
         """Re-test all confirmed values from a completed session."""

@@ -781,6 +781,66 @@ class TestAbortTeardown:
         assert worker.scheduler.force_stop.called
 
 
+class TestShutdownForExit:
+    def _session(self, engine):
+        return engine._db.get_tuner_session(engine._session_id)
+
+    def test_exit_mid_test_restores_baselines_and_leaves_the_session_resumable(self, engine):
+        cs = engine._core_states[0]
+        cs.current_offset = -10
+        cs.in_test = True
+        engine._db.upsert_tuner_core_state(engine._session_id, cs)
+        engine._smu.set_co_offset(0, -10)
+        engine._co_applied[0] = -10
+        worker = MagicMock()
+        worker.isRunning.return_value = True
+        worker.wait.return_value = True
+        engine._worker = worker
+
+        engine.shutdown()
+
+        assert worker.scheduler.force_stop.called
+        assert engine._worker is None
+        assert engine._smu.get_co_offset(0) == cs.baseline_offset
+        assert self._session(engine).status == "paused"
+        assert engine._session_id in [s.id for s in engine._db.list_resumable_tuner_sessions()]
+        assert engine.status == "idle"
+        assert not any(c.in_test for c in engine._db.get_tuner_core_states(engine._session_id).values())
+
+    def test_exit_does_not_relabel_a_session_the_engine_already_stopped(self, engine):
+        engine._transition_status("platform_fault")
+        engine._worker = None
+        engine.shutdown()
+        assert self._session(engine).status == "platform_fault"
+
+    def test_exit_mid_hunt_requeues_the_in_flight_probe(self, engine):
+        engine._hunt = bisect.HuntState(
+            candidates=[0, 1, 2, 3],
+            stage=bisect.Stage.PROBE,
+            pending=[],
+            queue=[[2, 3]],
+            in_flight=[0, 1],
+            parent=[0, 1, 2, 3],
+            level=1,
+            loaded=[0],
+        )
+        engine._hunting = True
+        engine._transition_status("hunting")
+        engine._save_hunt()
+        engine._worker = None
+        engine.shutdown()
+        persisted = bisect.HuntState.from_json(self._session(engine).hunt_state)
+        assert persisted.in_flight == []
+        assert persisted.queue == [[0, 1], [2, 3]]
+        assert self._session(engine).status == "paused"
+
+    def test_exit_retains_ownership_when_baselines_cannot_be_restored(self, engine, monkeypatch):
+        monkeypatch.setattr(engine, "_revert_all_to_baseline", lambda **_kw: {0})
+        engine._worker = None
+        engine.shutdown()
+        assert self._session(engine).status != "paused"
+
+
 class TestWorkerLaunch:
     def _real_launch(self, engine, monkeypatch):
         monkeypatch.setattr(engine, "_start_worker", eng.TunerEngine._start_worker.__get__(engine))

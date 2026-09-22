@@ -905,6 +905,17 @@ class TestForceStop:
         tab.force_stop()
         assert tab._engine is None
 
+    def test_exit_shutdown_pauses_instead_of_aborting(self, tab):
+        eng = _engine()
+        tab._engine = eng
+        tab.shutdown()
+        assert eng.shutdown.called
+        assert not eng.abort.called
+
+    def test_exit_shutdown_without_an_engine_is_a_noop(self, tab):
+        tab.shutdown()
+        assert tab._engine is None
+
 
 class TestExternalOwnership:
     def test_external_stress_blocks_all_tuner_actions(self, tab, monkeypatch):

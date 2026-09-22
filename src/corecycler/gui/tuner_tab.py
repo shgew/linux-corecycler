@@ -1126,9 +1126,14 @@ class TunerTab(QWidget):
                 self._start_btn.setToolTip("")
 
     def force_stop(self) -> None:
-        """Force-stop the tuner engine and its worker when the app exits."""
+        """Abort the tuner engine and its worker after an unexpected error."""
         if self._engine:
             self._engine.abort()
+
+    def shutdown(self) -> None:
+        """Stop the tuner for app exit, leaving its session paused and resumable."""
+        if self._engine:
+            self._engine.shutdown()
 
     @property
     def is_running(self) -> bool:

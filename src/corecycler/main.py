@@ -413,7 +413,7 @@ def main() -> int:
 
         try:
             if window._tuner_tab.is_running:
-                window._tuner_tab.force_stop()
+                window._tuner_tab.shutdown()
         except Exception as e:
             print(f"exit cleanup: tuner stop failed: {e}", file=sys.stderr)
 
