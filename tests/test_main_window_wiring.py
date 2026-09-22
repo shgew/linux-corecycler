@@ -605,13 +605,13 @@ class TestCloseEvent:
         assert not worker.terminate.called
         assert event.accept.called
 
-    def test_a_running_tuner_is_force_stopped(self, window, no_modal):
-        window._tuner_tab.force_stop = MagicMock()
+    def test_a_running_tuner_is_stopped_for_exit(self, window, no_modal):
+        window._tuner_tab.shutdown = MagicMock()
         window._tuner_tab._engine = MagicMock(status="running")
         no_modal.question.return_value = no_modal.StandardButton.Yes
         event = MagicMock()
         window.closeEvent(event)
-        assert window._tuner_tab.force_stop.called
+        assert window._tuner_tab.shutdown.called
         assert event.accept.called
 
 

@@ -937,7 +937,7 @@ class MainWindow(QMainWindow):
                 self._worker.finished.disconnect(self._on_worker_finished)
 
         if tuner_running:
-            self._tuner_tab.force_stop()
+            self._tuner_tab.shutdown()
         if memory_running:
             self._memory_tab.force_stop()
 
@@ -957,4 +957,5 @@ class MainWindow(QMainWindow):
         self._msr.close()
         if self._history_db:
             self._history_db.close()
+            self._history_db = None
         event.accept()

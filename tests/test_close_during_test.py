@@ -95,20 +95,21 @@ class TestCloseDuringTest:
         assert db.list_runs(limit=1) == []
         window._worker = None
 
-    def test_close_aborts_a_paused_tuner_with_an_inflight_worker(self, window, no_modal):
+    def test_close_stops_a_paused_tuner_with_an_inflight_worker_without_aborting_it(self, window, no_modal):
         engine = MagicMock()
         engine.status = "paused"
         engine.test_in_flight = True
         window._tuner_tab._engine = engine
         order = []
-        engine.abort.side_effect = lambda: order.append("abort")
+        engine.shutdown.side_effect = lambda: order.append("shutdown")
         close = window._history_db.close
         window._history_db = MagicMock()
         window._history_db.close.side_effect = lambda: order.append("db-close")
         _answer(no_modal, "Yes")
         event = _close(window)
         assert event.accept.called
-        assert order == ["abort", "db-close"]
+        assert order == ["shutdown", "db-close"]
+        assert not engine.abort.called
         close()
 
     def test_answering_no_keeps_everything_alive(self, window, no_modal, db):
@@ -137,7 +138,7 @@ class TestCloseDuringTest:
             raising=False,
         )
         tuner_stop = MagicMock()
-        monkeypatch.setattr(window._tuner_tab, "force_stop", tuner_stop)
+        monkeypatch.setattr(window._tuner_tab, "shutdown", tuner_stop)
         memory_stop = MagicMock()
         monkeypatch.setattr(window._memory_tab, "force_stop", memory_stop)
         window._memory_tab._stress_worker = _running_worker()
@@ -146,6 +147,11 @@ class TestCloseDuringTest:
         assert event.accept.called
         assert tuner_stop.called
         assert memory_stop.called
+
+    def test_signals_delivered_after_close_never_touch_the_closed_database(self, window, db):
+        assert _close(window).accept.called
+        window._on_tuner_running_changed(False)
+        window._on_memory_stress_done(True)
 
 
 class TestWorkerFinishAlive:

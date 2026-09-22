@@ -22,6 +22,12 @@ packaged as a NixOS module with an overlay. Forked from
 - Optional telemetry files the kernel does not expose (`cpuinfo_cur_freq` on most AMD
   systems) are no longer logged on every poll. On a 32-thread machine that noise rotated
   the 20 MB debug log in about six minutes and erased the engine's own lines.
+- Closing the window, or a SIGTERM, SIGINT or SIGHUP, aborted the tuner session, so a
+  paused or running search could never be resumed. Exit now stops the test, restores
+  baselines and leaves the session paused.
+- Closing the window while the tuner was stopping crashed on a signal delivered after the
+  history database had closed. The crash dialog then kept the process, and its
+  single-instance lock, alive, so the next launch refused to start.
 
 ### Added (2026-09-21 senior review)
 
