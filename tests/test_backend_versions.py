@@ -88,6 +88,32 @@ def test_each_mode_produces_its_own_fft_path(mode, tmp_path):
         backend.cleanup(tmp_path)
 
 
+class _NoMCE:
+    def check_mce(self, *, force: bool = False) -> list:
+        return []
+
+
+def test_a_deadline_stop_of_real_mprime_is_a_pass(tmp_path):
+    import threading
+
+    backend = _backend()
+    if containment.available_mechanism(refresh=True) is None:
+        pytest.skip("no systemd cgroup scope available on this host")
+    supervisor = execution.Supervisor(
+        backend=backend,
+        detector=_NoMCE(),
+        thermal=execution.ThermalWatch(max_temperature=95.0, grace_seconds=3.0, hard_margin=8.0, require_sensor=False),
+        stop_event=threading.Event(),
+        observed=[],
+    )
+    lane = execution.Lane(core_id=0, cpus=CPUS, work_dir=tmp_path)
+    try:
+        verdict = supervisor.run([lane], lambda _lane: StressConfig(threads=2), 8.0)[0]
+    finally:
+        backend.cleanup(tmp_path)
+    assert verdict is not None and verdict.passed, verdict
+
+
 def _flags_in_help(binary_key: str, names: tuple[str, ...], flags: set[str]) -> None:
     from corecycler.config import tools
 

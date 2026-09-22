@@ -420,6 +420,29 @@ class TestVerdicts:
         verdict = run_one(supervisor, lane(tmp_path), 0.15)
         assert verdict is not None and verdict.passed
 
+    def test_a_payload_that_exits_cleanly_on_our_sigterm_passes(self, tmp_path):
+        ready = tmp_path / "ready"
+        backend = FakeBackend(
+            _child(
+                "import signal, sys, time; "
+                "signal.signal(signal.SIGTERM, lambda *_: sys.exit(0)); "
+                f"open('{ready}', 'w').close(); time.sleep(60)"
+            )
+        )
+        backend.parse_output = lambda out, err, rc: backend.indefinite_exit_verdict(rc)
+        supervisor, _, _ = make_supervisor(backend, hooks=SuperviseHooks(on_status=lambda *_: wait_for(ready)))
+        verdict = run_one(supervisor, lane(tmp_path), 0.3)
+        assert verdict is not None and verdict.passed, verdict
+
+    def test_a_clean_exit_the_supervisor_did_not_ask_for_proves_nothing(self, tmp_path):
+        backend = FakeBackend(_child("import time; time.sleep(0.3)"))
+        backend.parse_output = lambda out, err, rc: backend.indefinite_exit_verdict(rc)
+        supervisor, _, _ = make_supervisor(backend)
+        with patch.object(execution, "STARTUP_WINDOW_SECONDS", 0.0):
+            verdict = run_one(supervisor, lane(tmp_path), 30.0)
+        assert verdict is not None and not verdict.passed
+        assert "verdict unavailable" in verdict.error_message
+
     def test_an_instant_nonzero_exit_proves_nothing(self, tmp_path):
         backend = FakeBackend(_child("import sys; sys.exit(3)"))
         supervisor, _, _ = make_supervisor(backend)
@@ -976,6 +999,7 @@ class TestHelpers:
         stderr = MagicMock()
         proc = SimpleNamespace(
             pid=4321,
+            returncode=None,
             stdout=stdout,
             stderr=stderr,
             poll=lambda: None,

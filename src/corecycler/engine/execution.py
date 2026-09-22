@@ -86,6 +86,7 @@ class TerminationOutcome:
     sent_signals: tuple[int, ...] = ()
     group_gone: bool = True
     scope_gone: bool = True
+    stopped_running: bool = False
 
     @property
     def all_gone(self) -> bool:
@@ -208,6 +209,7 @@ def kill_process_group(proc: subprocess.Popen, pgid: int | None = None) -> Termi
             pgid = proc.pid
     if pgid != proc.pid:
         raise RuntimeError("Refusing to signal an unowned process group")
+    running = not _exited_without_reaping(proc)
     sent: list[int] = []
     if not _process_group_gone(pgid):
         with contextlib.suppress(ProcessLookupError):
@@ -227,7 +229,11 @@ def kill_process_group(proc: subprocess.Popen, pgid: int | None = None) -> Termi
         if stream:
             with contextlib.suppress(OSError):
                 stream.close()
-    return TerminationOutcome(tuple(sent), group_gone=group_gone)
+    return TerminationOutcome(
+        tuple(sent),
+        group_gone=group_gone,
+        stopped_running=running and signal.SIGTERM in sent,
+    )
 
 
 def _kill_scope(unit: str) -> bool:
@@ -577,6 +583,7 @@ class Supervisor:
                     sent_signals=outcome.sent_signals,
                     group_gone=outcome.group_gone,
                     scope_gone=scope_gone,
+                    stopped_running=outcome.stopped_running,
                 )
                 if not run.termination.all_gone or run.proc.poll() is None:
                     raise RuntimeError("stress process group or containment scope remains alive")
@@ -701,6 +708,9 @@ class Supervisor:
     def _classify_completed(self, run: _LaneRun, elapsed: float, interrupted: bool) -> StressResult | None:
         returncode = run.proc.returncode if run.proc is not None else 0
         returncode = returncode if returncode is not None else 0
+        if returncode == 0 and run.termination is not None and run.termination.stopped_running:
+            # mprime traps SIGTERM and exits 0 after a clean shutdown; that is still our stop.
+            returncode = -signal.SIGTERM
         live_error = self.backend.poll_errors(run.lane.work_dir)
         if live_error:
             return StressResult(

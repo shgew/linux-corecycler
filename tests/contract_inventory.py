@@ -169,6 +169,30 @@ def _pin_mprime_31x_config_keys() -> None:
     )
 
 
+def _pin_mprime_sigterm_clean_exit() -> None:
+    from types import SimpleNamespace
+
+    from corecycler.engine.backends.mprime import MprimeBackend
+    from corecycler.engine.execution import Lane, Supervisor, TerminationOutcome, _LaneRun
+
+    with tempfile.TemporaryDirectory() as tmp:
+        supervisor = Supervisor(
+            backend=MprimeBackend(),
+            detector=MagicMock(),
+            thermal=MagicMock(),
+            stop_event=MagicMock(),
+            observed=[],
+        )
+        verdicts = {}
+        for stopped_running in (True, False):
+            run = _LaneRun(lane=Lane(core_id=0, cpus=(0,), work_dir=Path(tmp)))
+            run.proc = SimpleNamespace(returncode=0)
+            run.termination = TerminationOutcome((15,), stopped_running=stopped_running)
+            verdicts[stopped_running] = supervisor._classify_completed(run, 60.0, interrupted=False)
+    assert verdicts[True] is not None and verdicts[True].passed, verdicts[True]
+    assert verdicts[False] is not None and not verdicts[False].passed, verdicts[False]
+
+
 def _pin_proc_cpus_allowed_list() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         task = Path(tmp) / "77" / "task" / "77"
@@ -402,6 +426,18 @@ CONTRACTS: list[Contract] = [
         ring_a=_pin_mprime_31x_config_keys,
         live_verifiable=True,
         ring_b_test=("test_backend_versions.py::test_each_mode_produces_its_own_fft_path"),
+    ),
+    Contract(
+        name="mprime-sigterm-clean-exit",
+        kind="tool",
+        source=(
+            "mprime 31.04 build 2 traps SIGTERM, prints 'Torture Test completed ... Execution "
+            "halted' and exits 0, verified live 2026-09-22; the supervisor's deadline stop must "
+            "read that as its own stop, not as an unexplained exit"
+        ),
+        ring_a=_pin_mprime_sigterm_clean_exit,
+        live_verifiable=True,
+        ring_b_test="test_backend_versions.py::test_a_deadline_stop_of_real_mprime_is_a_pass",
     ),
     Contract(
         name="proc-cpus-allowed-list",
