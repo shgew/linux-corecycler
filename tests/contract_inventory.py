@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 from corecycler.config import tools
 from corecycler.engine import containment
 from corecycler.engine.backends import BACKEND_REGISTRY, load_all, ycruncher
+from corecycler.engine.backends.base import StressConfig
 from corecycler.monitor.cpu_usage import read_cpu_times
 from corecycler.monitor.memory import parse_dmidecode_output
 from corecycler.monitor.msr import (
@@ -341,6 +342,27 @@ def _pin_ycruncher_component_tests() -> None:
     assert sorted(ycruncher.VALID_COMPONENT_TESTS) == ["BBP", "BKT", "FFTv4", "N63", "SFTv4", "SNT", "SVT", "VT3"]
 
 
+def _pin_ycruncher_stress_config() -> None:
+    rendered = ycruncher.render_config(StressConfig(cpus=(15, 31), tests=("FFTv4", "N63"), test_seconds=30))
+    assert rendered == (
+        "{\n"
+        '    Action : "StressTest"\n'
+        "    StressTest : {\n"
+        '        AllocateLocally : "true"\n'
+        "        LogicalCores : [15 31]\n"
+        "        TotalMemory : 67108864\n"
+        "        SecondsPerTest : 30\n"
+        "        SecondsTotal : 0\n"
+        '        StopOnError : "true"\n'
+        "        Tests : [\n"
+        '            "FFTv4"\n'
+        '            "N63"\n'
+        "        ]\n"
+        "    }\n"
+        "}\n"
+    )
+
+
 def _pin_external_tool_discovery() -> None:
     assert tools.env_var("y-cruncher") == "CORECYCLER_Y_CRUNCHER_BIN"
     assert tools.env_var("stress-ng") == "CORECYCLER_STRESS_NG_BIN"
@@ -504,10 +526,22 @@ CONTRACTS: list[Contract] = [
     Contract(
         name="ycruncher-component-tests",
         kind="tool",
-        source="y-cruncher component stress-test identifiers accepted by its stress command",
+        source="y-cruncher component stress-test identifiers accepted in a stress-test config file",
         ring_a=_pin_ycruncher_component_tests,
         live_verifiable=True,
         ring_b_test=("test_ycruncher_binary.py::TestYCruncherBinaryContract::test_valid_component_test_still_accepted"),
+    ),
+    Contract(
+        name="ycruncher-stress-config",
+        kind="tool",
+        source=(
+            "y-cruncher 'config' stress-test object: LogicalCores pins one thread per listed CPU, "
+            "TotalMemory is bytes split across those threads, SecondsTotal 0 runs until killed; "
+            "the 'stress' command line has no thread option and pins a thread to every machine CPU"
+        ),
+        ring_a=_pin_ycruncher_stress_config,
+        live_verifiable=True,
+        ring_b_test="test_ycruncher_binary.py::TestYCruncherBinaryContract::test_config_keeps_every_thread_on_a_contained_lane",
     ),
     Contract(
         name="external-tool-discovery",

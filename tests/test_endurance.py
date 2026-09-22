@@ -227,6 +227,28 @@ class TestAllCoreWorkloadLaunch:
         assert runners[0]["backend"] is eng._backend
         assert worker.start.called
 
+    def test_a_memory_coupled_workload_reaches_every_lane(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
+        eng = self._engine(db, topo_dual_ccd_x3d, mock_backend)
+        monkeypatch.setattr(engine_module, "_ParallelWorker", MagicMock(return_value=MagicMock()))
+        runners = []
+        monkeypatch.setattr(engine_module, "ParallelStress", lambda **kw: runners.append(kw) or MagicMock())
+
+        eng._start_multi_core_worker(
+            ORDER,
+            600,
+            workload={
+                "regime": "coupled",
+                "backend": "mprime",
+                "stress_mode": "AVX2",
+                "fft_preset": "LARGE",
+                "threads": 2,
+                "profile": "sustained",
+                "memory_coupled": True,
+            },
+        )
+
+        assert runners[0]["stress_config"].memory_coupled is True
+
     def test_an_unknown_workload_mode_is_an_apparatus_fault(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
         eng = self._engine(db, topo_dual_ccd_x3d, mock_backend)
         failed = []

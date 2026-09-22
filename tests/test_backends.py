@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from corecycler.engine.backends.base import (
 from corecycler.engine.backends.mprime import FFT_RANGES, MODE_TO_CPU_FLAGS, MprimeBackend
 from corecycler.engine.backends.stress_ng import StressNgBackend, _mode_to_method
 from corecycler.engine.backends.ycruncher import MODE_TO_ALGORITHMS, VALID_COMPONENT_TESTS, YCruncherBackend
+from corecycler.engine.execution import classify_error
 
 
 def test_backend_registry_is_available_without_explicit_loading():
@@ -660,84 +662,90 @@ class TestYCruncherBackend:
         on_path({})
         assert YCruncherBackend().is_available() is False
 
-    def test_get_command_sse_selects_scalar_algorithm(self, tmp_path):
+    def _render(self, work_dir: Path, **overrides) -> str:
+        config = StressConfig(**{"cpus": (15, 31), "threads": 2, **overrides})
+        YCruncherBackend().prepare(work_dir, config)
+        return (work_dir / "stress.cfg").read_text()
+
+    @staticmethod
+    def _field(text: str, key: str) -> str:
+        match = re.search(rf"^\s*{key} : (.+)$", text, re.MULTILINE)
+        assert match, f"{key} missing from:\n{text}"
+        return match.group(1)
+
+    @staticmethod
+    def _tests(text: str) -> list[str]:
+        return re.findall(r'"(\w+)"', text[text.index("Tests :") :])
+
+    def test_command_runs_the_prepared_config_headless(self, tmp_path):
         backend = YCruncherBackend()
         backend._binary = "/bin/y-cruncher"
-        cmd = backend.get_command(StressConfig(mode=StressMode.SSE), tmp_path)
+        cmd = backend.get_command(StressConfig(cpus=(0,)), tmp_path)
         assert cmd == [
             "/bin/y-cruncher",
             "skip-warnings",
             "pause:-2",
             "status:none",
-            "stress",
-            "-M:1024M",
-            "-D:30",
-            "BKT",
+            "config",
+            str(tmp_path / "stress.cfg"),
         ]
 
-    def test_get_command_avx2_uses_curve_optimizer_algorithms(self, tmp_path):
-        backend = YCruncherBackend()
-        backend._binary = "/bin/y-cruncher"
-        cmd = backend.get_command(StressConfig(mode=StressMode.AVX2), tmp_path)
-        assert cmd == [
-            "/bin/y-cruncher",
-            "skip-warnings",
-            "pause:-2",
-            "status:none",
-            "stress",
-            "-M:1024M",
-            "-D:30",
-            "BKT",
-            "FFTv4",
-            "N63",
-            "VT3",
-        ]
+    def test_config_runs_one_thread_on_each_lane_cpu(self, tmp_path):
+        """The stress command sizes its pool from the machine topology and
+        ignores the cpuset, so only LogicalCores keeps it on the lane."""
+        assert self._field(self._render(tmp_path), "LogicalCores") == "[15 31]"
 
-    def test_get_command_uses_explicit_component_tests(self, tmp_path: Path) -> None:
-        backend = YCruncherBackend()
-        backend._binary = "/bin/y-cruncher"
-        cmd = backend.get_command(StressConfig(mode=StressMode.AVX2, tests=("BKT", "VT3")), tmp_path)
-        assert cmd[-2:] == ["BKT", "VT3"]
+    def test_a_config_without_lane_cpus_is_refused(self, tmp_path):
+        with pytest.raises(RuntimeError, match="lane CPUs"):
+            YCruncherBackend().prepare(tmp_path, StressConfig())
+        assert not (tmp_path / "stress.cfg").exists()
 
-    def test_get_command_rejects_unknown_component_tests(self, tmp_path: Path) -> None:
-        backend = YCruncherBackend()
-        backend._binary = "/bin/y-cruncher"
+    @pytest.mark.parametrize(
+        ("mode", "expected"),
+        [(StressMode.SSE, ["BKT"]), (StressMode.AVX2, ["BKT", "FFTv4", "N63", "VT3"])],
+    )
+    def test_mode_selects_default_component_tests(self, tmp_path, mode, expected):
+        assert self._tests(self._render(tmp_path, mode=mode)) == expected
+
+    def test_explicit_component_tests_win(self, tmp_path):
+        assert self._tests(self._render(tmp_path, mode=StressMode.AVX2, tests=("BKT", "VT3"))) == ["BKT", "VT3"]
+
+    def test_unknown_component_tests_are_rejected(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError) as exc_info:
-            backend.get_command(StressConfig(tests=("UNKNOWN", "BKT", "BAD")), tmp_path)
+            YCruncherBackend().prepare(tmp_path, StressConfig(cpus=(0,), tests=("UNKNOWN", "BKT", "BAD")))
         assert str(exc_info.value) == "Unknown y-cruncher component test(s): BAD, UNKNOWN"
 
-    def test_get_command_validates_component_tests_before_resolving_binary(self, tmp_path: Path, on_path) -> None:
-        on_path({})
-        with pytest.raises(ValueError, match="Unknown y-cruncher component test"):
-            YCruncherBackend().get_command(StressConfig(tests=("UNKNOWN",)), tmp_path)
+    def test_a_mode_with_no_component_tests_is_refused(self, tmp_path):
+        with pytest.raises(RuntimeError, match="no y-cruncher component tests"):
+            YCruncherBackend().prepare(tmp_path, StressConfig(cpus=(0,), mode=StressMode.CUSTOM))
 
-    @pytest.mark.parametrize(("test_seconds", "duration_arg"), [(45, "-D:45"), (0, "-D:1")])
-    def test_get_command_uses_clamped_test_duration(self, tmp_path: Path, test_seconds: int, duration_arg: str) -> None:
-        backend = YCruncherBackend()
-        backend._binary = "/bin/y-cruncher"
-        cmd = backend.get_command(StressConfig(test_seconds=test_seconds), tmp_path)
-        assert duration_arg in cmd
+    @pytest.mark.parametrize(("test_seconds", "expected"), [(None, "30"), (45, "45"), (0, "1")])
+    def test_each_test_runs_for_the_clamped_slot_share(self, tmp_path, test_seconds, expected):
+        text = self._render(tmp_path, test_seconds=test_seconds)
+        assert self._field(text, "SecondsPerTest") == expected
+        assert self._field(text, "SecondsTotal") == "0"
+        assert self._field(text, "StopOnError") == '"true"'
 
-    def test_get_command_is_headless_never_blocks(self, tmp_path):
-        backend = YCruncherBackend()
-        backend._binary = "/bin/y-cruncher"
-        cmd = backend.get_command(StressConfig(mode=StressMode.AVX), tmp_path)
-        assert "skip-warnings" in cmd
-        assert "pause:-2" in cmd
-        assert cmd.index("skip-warnings") < cmd.index("stress")
-        assert cmd.index("pause:-2") < cmd.index("stress")
+    def test_memory_stays_cache_sized_per_thread(self, tmp_path):
+        assert self._field(self._render(tmp_path), "TotalMemory") == str(2 * 32 * 1024 * 1024)
 
-    def test_get_command_memory_override(self, tmp_path):
-        backend = YCruncherBackend()
-        backend._binary = "/bin/y-cruncher"
-        cmd = backend.get_command(StressConfig(mode=StressMode.SSE, memory_mb=2048), tmp_path)
-        assert "-M:2048M" in cmd
+    def test_a_memory_coupled_workload_spills_past_the_cache(self, tmp_path):
+        text = self._render(tmp_path, memory_coupled=True)
+        assert self._field(text, "TotalMemory") == str(2 * 256 * 1024 * 1024)
 
-    def test_get_command_no_binary_raises(self, tmp_path, on_path):
+    def test_an_explicit_memory_budget_wins(self, tmp_path):
+        text = self._render(tmp_path, memory_mb=2048, memory_coupled=True)
+        assert self._field(text, "TotalMemory") == str(2048 * 1024 * 1024)
+
+    def test_a_launch_without_its_config_is_refused(self, tmp_path):
+        with pytest.raises(OSError, match="stress.cfg"):
+            YCruncherBackend().assert_prepared(tmp_path)
+
+    def test_no_binary_raises(self, tmp_path, on_path):
         on_path({})
         backend = YCruncherBackend()
         with pytest.raises(RuntimeError, match="y-cruncher binary not found"):
-            backend.get_command(StressConfig(), tmp_path)
+            backend.get_command(StressConfig(cpus=(0,)), tmp_path)
 
     def test_get_supported_modes(self):
         backend = YCruncherBackend()
@@ -752,7 +760,6 @@ class TestYCruncherBackend:
         backend = YCruncherBackend()
         assert backend.instruction_set(config) is None
         assert backend.workload(config) == ("N63",)
-        assert backend.default_memory_mb(4) == 256
 
     def test_parse_real_pass_output_not_false_flagged(self):
         backend = YCruncherBackend()
@@ -771,6 +778,16 @@ class TestYCruncherBackend:
         passed, msg = backend.parse_output(_CAPTURED_PASS_OUTPUT, "", 0)
         assert not passed
         assert "verdict unavailable" in msg
+
+    def test_parse_unpinnable_thread_is_a_harness_fault_not_instability(self):
+        """A thread y-cruncher cannot pin prints 'Failed ...' and still passes
+        every test; that is a lane/config mismatch, never the core's verdict."""
+        out = _CAPTURED_PASS_OUTPUT.replace(
+            "Allocating Memory...", "Failed to set core affinity to core: 14\nAllocating Memory..."
+        )
+        passed, msg = YCruncherBackend().parse_output(out, "", -15)
+        assert not passed
+        assert classify_error(msg) == "startup"
 
     @pytest.mark.parametrize(("stdout", "stderr"), [("Checksum mismatch", ""), ("", "Checksum mismatch")])
     def test_parse_checksum_mismatch_after_scheduler_kill(self, stdout, stderr):
@@ -815,11 +832,10 @@ class TestYCruncherBackend:
         assert "exited with code 7" in msg
         assert "verdict unavailable" in msg
 
-    def test_prepare(self, tmp_path):
-        backend = YCruncherBackend()
+    def test_prepare_creates_the_work_dir(self, tmp_path):
         work = tmp_path / "ycruncher_work"
-        backend.prepare(work, StressConfig())
-        assert work.exists()
+        YCruncherBackend().prepare(work, StressConfig(cpus=(0,)))
+        assert (work / "stress.cfg").is_file()
 
     def test_cleanup_noop(self, tmp_path):
         backend = YCruncherBackend()

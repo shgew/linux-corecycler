@@ -28,6 +28,21 @@ packaged as a NixOS module with an overlay. Forked from
   workload to each test-log line, and shows the build that created the session.
 - `hunting`, `platform_fault` and `profile_quarantined` have status labels and colors.
 
+### Fixed (2026-09-22 every contained y-cruncher run failed)
+
+- y-cruncher's `stress` command line has no thread option. It ignored the lane's cpuset,
+  started one thread per machine CPU on the lane's two CPUs, and printed "Failed to set
+  core affinity" for every other CPU. That line matched the backend's generic `Failed`
+  pattern, so every tuner y-cruncher slot was recorded as an instability FAIL no matter
+  the offset. y-cruncher now runs a config file written per lane. `LogicalCores` lists
+  exactly the lane's CPUs, which the supervisor passes to the backend as
+  `StressConfig.cpus`, and a launch without them is refused. A thread that still cannot
+  be pinned is a harness fault, not a verdict on the core.
+- y-cruncher memory is sized per thread. It is 32 MiB, so a lane stays in one CCD's L3,
+  or 256 MiB for `memory_coupled` workloads, so the coupled regime reaches DRAM. The
+  `memory_coupled` workload flag now reaches the backend. Before, the coupled y-cruncher
+  workload was cache-resident.
+
 ### Fixed (2026-09-22 every y-cruncher slot paused the tuner)
 
 - The default battery named its y-cruncher workloads `ycruncher`, but the backend is

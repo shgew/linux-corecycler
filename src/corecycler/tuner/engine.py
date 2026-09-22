@@ -3243,11 +3243,13 @@ class TunerEngine(QObject):
         except KeyError:
             _fft_preset = FFTPreset.SMALL
 
-        tests = (self._active_workload(cs) or {}).get("tests")
+        active = self._active_workload(cs) or {}
+        tests = active.get("tests")
         stress_config = StressConfig(
             mode=_stress_mode,
             fft_preset=_fft_preset,
             threads=self._threads_for(core_id, requested_threads),
+            memory_coupled=bool(active.get("memory_coupled")),
             tests=tuple(tests) if tests else None,
             duty_cycle=duty_cycle,
             test_seconds=max(1, duration // len(tests)) if tests else None,
@@ -3280,7 +3282,7 @@ class TunerEngine(QObject):
             self._fail_test_async(core_id, str(e))
             return
 
-        regime = self._active_regime(cs) or str((self._active_workload(cs) or {}).get("regime", "primary"))
+        regime = self._active_regime(cs) or str(active.get("regime", "primary"))
         logical_cpu = core_info.logical_cpus[0] if core_info.logical_cpus else core_id
         worker = _TunerWorker(
             core_id,
@@ -4579,6 +4581,7 @@ class TunerEngine(QObject):
                     fft_preset=FFTPreset[workload["fft_preset"].upper()],
                     threads=self._threads_for(cores[0], workload.get("threads")),
                     memory_mb=memory_mb,
+                    memory_coupled=bool(workload.get("memory_coupled")),
                     tests=tuple(tests) if tests else None,
                     test_seconds=max(1, duration // len(tests)) if tests else None,
                     duty_cycle=duty,

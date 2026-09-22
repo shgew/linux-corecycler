@@ -871,6 +871,20 @@ class TestWorkerLaunch:
         assert scheduler.stress_config.mode is StressMode.AVX2
         assert scheduler.stress_config.fft_preset is FFTPreset.SMALL
 
+    def test_a_memory_coupled_workload_reaches_the_backend(self, engine, monkeypatch):
+        _worker, factory = self._real_launch(engine, monkeypatch)
+        coupled = {
+            "regime": "coupled",
+            "backend": "mprime",
+            "stress_mode": "AVX2",
+            "fft_preset": "LARGE",
+            "threads": 2,
+            "memory_coupled": True,
+        }
+        monkeypatch.setattr(engine, "_active_workload", lambda _cs: coupled)
+        engine._start_worker(0, 1)
+        assert factory.call_args.args[2].stress_config.memory_coupled is True
+
     def test_an_unbuildable_scheduler_is_an_apparatus_fault(self, engine, monkeypatch):
         worker, _factory = self._real_launch(engine, monkeypatch)
 

@@ -278,7 +278,7 @@ class TestBackendSafety:
     def test_ycruncher_prepare_stays_in_work_dir(self, tmp_path):
         work = tmp_path / "work"
         backend = YCruncherBackend()
-        backend.prepare(work, StressConfig())
+        backend.prepare(work, StressConfig(cpus=(0,)))
         assert work.exists()
 
     def test_mprime_prepare_doesnt_clobber_existing(self, tmp_path):

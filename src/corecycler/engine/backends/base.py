@@ -71,6 +71,7 @@ class StressConfig:
     fft_max: int | None = None
     threads: int = 1
     memory_mb: int | None = None  # for linpack-style tests
+    memory_coupled: bool = False
     # Backend-specific algorithm selection (y-cruncher component tests). None
     # means the backend picks; an explicit tuple is what per-regime confidence
     # accounting requires, since "whatever the tool defaults to" is not a
@@ -78,6 +79,9 @@ class StressConfig:
     tests: tuple[str, ...] | None = None
     duty_cycle: DutyCycle | None = None
     test_seconds: int | None = None
+    # The CPUs the lane's cpuset confines the payload to. The supervisor sets
+    # it at launch, so a backend that pins its own threads names only these.
+    cpus: tuple[int, ...] = ()
 
 
 @dataclass(slots=True)

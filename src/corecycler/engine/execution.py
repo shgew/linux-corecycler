@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING
 
 from corecycler.config import tools
@@ -367,6 +367,7 @@ class Supervisor:
 
     def _launch(self, run: _LaneRun, cfg: StressConfig, batch_start: float) -> bool:
         lane = run.lane
+        cfg = replace(cfg, cpus=lane.cpus)
         try:
             self.backend.prepare(lane.work_dir, cfg)
             self.backend.assert_prepared(lane.work_dir)

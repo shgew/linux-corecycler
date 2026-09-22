@@ -1170,6 +1170,26 @@ class TestContainment:
         with pytest.raises(containment.ContainmentUnavailable):
             containment.contain(())
 
+    def test_the_backend_is_told_which_cpus_its_lane_is_confined_to(self, tmp_path):
+        """A backend that pins its own threads must name exactly the cpuset's
+        CPUs; any other id is a thread the kernel refuses to place."""
+        seen: list[tuple[str, tuple[int, ...]]] = []
+
+        class Recording(FakeBackend):
+            def prepare(self, work_dir, config):
+                seen.append(("prepare", config.cpus))
+                super().prepare(work_dir, config)
+
+            def get_command(self, config, work_dir):
+                seen.append(("command", config.cpus))
+                return super().get_command(config, work_dir)
+
+        shared = StressConfig()
+        supervisor, _, _ = make_supervisor(Recording(_child("pass")))
+        supervisor.run([lane(tmp_path, cpus=(15, 31))], lambda _lane: shared, 5.0)
+        assert seen == [("prepare", (15, 31)), ("command", (15, 31))]
+        assert shared.cpus == ()
+
     def test_contain_refuses_when_no_mechanism_probes(self):
         with (
             patch.object(containment, "available_mechanism", return_value=None),
