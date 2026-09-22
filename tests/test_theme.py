@@ -31,7 +31,6 @@ QUIET_STATES = ("pending", "queued", "skipped")
 VERDICT_STATUSES = (
     "completed",
     "crashed",
-    "quarantined",
     "profile_quarantined",
     "platform_fault",
     "stopped",

@@ -26,6 +26,7 @@ EXIT_REFUSED = 5
 EXIT_ENGINE_ABORTED = 6
 EXIT_LOCKED = 7
 EXIT_HISTORY = 8
+EXIT_PLATFORM_FAULT = 9
 EXIT_SIGNAL = 130
 # How often the paused engine is checked for a still-running test, and how
 # often the Qt loop yields to Python so a pending signal handler can run.
@@ -384,7 +385,7 @@ def _cmd_run(
         if source is None:
             print(f"corecycler: session {seed_from} not found", file=sys.stderr)
             return EXIT_REFUSED
-        if source.status == "quarantined":
+        if source.status == "profile_quarantined":
             print(
                 f"corecycler: session {seed_from} is quarantined and cannot seed a new search",
                 file=sys.stderr,
@@ -439,7 +440,7 @@ def _cmd_run(
                 file=sys.stderr,
             )
             return EXIT_REFUSED
-        if session.status == "quarantined":
+        if session.status == "profile_quarantined":
             print("corecycler: --config cannot be applied to a quarantined session", file=sys.stderr)
             return EXIT_REFUSED
 
@@ -522,8 +523,10 @@ def _cmd_run(
     def on_status(status: str) -> None:
         if status == "paused":
             settle_paused()
-        elif status == "quarantined":
+        elif status == "profile_quarantined":
             finish(EXIT_QUARANTINED)
+        elif status == "platform_fault":
+            finish(EXIT_PLATFORM_FAULT)
         elif status == "idle":
             finish(EXIT_ENGINE_ABORTED)
 
@@ -572,6 +575,7 @@ _OUTCOME_NOTES = {
     EXIT_COMPLETED: ("Tuning complete", "The session finished and confirmed a profile.", "normal"),
     EXIT_PAUSED: ("Tuning paused", "The tuner stopped for attention - check the log.", "critical"),
     EXIT_QUARANTINED: ("Tuning quarantined", "The profile is unsafe; cores forced to stock.", "critical"),
+    EXIT_PLATFORM_FAULT: ("Platform fault", "The machine fails at stock; offsets are not the cause.", "critical"),
     EXIT_ENGINE_ABORTED: ("Tuning aborted", "The engine stopped itself - check the log.", "critical"),
 }
 

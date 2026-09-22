@@ -308,7 +308,7 @@ TUNER_REGIME_BANKS = TableSpec(
 class HistoryDB:
     """Crash-safe SQLite database for test run history."""
 
-    SCHEMA_VERSION = 21
+    SCHEMA_VERSION = 22
     TUNER_CONTRACT_VERSION = 16
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
@@ -1086,6 +1086,9 @@ CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
             conn.execute("ALTER TABLE tuner_sessions DROP COLUMN hunting_core")
         HistoryDB._add_columns(conn, "tuner_core_states", [("proven_offset", "INTEGER")])
 
+    # v21 -> v22: the engine renamed "quarantined" to "profile_quarantined".
+    _DDL_MIGRATE_V22 = "UPDATE tuner_sessions SET status='profile_quarantined' WHERE status='quarantined';"
+
     _MIGRATIONS: dict[int, str | callable] = {
         2: _migrate_v2,
         3: _DDL_MIGRATE_V3,
@@ -1107,6 +1110,7 @@ CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
         19: _migrate_v19,
         20: _migrate_v20,
         21: _migrate_v21,
+        22: _DDL_MIGRATE_V22,
     }
 
     # ------------------------------------------------------------------

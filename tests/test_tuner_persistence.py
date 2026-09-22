@@ -532,7 +532,7 @@ class TestSchemaV15Narrative:
             assert tp.pick_auto_resume_session(db).id == sid
             db.update_tuner_session_status(sid, "paused")
             assert tp.pick_auto_resume_session(db) is None  # human choice
-            db.update_tuner_session_status(sid, "quarantined")
+            db.update_tuner_session_status(sid, "profile_quarantined")
             assert tp.pick_auto_resume_session(db) is None
         finally:
             db.close()

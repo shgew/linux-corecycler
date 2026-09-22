@@ -282,7 +282,7 @@ def drive(
                 return
 
     def cleanly_converged(e: TunerEngine) -> bool:
-        if e._hunting or e.status in ("hunting", "paused", "quarantined", "aborted"):
+        if e._hunting or e.status in ("hunting", "paused", "profile_quarantined", "aborted"):
             return False
         if e._validation_stage != 9 or e._validation_dirty:
             return False
@@ -335,7 +335,7 @@ def drive(
         terminal_reason = TerminalReason.STEP_CAP
     elif final._hunting or final.status == "hunting":
         terminal_reason = TerminalReason.HUNTING
-    elif final.status in ("paused", "quarantined", "aborted"):
+    elif final.status in ("paused", "profile_quarantined", "aborted"):
         terminal_reason = TerminalReason.PAUSED
     elif clean:
         terminal_reason = TerminalReason.CLEAN_CONVERGED

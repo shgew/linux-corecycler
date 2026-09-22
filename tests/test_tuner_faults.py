@@ -1036,7 +1036,7 @@ class TestClosedLoopSimulation:
         assert steps < 6000, f"did not converge ({order})"
         assert crashes >= 1, "no hard crash was exercised - simulation is vacuous"
         assert settled_for == 200, "simulation stopped before the live vector held steady"
-        assert eng.status not in ("paused", "quarantined")
+        assert eng.status not in ("paused", "profile_quarantined")
         # The learned live vector, not the next in-flight probe, must be safe.
         resident = eng.live_vector()
         for c, (_stable, crash) in cliffs.items():
@@ -1083,7 +1083,7 @@ class TestIntermittentInstability:
         )
         assert steps < 8000
         assert crashes >= 1, "the intermittent crash never fired -- the test is vacuous"
-        assert eng.status not in ("paused", "quarantined")
+        assert eng.status not in ("paused", "profile_quarantined")
         resident = eng.live_vector().get(0, 0)
         assert crashed_at[0], "no crash recorded -- vacuous"
         worst = max(crashed_at[0])  # least-aggressive offset that hard-crashed
@@ -1123,7 +1123,9 @@ class TestIntermittentInstability:
             eng, steps, crashes, crashed_at, sid = drive_intermittent(db, topo, _StubBackend(), cliffs, flaky, cfg_kw)
 
             assert steps < 8000, f"no convergence: cliffs={cliffs} flaky={flaky}"
-            assert eng.status not in ("paused", "quarantined"), f"stuck in {eng.status}: cliffs={cliffs} flaky={flaky}"
+            assert eng.status not in ("paused", "profile_quarantined"), (
+                f"stuck in {eng.status}: cliffs={cliffs} flaky={flaky}"
+            )
             resident = eng.live_vector()
             for c in cliffs:
                 if not crashed_at[c]:
@@ -1476,7 +1478,7 @@ class TestValidationFuzz:
             eng, steps = drive_validation(db, topo, _StubBackend(), cliffs, agg_margin, cfg_kw)
 
             assert steps < 8000, f"validation did not converge: cliffs={cliffs} margin={agg_margin}"
-            assert eng.status not in ("paused", "quarantined"), f"validation stuck in {eng.status}"
+            assert eng.status not in ("paused", "profile_quarantined"), f"validation stuck in {eng.status}"
             for c, (stable, crash) in cliffs.items():
                 best = eng._core_states[c].best_offset
                 assert best is not None
@@ -1580,7 +1582,7 @@ class TestValidationFaultInjection:
             eng, steps = drive_validation(db, topo, _StubBackend(), cliffs, 0, cfg_kw, faults=faults)
 
             assert steps < 8000, f"did not terminate: faults={faults}"
-            assert eng.status in ("idle", "paused", "running", "validating", "quarantined"), eng.status
+            assert eng.status in ("idle", "paused", "running", "validating", "profile_quarantined"), eng.status
             for c, (stable, crash) in cliffs.items():
                 best = eng._core_states[c].best_offset
                 assert best is not None

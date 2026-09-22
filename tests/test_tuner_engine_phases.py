@@ -417,6 +417,16 @@ class TestHuntSlots:
         persisted = bisect.HuntState.from_json(engine._db.get_tuner_session(engine._session_id).hunt_state)
         assert persisted == engine._hunt
 
+    def test_evidence_on_a_stock_core_requeues_the_probe_and_pauses(self, engine, monkeypatch):
+        live = self._probing(engine)
+        engine._run_next_hunt_slot()
+        monkeypatch.setattr(eng.QTimer, "singleShot", lambda _ms, _fn: None)
+        engine._on_hunt_slot_finished(0, True, "", {2: {"source": "mce"}})
+        assert engine.status == "paused"
+        assert engine._hunt.stage is bisect.Stage.PROBE
+        assert engine._hunt.in_flight == []
+        assert engine._hunt.queue[0] == live
+
 
 class TestApparatusFault:
     def test_a_fault_retries_the_same_step(self, engine, monkeypatch):

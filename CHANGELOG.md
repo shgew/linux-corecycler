@@ -37,6 +37,19 @@ packaged as a NixOS module with an overlay. Forked from
   endurance workload whose backend is not registered, so a bad name is refused before a
   session starts instead of mid-search.
 
+### Fixed (2026-09-22 the CLI never saw a quarantine)
+
+- The senior review pass renamed the engine's `quarantined` status to
+  `profile_quarantined`, but the CLI still compared against the old name. `tune
+  --seed-from` accepted a quarantined session as a seed, `resume --config` could replace
+  a quarantined session's config, and a quarantine mid-run never produced exit 4. All
+  three now use the engine's status. The History tab's quarantine count had the same
+  mismatch and always showed 0.
+- A headless run that ended in a platform fault never exited, because the CLI ignored
+  the `platform_fault` status. It now exits 9 and sends a "Platform fault" notification.
+- Schema v22 renames sessions stored as `quarantined` by older builds to
+  `profile_quarantined`, so they stay refused as seeds.
+
 ### Fixed (2026-09-22 every mprime test paused the tuner)
 
 - mprime traps SIGTERM, shuts its workers down and exits 0. Since the senior review pass

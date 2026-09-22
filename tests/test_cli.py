@@ -15,7 +15,7 @@ _sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 if not hasattr(_sys.modules.get("PySide6", None), "__path__"):
     pytest.skip("CLI tests require real PySide6", allow_module_level=True)
 
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QCoreApplication, QObject, QTimer, Signal
 from PySide6.QtWidgets import QApplication
 
 from corecycler import __version__, cli
@@ -83,8 +83,14 @@ class FakeEngine(QObject):
             self.status = "paused"
             self.status_changed.emit("paused")
         elif self.behavior == "quarantines":
-            self.status = "quarantined"
-            self.status_changed.emit("quarantined")
+            self.status = "profile_quarantined"
+            self.status_changed.emit("profile_quarantined")
+        elif self.behavior == "platform_faults":
+            self.status = "hunting"
+            QTimer.singleShot(0, lambda: self.status_changed.emit("platform_fault"))
+            self.hang_guard = QTimer(self, singleShot=True, interval=1000)
+            self.hang_guard.timeout.connect(QCoreApplication.quit)
+            self.hang_guard.start()
         elif self.behavior == "aborts":
             self.status = "idle"
             self.status_changed.emit("idle")
@@ -490,7 +496,7 @@ class TestSeedFrom:
 
     def test_a_quarantined_source_is_rejected_before_reading_offsets(self, db, monkeypatch, capsys):
         sid = self._prior(db, {0: -30})
-        db.update_tuner_session_status(sid, "quarantined")
+        db.update_tuner_session_status(sid, "profile_quarantined")
         monkeypatch.setattr(
             db,
             "get_tuner_session_offsets",
@@ -628,6 +634,11 @@ class TestRunOutcomes:
         code, _ = self._run(db, "quarantines")
         assert code == cli.EXIT_QUARANTINED
 
+    def test_platform_fault_ends_the_run_with_its_own_exit(self, db):
+        code, engine = self._run(db, "platform_faults")
+        engine.hang_guard.stop()
+        assert code == cli.EXIT_PLATFORM_FAULT
+
     def test_engine_refusal_maps_to_refused_exit(self, db):
         code, _ = self._run(db, "refuses")
         assert code == cli.EXIT_REFUSED
@@ -760,7 +771,7 @@ class TestResumeConfigOverride:
 
     def test_a_quarantined_session_is_refused(self, db, tmp_path, capsys):
         sid = self._resumable_session(db)
-        db.update_tuner_session_status(sid, "quarantined")
+        db.update_tuner_session_status(sid, "profile_quarantined")
         before = db.get_tuner_session(sid).config_json
         code = cli.cmd_run(
             self._cfg_file(tmp_path, endurance=True),

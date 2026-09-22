@@ -167,7 +167,7 @@ bound recovery:
    hunt culprit does. After `resume_crash_quarantine_threshold` (default 3) the tuner
    does not dead-end: it starts the attribution hunt, whose first probe runs every
    core at CO=0. If the machine dies there too, the fault is not in the offsets and
-   the tuner says so. `quarantined` is now reserved for the one case it always meant
+   the tuner says so. `profile_quarantined` is now reserved for the one case it always meant
    literally: stock restoration itself failed, so offsets may still be resident.
 
 An interrupted session is detected on next launch and offered for resume. Resume
@@ -308,7 +308,8 @@ The status is the session's flow, and the CLI exit code follows it.
 | `validating` | Multi-core validation stages, or an endurance round | -- |
 | `hunting` | Attribution hunt: who crashed the machine | -- |
 | `paused` | Stopped on an instrument failure and waiting for you | 3 |
-| `quarantined` | Stock restoration itself failed; offsets may still be resident | 4 |
+| `profile_quarantined` | Stock restoration itself failed; offsets may still be resident | 4 |
+| `platform_fault` | The attribution hunt reproduced the failure with every core at stock | 9 |
 | `aborted` | Deliberate stop; baselines restored, progress resumable | 6, or 130 from SIGINT |
 | `completed` | Every core confirmed and validation clean, endurance off | 0 |
 | `idle` | No session in flight | -- |

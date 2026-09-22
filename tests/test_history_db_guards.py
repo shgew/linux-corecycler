@@ -77,7 +77,8 @@ class TestOpenGuards:
         conn.execute("UPDATE schema_version SET version=?", (HistoryDB.SCHEMA_VERSION + 1,))
         conn.commit()
         conn.close()
-        with pytest.raises(RuntimeError, match=r"schema version 22.*supports 21"):
+        future, current = HistoryDB.SCHEMA_VERSION + 1, HistoryDB.SCHEMA_VERSION
+        with pytest.raises(RuntimeError, match=rf"schema version {future}.*supports {current}"):
             HistoryDB(path)
 
         conn = sqlite3.connect(path)
@@ -146,6 +147,26 @@ class TestOpenGuards:
             assert "contract_version" in columns
             with pytest.raises(LegacySession, match=rf"Session {session_id} predates tuner contract v16"):
                 migrated.get_tuner_session(session_id, resumable=True)
+        finally:
+            migrated.close()
+
+    def test_v22_migration_renames_legacy_quarantined_sessions(self, tmp_path):
+        path = tmp_path / "history.db"
+        db = HistoryDB(path)
+        legacy = db.create_tuner_session("{}", "", "")
+        paused = db.create_tuner_session("{}", "", "")
+        db.update_tuner_session_status(legacy, "quarantined")
+        db.update_tuner_session_status(paused, "paused")
+        db.close()
+        conn = sqlite3.connect(path)
+        conn.execute("UPDATE schema_version SET version=21")
+        conn.commit()
+        conn.close()
+
+        migrated = HistoryDB(path)
+        try:
+            assert migrated.get_tuner_session(legacy).status == "profile_quarantined"
+            assert migrated.get_tuner_session(paused).status == "paused"
         finally:
             migrated.close()
 

@@ -475,7 +475,7 @@ class HistoryTab(QWidget):
             statuses = [s.status for s in self._tuner_sessions]
             self._total_label.setText(f"Sessions: {self._total_tuner_sessions}")
             self._completed_label.setText(f"Completed: {statuses.count('completed')}")
-            self._crashed_label.setText(f"Quarantined: {statuses.count('quarantined')}")
+            self._crashed_label.setText(f"Quarantined: {statuses.count('profile_quarantined')}")
             active = sum(1 for status in statuses if status in ("running", "validating", "hunting"))
             self._stopped_label.setText(f"Active: {active}  Paused: {statuses.count('paused')}")
         else:

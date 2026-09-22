@@ -136,7 +136,6 @@ SESSION_STATUS_LABELS: dict[str, str] = {
     "validating": "Validating",
     "hunting": "Hunting",
     "paused": "Paused",
-    "quarantined": "Quarantined",
     "profile_quarantined": "Quarantined",
     "platform_fault": "Platform fault",
     "aborted": "Aborted",
@@ -215,7 +214,6 @@ def _status_colors(c: dict[str, str]) -> dict[str, str]:
     return {
         "completed": c["COLOR_PASS"],
         "crashed": c["COLOR_FAIL"],
-        "quarantined": c["COLOR_FAIL"],
         "profile_quarantined": c["COLOR_FAIL"],
         "platform_fault": c["COLOR_FAIL"],
         "stopped": c["COLOR_WARN"],

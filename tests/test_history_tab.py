@@ -84,6 +84,14 @@ class TestViews:
         tab.refresh()
         assert len(tab._tuner_sessions) == 1
 
+    def test_tuner_summary_counts_quarantined_sessions(self, db):
+        _seed_session(db, "profile_quarantined")
+        _seed_session(db, "completed")
+        tab = _tab(db)
+        tab._view_mode = tab.VIEW_TUNER
+        tab.refresh()
+        assert tab._crashed_label.text() == "Quarantined: 1"
+
     def test_tuner_view_marks_a_fully_confirmed_profile(self, db):
         from corecycler.tuner.state import CoreState, TunerPhase
 

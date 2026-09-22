@@ -69,7 +69,8 @@ class TunerSession:
     created_at: str = ""
     updated_at: str = ""
     boot_id: str = ""
-    status: str = "running"  # running, paused, completed, validating, aborted, quarantined
+    # running, validating, hunting, paused, completed, aborted, platform_fault, profile_quarantined
+    status: str = "running"
     bios_version: str = ""
     cpu_model: str = ""
     # The build that created the row; the rules its evidence was judged by.
