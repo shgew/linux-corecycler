@@ -13,6 +13,7 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from corecycler.tuner.report import build
 from tests.silicon import CoreSilicon, FakeSilicon, converged
 from tests.silicon_driver import TerminalReason, drive
 
@@ -88,6 +89,16 @@ class TestLoadOnlyInstability:
         )
         run = drive(db, _topo(4), mock_backend, silicon)
         _assert_clean_convergence(run, silicon)
+
+    def test_completed_engine_run_populates_report_offsets(self, db, mock_backend):
+        silicon = _uniform(4, load=-30, idle=-60)
+
+        run = drive(db, _topo(4), mock_backend, silicon, endurance=False)
+        assert db.get_tuner_session(run.session_id).status == "completed"
+        report = build(db, run.session_id)
+
+        assert {row["core"]: row["accepted_offset"] for row in report["cores"]} == run.final
+        assert all(row["bios_offset"] is not None for row in report["cores"])
 
 
 class TestIdleInstability:

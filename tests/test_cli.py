@@ -916,6 +916,21 @@ class TestRunPreflightRefusals:
         assert self._run(db) == cli.EXIT_REFUSED
         assert "invalid tuner config" in capsys.readouterr().err
 
+    def test_unavailable_battery_backend_is_refused_before_session_start(self, db, monkeypatch, capsys):
+        monkeypatch.setattr("corecycler.engine.topology.detect_topology", _fake_topology)
+        monkeypatch.setattr(cli, "_build_smu", lambda _t: MagicMock(commands=MagicMock(co_range=(-50, 10))))
+        monkeypatch.setattr(
+            TunerConfig,
+            "backend_availability_errors",
+            lambda _self: ["battery backend 'y-cruncher' is unavailable: not found on PATH"],
+        )
+        backend = MagicMock()
+        backend.is_available.return_value = True
+        monkeypatch.setattr("corecycler.engine.backends.get_backend", lambda *_: backend)
+
+        assert self._run(db) == cli.EXIT_REFUSED
+        assert "battery backend 'y-cruncher' is unavailable" in capsys.readouterr().err
+
     def test_topology_detection_failure_refused(self, db, monkeypatch, capsys):
         monkeypatch.setattr("corecycler.engine.topology.detect_topology", lambda: None)
         assert self._run(db) == cli.EXIT_REFUSED
@@ -1047,6 +1062,7 @@ class TestRunEngineConstruction:
         backend = MagicMock()
         backend.is_available.return_value = True
         monkeypatch.setattr("corecycler.engine.backends.get_backend", lambda _n: backend)
+        monkeypatch.setattr(TunerConfig, "backend_availability_errors", lambda _self: [])
         built = []
 
         def fake_engine(**kw):

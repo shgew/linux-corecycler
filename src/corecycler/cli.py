@@ -495,6 +495,10 @@ def _cmd_run(
                 file=sys.stderr,
             )
             return EXIT_REFUSED
+        unavailable = config.backend_availability_errors()
+        if unavailable:
+            print("corecycler: unavailable tuner workload: " + "; ".join(unavailable), file=sys.stderr)
+            return EXIT_REFUSED
         engine = TunerEngine(db=db, topology=topology, smu=smu, backend=backend, config=config)
 
     if override is not None:

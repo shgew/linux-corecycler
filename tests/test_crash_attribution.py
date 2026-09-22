@@ -782,22 +782,80 @@ class TestPersistedHuntResume:
         assert launches[0][2] == workload
         assert engine._smu.written == expected_residents
 
+    @pytest.mark.parametrize("rebooted", [True, False])
+    def test_paused_session_restores_its_persisted_hunt(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch, rebooted
+    ):
+        import corecycler.tuner.engine as engine_mod
+
+        engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_confirmed_validating(engine, db, BEST, BASELINES)
+        state = _armed_probe_state(engine)
+        state.armed = False
+        db.set_hunt_state(engine._session_id, state.to_json())
+        db.update_tuner_session_status(engine._session_id, "paused")
+        monkeypatch.setattr(engine_mod, "_rebooted_since", lambda *_a, **_kw: rebooted)
+        monkeypatch.setattr(engine_mod.QTimer, "singleShot", lambda *_a: None)
+        engine._run_next_hunt_slot = lambda: None
+
+        engine.resume(engine._session_id)
+
+        assert engine._hunt is not None
+        assert engine._hunt.to_json() == state.to_json()
+        assert engine.status == "hunting"
+        assert db.get_tuner_session(engine._session_id).status == "hunting"
+
+    def test_resume_discards_another_sessions_in_memory_hunt(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
+        import corecycler.tuner.engine as engine_mod
+
+        first = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_confirmed_validating(first, db, BEST, BASELINES)
+        first_state = _armed_probe_state(first)
+        first._hunt = first_state
+
+        second = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_confirmed_validating(second, db, BEST, BASELINES)
+        second_state = _armed_probe_state(second)
+        second_state.in_flight = [0, 1]
+        second_state.armed = False
+        db.set_hunt_state(second._session_id, second_state.to_json())
+        db.update_tuner_session_status(second._session_id, "paused")
+        monkeypatch.setattr(engine_mod, "_rebooted_since", lambda *_a, **_kw: False)
+        first._run_next_hunt_slot = lambda: None
+
+        first.resume(second._session_id)
+
+        assert first._hunt is not first_state
+        assert first._hunt is not None
+        assert first._hunt.to_json() == second_state.to_json()
+
     def test_second_resume_site_rejects_corrupt_hunt_state_before_writing_co(
         self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
     ):
         import corecycler.tuner.engine as engine_mod
 
         engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
-        db.set_hunt_state(engine._session_id, "not-json")
+        _seed_confirmed_validating(engine, db, BEST, BASELINES)
+        state = _armed_probe_state(engine)
+        state.armed = False
+        db.set_hunt_state(engine._session_id, state.to_json())
         db.update_tuner_session_status(engine._session_id, "validating")
+        smu = engine._smu
         messages = []
         engine.log_message.connect(messages.append)
+        monkeypatch.setattr(engine_mod, "_rebooted_since", lambda *_a, **_kw: True)
         monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda **_kw: False)
-        engine._attribute_crash_after_reboot = lambda *_a, **_kw: ([], True)
+
+        def corrupt_pending_hunt(session, *_args):
+            session.hunt_state = "not-json"
+            engine._smu = None
+            return [], True
+
+        engine._attribute_crash_after_reboot = corrupt_pending_hunt
 
         engine.resume(engine._session_id)
 
-        assert engine._smu.written == {}
+        assert smu.written == {}
         assert engine.status == "paused"
         assert db.get_tuner_session(engine._session_id).status == "paused"
         assert any("Persisted hunt state is invalid:" in message for message in messages)
@@ -861,3 +919,141 @@ class TestPersistedHuntSafety:
         assert restored.found == []
         assert restored.exonerated == []
         assert db.get_tuner_core_states(engine._session_id)[5].in_test is False
+
+
+class TestHuntExecution:
+    def test_start_persists_hunting_before_the_first_probe(self, db, topo_dual_ccd_x3d, mock_backend):
+        engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_confirmed_validating(engine, db, BEST, BASELINES)
+        engine._pending_hunt_vector = dict(BEST)
+        statuses = []
+        engine._run_next_hunt_slot = lambda: statuses.append(db.get_tuner_session(engine._session_id).status)
+
+        engine._start_hunt(loaded=[5, 6])
+
+        assert statuses == ["hunting"]
+
+    @pytest.mark.parametrize(
+        ("kind", "loaded", "expected"),
+        [
+            ("rapid_transition", [5, 6], "rapid_transition"),
+            ("soak", [5, 6], "soak"),
+            ("parallel", [5, 6], "parallel"),
+            ("solo", [5], "solo"),
+        ],
+    )
+    def test_hunt_replays_the_checkpointed_worker_kind(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch, kind, loaded, expected
+    ):
+        engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_confirmed_validating(engine, db, BEST, BASELINES)
+        state = bisect.begin(sorted(BEST), loaded)
+        bisect.next_live_set(state)
+        bisect.record(
+            state,
+            reproduced=False,
+            control_confirmations=engine._config.control_run_confirmations,
+            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
+        )
+        state.vector = dict(BEST)
+        state.workload = {**engine._workload_snapshot(engine._core_states[loaded[0]]), "kind": kind}
+        engine._hunt = state
+        engine._hunt_workload = state.workload
+        engine._hunting = True
+        engine._apply_hunt_mask = lambda _live: True
+        launched = []
+        monkeypatch.setattr(
+            engine,
+            "_start_rapid_transition_worker",
+            lambda cores, duration, workload: launched.append(("rapid_transition", cores, workload)),
+            raising=False,
+        )
+        monkeypatch.setattr(
+            engine,
+            "_start_soak_worker",
+            lambda cores, duration, workload: launched.append(("soak", cores, workload)),
+            raising=False,
+        )
+        engine._start_multi_core_worker = lambda cores, duration, **kwargs: launched.append(
+            ("parallel", cores, kwargs["workload"])
+        )
+        engine._start_worker = lambda core, duration, **kwargs: launched.append(("solo", [core], state.workload))
+
+        engine._run_next_hunt_slot()
+
+        assert launched == [(expected, loaded, state.workload)]
+
+    def test_immediate_stage4_hunt_keeps_the_rapid_transition_workload(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        import corecycler.tuner.engine as engine_mod
+
+        engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_confirmed_validating(engine, db, BEST, BASELINES)
+        engine._validation_stage = 4
+        engine._validation_core_order = [5, 6]
+        engine._apply_validation_offsets = lambda *_a: True
+        launched = []
+        monkeypatch.setattr(engine_mod, "CoreScheduler", lambda **_kw: SimpleNamespace())
+        monkeypatch.setattr(engine_mod, "_RapidTransitionWorker", lambda *_a, **_kw: SimpleNamespace())
+        engine._launch_worker = lambda _worker, workload, _cores, **_kw: launched.append(workload)
+
+        engine._run_validation_stage4()
+        engine._run_next_hunt_slot = lambda: None
+        engine._on_validation_test_finished(5, False, 17.0)
+
+        assert launched[0]["kind"] == "rapid_transition"
+        assert engine._hunt is not None
+        assert engine._hunt.workload == launched[0]
+
+    @pytest.mark.parametrize("failure_source", ["outside_live_set", "zero_offset"])
+    def test_failure_reported_by_a_stock_core_requeues_without_a_verdict(
+        self, db, topo_dual_ccd_x3d, mock_backend, failure_source
+    ):
+        engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        state = bisect.begin(sorted(BEST), [5, 6])
+        bisect.next_live_set(state)
+        bisect.record(
+            state,
+            reproduced=False,
+            control_confirmations=engine._config.control_run_confirmations,
+            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
+        )
+        in_flight = bisect.next_live_set(state)
+        assert in_flight is not None
+        vector = dict(BEST)
+        if failure_source == "outside_live_set":
+            reported = next(core for core in BEST if core not in in_flight)
+        else:
+            reported = in_flight[0]
+            vector[reported] = 0
+        state.vector = vector
+        engine._hunt = state
+        engine._hunting = True
+        requeued = []
+        engine._requeue_hunt_probe = lambda: requeued.append(True)
+        engine.pause = lambda: None
+
+        engine._on_hunt_slot_finished(reported, False, "computation", {})
+
+        assert requeued == [True]
+        assert state.in_flight == in_flight
+        assert state.no_reproduce == 0
+
+    def test_platform_fault_does_not_overwrite_failed_stock_restoration(self, db, topo_dual_ccd_x3d, mock_backend):
+        engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        state = bisect.begin(sorted(BEST), [5, 6])
+        engine._hunt = state
+        engine._hunting = True
+        engine._restore_hunt_stock = lambda: False
+        db.update_tuner_session_status(engine._session_id, "profile_quarantined")
+        engine._set_status("profile_quarantined")
+        faults = []
+        engine.platform_fault.connect(faults.append)
+
+        engine._platform_fault("stock probe failed")
+
+        assert engine.status == "profile_quarantined"
+        assert db.get_tuner_session(engine._session_id).status == "profile_quarantined"
+        assert engine._hunt is state
+        assert faults == []

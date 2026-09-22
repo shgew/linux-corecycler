@@ -242,10 +242,11 @@ class TestCoreStateSanity:
     def _session(self, db):
         return db.create_tuner_session(TunerConfig().to_json(), "2402", "Test")
 
-    def test_an_offset_outside_the_sane_range_is_refused(self, db):
+    @pytest.mark.parametrize("field", ["current_offset", "proven_offset"])
+    def test_an_offset_outside_the_sane_range_is_refused(self, db, field):
         sid = self._session(db)
         with pytest.raises(ValueError, match="outside sane CO range"):
-            db.upsert_tuner_core_state(sid, CoreState(core_id=0, current_offset=-9999))
+            db.upsert_tuner_core_state(sid, CoreState(core_id=0, **{field: -9999}))
 
     def test_a_negative_counter_is_refused(self, db):
         sid = self._session(db)

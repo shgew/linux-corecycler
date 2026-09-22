@@ -627,6 +627,52 @@ class TestVerdictRouter:
         assert worker.deleteLater.called
         assert engine._worker is None
 
+    def test_an_unknown_worker_outcome_retries_without_changing_search_state(self, engine, monkeypatch):
+        cs = engine._core_states[0]
+        cs.phase = TunerPhase.COARSE_SEARCH
+        cs.current_offset = -5
+        cs.best_offset = 0
+        cs.in_test = True
+        engine._db.upsert_tuner_core_state(engine._session_id, cs)
+        queued = []
+        monkeypatch.setattr(eng.QTimer, "singleShot", lambda _ms, fn: queued.append(fn))
+
+        engine._on_test_finished(0, False, "unrecognized worker failure", "unknown", 1.0, 0.0)
+
+        assert engine._apparatus_fault_streak == 1
+        assert cs.phase is TunerPhase.COARSE_SEARCH
+        assert cs.current_offset == -5
+        assert cs.best_offset == 0
+        assert len(queued) == 1
+
+    def test_foreign_stock_mce_keeps_validation_paused(self, engine, monkeypatch):
+        engine._validation_stage = 2
+        engine._set_status("validating")
+        engine._co_applied[1] = 0
+        engine._core_states[0].in_test = True
+        queued = []
+        monkeypatch.setattr(eng.QTimer, "singleShot", lambda _ms, fn: queued.append(fn))
+
+        engine._on_test_finished(0, False, "machine check", "mce", 1.0, 0.0, _foreign_payload(1))
+
+        assert engine.status == "paused"
+        assert engine._paused is True
+        assert engine._validation_stage == 2
+        assert queued == []
+
+    def test_thermal_foreign_stock_mce_keeps_validation_paused(self, engine, monkeypatch):
+        engine._validation_stage = 2
+        engine._set_status("validating")
+        engine._co_applied[1] = 0
+        exited = []
+        monkeypatch.setattr(engine, "_validation_stage_exit_to_search", lambda: exited.append(True))
+
+        engine._on_test_finished(0, False, "too hot", "thermal", 1.0, 0.0, _foreign_payload(1))
+
+        assert engine.status == "paused"
+        assert engine._validation_stage == 2
+        assert exited == []
+
     def test_a_thermal_stop_during_a_hunt_retries_the_same_probe(self, engine):
         state = bisect.HuntState(
             candidates=[0, 1, 2, 3],
@@ -729,16 +775,30 @@ class TestSoakVerdict:
     def test_a_soak_naming_another_core_leaves_validation(self, engine, monkeypatch):
         self._soaking(engine)
         _confirm(engine, 1, -20)
+        engine._co_applied[1] = -20
         exited = []
         monkeypatch.setattr(engine, "_validation_stage_exit_to_search", lambda: exited.append(True))
         engine._on_test_finished(0, False, "kernel error", "mce", 1.0, 0.0, _foreign_payload(1), "")
         assert exited == [True]
         assert engine._validation_dirty is True
 
+    def test_a_soak_with_foreign_stock_mce_keeps_validation_paused(self, engine, monkeypatch):
+        self._soaking(engine)
+        engine._co_applied[1] = 0
+        exited = []
+        monkeypatch.setattr(engine, "_validation_stage_exit_to_search", lambda: exited.append(True))
+
+        engine._on_test_finished(0, False, "kernel error", "mce", 1.0, 0.0, _foreign_payload(1), "")
+
+        assert engine.status == "paused"
+        assert engine._validation_stage == 7
+        assert exited == []
+
 
 class TestApparatusFaultWithEvidence:
     def test_kernel_evidence_during_validation_outranks_the_retry(self, engine, monkeypatch):
         _confirm(engine, 1, -20)
+        engine._co_applied[1] = -20
         engine._validation_stage = 2
         engine._set_status("validating")
         queued = []
@@ -748,6 +808,19 @@ class TestApparatusFaultWithEvidence:
         assert engine.status == "running"
         assert queued[0] == engine._run_next
         assert engine._apparatus_fault_streak == 0
+
+    def test_apparatus_fault_with_foreign_stock_mce_keeps_validation_paused(self, engine, monkeypatch):
+        engine._validation_stage = 2
+        engine._set_status("validating")
+        engine._co_applied[1] = 0
+        queued = []
+        monkeypatch.setattr(eng.QTimer, "singleShot", lambda _ms, fn: queued.append(fn))
+
+        engine._handle_apparatus_fault(0, "stalled", "stall", engine._foreign_mce_by_core(0, _foreign_payload(1)))
+
+        assert engine.status == "paused"
+        assert engine._validation_stage == 2
+        assert queued == []
 
 
 class TestAbortTeardown:
@@ -1121,6 +1194,29 @@ class TestSuspendInhibition:
         instance.start()
         instance.pause()
         assert not sleep_lock.held
+
+    def test_a_pause_during_a_test_releases_inhibition_only_after_worker_finishes(
+        self, db, tmp_path, monkeypatch, sleep_lock
+    ):
+        instance = self._engine(db, tmp_path, monkeypatch)
+        instance.start()
+        worker = MagicMock()
+        instance._worker = worker
+        instance._core_states[0].in_test = True
+
+        instance.pause()
+        assert sleep_lock.held
+
+        instance._on_test_finished(0, True, "", "", 1.0, 0.0)
+
+        assert not sleep_lock.held
+
+    @pytest.mark.parametrize("teardown_proven", [True, False])
+    def test_shutdown_reports_whether_teardown_was_proven(self, db, tmp_path, monkeypatch, teardown_proven):
+        instance = self._engine(db, tmp_path, monkeypatch)
+        monkeypatch.setattr(instance, "_stop_and_restore", lambda _action: teardown_proven)
+
+        assert instance.shutdown() is teardown_proven
 
     def test_a_finished_session_lets_it_sleep_again(self, db, tmp_path, monkeypatch, sleep_lock):
         instance = self._engine(db, tmp_path, monkeypatch)

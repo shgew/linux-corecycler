@@ -261,7 +261,7 @@ class _TunerWorker(QThread):
                 report.passed,
                 report.error_message or "",
                 report.error_type or "",
-                elapsed,
+                report.duration_seconds,
                 peak_stretch if report_core == self._core_id else 0.0,
                 mce_json,
                 "",
@@ -380,7 +380,7 @@ class _ParallelWorker(_TunerWorker):
                     report.passed,
                     report.error_message or "",
                     report.error_type or "",
-                    elapsed,
+                    report.duration_seconds,
                     0.0,
                     mce_json,
                     results_json,
@@ -808,6 +808,8 @@ class TunerEngine(QObject):
         self._endurance_index = 0
         self._in_requeue = False
         self._hunting = False
+        self._hunt = None
+        self._hunt_workload = None
         self._soaking = False
         self._pending_hunt_loaded = []
         self._pending_hunt_vector = {}
@@ -915,21 +917,20 @@ class TunerEngine(QObject):
         # offsets away on every restart.
         crashed: list[int] = []
         pending_hunt = False
+        try:
+            self._hunt = bisect.HuntState.from_json(session.hunt_state)
+        except bisect.InvalidHuntState as exc:
+            self.log_message.emit(f"Persisted hunt state is invalid: {exc}. Pausing without applying CO.")
+            self.pause()
+            return
         clean_reboot = rebooted and last_boot_ended_cleanly(boot_id=session.boot_id)
         if clean_reboot:
             self._clear_all_in_test()
-            if session.status == "hunting":
-                try:
-                    self._hunt = bisect.HuntState.from_json(session.hunt_state)
-                except bisect.InvalidHuntState as exc:
-                    self.log_message.emit(f"Persisted hunt state is invalid: {exc}. Pausing without applying CO.")
-                    self.pause()
-                    return
-                if self._hunt is not None:
-                    self._hunting = True
-                    if self._hunt.armed:
-                        self._requeue_hunt_probe()
-                    pending_hunt = True
+            if self._hunt is not None:
+                self._hunting = True
+                if self._hunt.armed:
+                    self._requeue_hunt_probe()
+                pending_hunt = True
             else:
                 self._db.set_hunt_state(session_id, "")
         elif rebooted:
@@ -938,13 +939,6 @@ class TunerEngine(QObject):
                 return
         else:
             self._clear_all_in_test()
-            if self._hunt is None and session.status == "hunting":
-                try:
-                    self._hunt = bisect.HuntState.from_json(session.hunt_state)
-                except bisect.InvalidHuntState as exc:
-                    self.log_message.emit(f"Persisted hunt state is invalid: {exc}. Pausing without applying CO.")
-                    self.pause()
-                    return
             if self._hunt is not None:
                 self._hunting = True
                 if self._hunt.armed:
@@ -1078,7 +1072,7 @@ class TunerEngine(QObject):
                 self._hunt = resumed
                 self._hunt_workload = resumed.workload
                 self._hunting = True
-                self._set_status("hunting")
+                self._transition_status("hunting")
                 if resumed.armed:
                     self.log_message.emit(
                         f"Resumed session {session_id} — the machine died under hunt probe "
@@ -1132,16 +1126,17 @@ class TunerEngine(QObject):
         self._set_status("idle")
         self.log_message.emit("Tuner aborted")
 
-    def shutdown(self) -> None:
+    def shutdown(self) -> bool:
         """Stop for application exit: restore baselines and leave the session
         paused, so closing the window never discards a resumable search."""
         if not self._stop_and_restore("Shutdown"):
-            return
+            return False
         session = self._db.get_tuner_session(self._session_id) if self._session_id is not None else None
         if session is not None and session.status in RESUMABLE_STATUSES:
             self._transition_status("paused")
             self._set_status("idle")
             self.log_message.emit("Tuner paused for application exit")
+        return True
 
     def _stop_and_restore(self, action: str) -> bool:
         self._abort_requested = True
@@ -1305,8 +1300,13 @@ class TunerEngine(QObject):
         doubles what the next probe costs, so a marginal depth is not retried
         forever while a genuinely better one still gets found.
         """
-        if passed:
+        contradicted = cs.backoff_fail_bound is not None and (
+            cs.current_offset == cs.backoff_fail_bound
+            or self._is_more_aggressive(cs.current_offset, cs.backoff_fail_bound)
+        )
+        if passed and not contradicted:
             cs.best_offset = cs.current_offset
+            cs.proven_offset = cs.best_offset
             cs.anneal_strikes = 0
             cs.anneal_bar_hours = float(self._config.anneal_bank_hours)
             self.log_message.emit(f"Core {cs.core_id}: annealed deeper to {cs.best_offset}")
@@ -1418,7 +1418,10 @@ class TunerEngine(QObject):
             if cs.anneal_strikes >= self._config.anneal_max_strikes:
                 continue
             candidate = cs.best_offset + self._config.direction * self._config.fine_step
-            if self._exceeds_max(candidate):
+            if self._exceeds_max(candidate) or (
+                cs.backoff_fail_bound is not None
+                and (candidate == cs.backoff_fail_bound or self._is_more_aggressive(candidate, cs.backoff_fail_bound))
+            ):
                 continue
             hours = self._banked_hours(cs)
             if hours < self._anneal_bar(cs):
@@ -1802,6 +1805,8 @@ class TunerEngine(QObject):
                         cs.best_offset = new_offset
                         cs.current_offset = new_offset
 
+        if passed and cs.phase is TunerPhase.CONFIRMED:
+            cs.proven_offset = cs.best_offset
         # Persist
         if self._session_id:
             self._db.upsert_tuner_core_state(self._session_id, cs)
@@ -2511,7 +2516,8 @@ class TunerEngine(QObject):
             )
             self._platform_fault("no core held a live offset at the time of the failure")
             return
-        workload = self._hunt_workload or self._workload_snapshot(self._core_states[under_load[0]])
+        workload = self._hunt_workload if self._validation_stage == 4 else None
+        workload = workload or self._workload_snapshot(self._core_states[under_load[0]])
         self._hunt = bisect.begin(candidates, under_load, observed_failure_time=observed_mttf)
         self._hunt.vector = vector
         self._hunt.workload = workload
@@ -2519,7 +2525,7 @@ class TunerEngine(QObject):
         self._hunting = True
         self._validation_stage = 0
         self._validation_thermal_aborts = 0
-        self._set_status("hunting")
+        self._transition_status("hunting")
         self._save_hunt()
         self.log_message.emit(
             f"Attribution hunt over {candidates}: control probe at stock first, then bisection of the live set."
@@ -2561,6 +2567,52 @@ class TunerEngine(QObject):
                 return False
             self._co_applied[core_id] = target
         return True
+
+    def _start_rapid_transition_worker(self, cores: list[int], duration: int, workload: dict) -> None:
+        from corecycler.engine.backends.base import FFTPreset, StressMode
+
+        stress_config = StressConfig(
+            mode=StressMode[workload["stress_mode"].upper()],
+            fft_preset=FFTPreset[workload["fft_preset"].upper()],
+            threads=workload.get("threads") or 2,
+        )
+        scheduler_config = SchedulerConfig(
+            seconds_per_core=duration,
+            cores_to_test=cores,
+            stop_on_error=True,
+            cycle_count=1,
+            max_temperature=self._config.max_temperature_c,
+            over_temp_grace_seconds=self._config.over_temp_grace_seconds,
+            over_temp_hard_margin=self._config.over_temp_hard_margin_c,
+            require_thermal_sensor=not self._config.allow_missing_thermal_sensor,
+        )
+        try:
+            scheduler = CoreScheduler(
+                topology=self._topology,
+                backend=self._get_backend_for_name(workload["backend"]),
+                stress_config=stress_config,
+                scheduler_config=scheduler_config,
+                work_dir=self._work_dir,
+            )
+        except Exception as exc:
+            self._fail_test_async(cores[0], str(exc))
+            return
+        self._worker_profile = "transitions"
+        core_info = self._topology.cores.get(cores[0])
+        logical_cpu = core_info.logical_cpus[0] if core_info and core_info.logical_cpus else cores[0]
+        worker = _RapidTransitionWorker(cores[0], logical_cpu, scheduler, cores, float(duration), parent=self)
+        self._launch_worker(worker, workload, cores, freeze_context=f"cores {cores} (rapid transitions)")
+
+    def _start_soak_worker(self, cores: list[int], duration: int, workload: dict) -> None:
+        self._soaking = True
+        thermal = ThermalWatch(
+            max_temperature=self._config.max_temperature_c,
+            grace_seconds=self._config.over_temp_grace_seconds,
+            hard_margin=self._config.over_temp_hard_margin_c,
+            require_sensor=not self._config.allow_missing_thermal_sensor,
+        )
+        worker = _SoakWorker(cores[0] if cores else 0, duration, thermal=thermal, parent=self)
+        self._launch_worker(worker, workload, cores, freeze_context=f"cores {cores} (real-world soak)")
 
     def _run_next_hunt_slot(self) -> None:
         if self._abort_requested or self._paused or self._hunt is None:
@@ -2605,35 +2657,52 @@ class TunerEngine(QObject):
                 f"Hunt probe ({self._hunt.stage}, level {self._hunt.level}): live {live}, "
                 f"every other core at stock, for {duration}s"
             )
-        if len(loaded) > 1:
-            self._start_multi_core_worker(loaded, duration, workload=self._hunt_workload)
-        else:
-            workload = self._hunt.workload or {}
-            self._start_worker(
-                reporter,
-                duration,
-                spectrum=workload.get("profile") == "spectrum",
-                duty_cycle=_duty_cycle_for(workload),
-            )
+        workload = self._hunt.workload or {}
+        match workload.get("kind"):
+            case "rapid_transition":
+                self._start_rapid_transition_worker(loaded, duration, workload)
+            case "soak":
+                self._start_soak_worker(loaded, duration, workload)
+            case "parallel":
+                self._start_multi_core_worker(loaded, duration, workload=workload)
+            case "solo":
+                self._start_worker(
+                    reporter,
+                    duration,
+                    spectrum=workload.get("profile") == "spectrum",
+                    duty_cycle=_duty_cycle_for(workload),
+                )
+            case _ if len(loaded) > 1:
+                self._start_multi_core_worker(loaded, duration, workload=workload)
+            case _:
+                self._start_worker(
+                    reporter,
+                    duration,
+                    spectrum=workload.get("profile") == "spectrum",
+                    duty_cycle=_duty_cycle_for(workload),
+                )
 
     def _on_hunt_slot_finished(self, core_id: int, passed: bool, error_type: str, foreign: dict[int, dict]) -> None:
+        self._soaking = False
         if self._hunt is None:
             self._hunting = False
             QTimer.singleShot(0, self._run_next)
             return
         reproduced = not passed
-        if foreign:
-            live = set(self._hunt.in_flight)
-            inconsistent = self._hunt.stage is not bisect.Stage.CONTROL and any(
-                core not in live or self._hunt.vector.get(core, 0) == 0 for core in foreign
+        live = set(self._hunt.in_flight)
+        reported_stock_failure = not passed and (core_id not in live or self._hunt.vector.get(core_id, 0) == 0)
+        foreign_stock_failure = any(core not in live or self._hunt.vector.get(core, 0) == 0 for core in foreign)
+        inconsistent = self._hunt.stage is not bisect.Stage.CONTROL and (
+            reported_stock_failure or foreign_stock_failure
+        )
+        if inconsistent:
+            self.log_message.emit(
+                "Attribution hunt saw hardware evidence on a core at stock; requeueing the probe and pausing."
             )
-            if inconsistent:
-                self.log_message.emit(
-                    "Attribution hunt saw hardware evidence on a core at stock; requeueing the probe and pausing."
-                )
-                self._requeue_hunt_probe()
-                self.pause()
-                return
+            self._requeue_hunt_probe()
+            self.pause()
+            return
+        if foreign:
             reproduced = True
         self._record_hunt_probe(reproduced=reproduced)
         QTimer.singleShot(0, self._run_next_hunt_slot)
@@ -2802,9 +2871,10 @@ class TunerEngine(QObject):
         answer to the question that was asked, and no further searching can
         improve it.
         """
+        if not self._restore_hunt_stock():
+            return
         self._hunting = False
         self._hunt = None
-        self._restore_hunt_stock()
         if self._session_id is not None:
             self._db.set_hunt_state(self._session_id, "")
             self._db.update_tuner_session_status(self._session_id, "platform_fault")
@@ -3346,6 +3416,8 @@ class TunerEngine(QObject):
             self._worker.wait(1000)
             self._worker.deleteLater()
             self._worker = None
+        if self._status in DORMANT_STATUSES:
+            self._sleep.release()
         if self._hunting and self._hunt is not None:
             self._hunt.armed = False
             self._save_hunt()
@@ -3413,6 +3485,8 @@ class TunerEngine(QObject):
         if not passed and error_type == "thermal":
             if foreign:
                 self._apply_foreign_evidence(foreign)
+                if self._paused:
+                    return
                 if self._validation_stage > 0:
                     self._validation_stage_exit_to_search()
                     return
@@ -3443,7 +3517,7 @@ class TunerEngine(QObject):
         # CO offset on any of them punishes an innocent core (85 back-offs in
         # one night came through the stall path). Retry without a verdict,
         # bounded, then stop honestly.
-        if not passed and error_type in ("stall", "killed", "mce_unattributed"):
+        if not passed and error_type in ("stall", "killed", "mce_unattributed", "unknown"):
             self._handle_apparatus_fault(core_id, error_msg, error_type, foreign)
             return
 
@@ -3556,6 +3630,8 @@ class TunerEngine(QObject):
             self._soaking = False
             if foreign:
                 self._apply_foreign_evidence(foreign)
+                if self._paused:
+                    return
                 self._validation_dirty = True
                 self._save_validation_pos()
                 self.log_message.emit(
@@ -3596,6 +3672,8 @@ class TunerEngine(QObject):
         # re-earn confirmation first (validation restarts once all are back).
         if foreign:
             self._apply_foreign_evidence(foreign)
+            if self._paused:
+                return
             if self._validation_stage > 0:
                 self.log_message.emit(
                     "Leaving validation: kernel evidence named other core(s); "
@@ -3791,6 +3869,8 @@ class TunerEngine(QObject):
         self._soaking = False
         if foreign:
             self._apply_foreign_evidence(foreign)
+            if self._paused:
+                return
             if self._validation_stage > 0:
                 self.log_message.emit(
                     "Leaving validation: kernel evidence named other core(s); "
@@ -4101,59 +4181,17 @@ class TunerEngine(QObject):
             if not self._apply_validation_offsets(first_core, offset):
                 return
 
-        # Build scheduler for rapid transitions
-        stress_config = StressConfig(
-            mode=self._get_stress_mode(),
-            fft_preset=self._get_fft_preset(),
-            threads=2,
-        )
-        scheduler_config = SchedulerConfig(
-            seconds_per_core=self._config.validate_duration_seconds,
-            cores_to_test=cores,
-            stop_on_error=True,
-            cycle_count=1,
-            max_temperature=self._config.max_temperature_c,
-            over_temp_grace_seconds=self._config.over_temp_grace_seconds,
-            over_temp_hard_margin=self._config.over_temp_hard_margin_c,
-            require_thermal_sensor=not self._config.allow_missing_thermal_sensor,
-        )
-        try:
-            scheduler = CoreScheduler(
-                topology=self._topology,
-                backend=self._backend,
-                stress_config=stress_config,
-                scheduler_config=scheduler_config,
-                work_dir=self._work_dir,
-            )
-        except Exception as e:
-            self._fail_test_async(cores[0], str(e))
-            return
-
-        self._worker_profile = "transitions"
-        self._last_tested_core = cores[0]
-        self._mark_cores_under_stress(cores)
-        core_info = self._topology.cores.get(cores[0])
-        logical_cpu = core_info.logical_cpus[0] if core_info and core_info.logical_cpus else cores[0]
-        worker = _RapidTransitionWorker(
-            cores[0],
-            logical_cpu,
-            scheduler,
-            cores,
-            float(self._config.validate_duration_seconds),
-            parent=self,
-        )
         checkpoint = self._workload_snapshot(
             self._core_states[cores[0]],
+            threads=2,
             profile="spectrum",
         )
         checkpoint["duration_seconds"] = self._config.validate_duration_seconds
         checkpoint["kind"] = "rapid_transition"
-        self._launch_worker(
-            worker,
-            checkpoint,
-            cores,
-            freeze_context=f"cores {cores} (rapid transitions)",
-        )
+        self._hunt_workload = checkpoint
+        self._last_tested_core = cores[0]
+        self._mark_cores_under_stress(cores)
+        self._start_rapid_transition_worker(cores, self._config.validate_duration_seconds, checkpoint)
 
     def _run_validation_next(self) -> None:
         """Dispatch the next validation test based on current stage."""
@@ -4514,31 +4552,14 @@ class TunerEngine(QObject):
             offset = cs.best_offset if cs.best_offset is not None else cs.baseline_offset
             if not self._apply_validation_offsets(first, offset):
                 return
-        self._soaking = True
-        self._mark_cores_under_stress(cores)
         self._last_tested_core = cores[0] if cores else None
-        thermal = ThermalWatch(
-            max_temperature=self._config.max_temperature_c,
-            grace_seconds=self._config.over_temp_grace_seconds,
-            hard_margin=self._config.over_temp_hard_margin_c,
-            require_sensor=not self._config.allow_missing_thermal_sensor,
-        )
-        worker = _SoakWorker(
-            cores[0] if cores else 0,
-            self._config.soak_duration_seconds,
-            thermal=thermal,
-            parent=self,
-        )
-        self._launch_worker(
-            worker,
-            {
-                **self._workload_snapshot(self._core_states[cores[0]]),
-                "kind": "soak",
-                "duration_seconds": self._config.soak_duration_seconds,
-            },
-            cores,
-            freeze_context=f"cores {cores} (real-world soak)",
-        )
+        workload = {
+            **self._workload_snapshot(self._core_states[cores[0]]),
+            "kind": "soak",
+            "duration_seconds": self._config.soak_duration_seconds,
+        }
+        self._mark_cores_under_stress(cores)
+        self._start_soak_worker(cores, self._config.soak_duration_seconds, workload)
 
     def _get_memory_backend(self):
         """The memory stress backend (stressapptest) if installed, else None.
@@ -4773,6 +4794,7 @@ class TunerEngine(QObject):
                 case 3:
                     self._validation_half_index += 1
                 case 4:
+                    self._hunt_workload = None
                     self._validation_stage = 5
                     self._validation_core_index = 0
                 case 5:
@@ -4884,7 +4906,7 @@ class TunerEngine(QObject):
 
     def _set_status(self, status: str) -> None:
         self._status = status
-        if status in DORMANT_STATUSES:
+        if status in DORMANT_STATUSES and not self.test_in_flight:
             self._sleep.release()
         else:
             self._sleep.hold()

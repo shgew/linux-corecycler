@@ -10,6 +10,35 @@ A per-core CPU stability tester and AMD PBO Curve Optimizer tuner for Linux,
 packaged as a NixOS module with an overlay. Forked from
 [Daaboulex/linux-corecycler](https://github.com/Daaboulex/linux-corecycler).
 
+### Fixed (2026-09-23 review of the fork's own changes)
+
+- `corecycler report` and the GUI showed every accepted and BIOS offset as empty, because
+  nothing set `proven_offset`. Confirmation and a successful anneal now record it, and the
+  persistence sanity check covers it.
+- Crash-attribution hunts: two culprits no longer fail to save as an unsorted set; a
+  confirmed culprit survives later probes running out of retries; a paused session reloads
+  its hunt; `hunting` is persisted before the first probe; probes replay the worker kind
+  that crashed (rapid transition, soak, parallel, solo); a failure reported by a stock core
+  is inconsistent evidence; resuming another session drops the previous in-memory hunt;
+  a failed stock restore during a platform fault keeps the quarantine warning.
+- Annealing never retests or promotes an offset at the recorded failure bound. An `unknown`
+  worker outcome retries as an apparatus fault instead of moving the offset. A pause from
+  stock-core machine-check evidence sticks on validation, thermal, soak and apparatus paths.
+  The sleep lock is held until a deferred pause's test actually finishes.
+- Start and resume refuse when a battery or endurance workload names a backend that is not
+  installed, instead of pausing on the first slot.
+- `corecycler resume` refuses `platform_fault` sessions. Auto-resume picks up `hunting`
+  sessions. Stage 4 and soak results count as validation evidence.
+- Stage 6 gave each stressapptest lane its per-lane memory divided by the lane count again.
+  Idle phases crashed on a missing `duration` argument.
+- Test-log durations are the supervised stress window (72.0 s) rather than wall time
+  including launch and teardown (73.1 s).
+- GUI: deleting or annotating a sorted history context acted on the wrong one; a session
+  that pauses itself during start now locks the Curve Optimizer tab; the window refuses to
+  close while tuner or memory teardown is unconfirmed; the GUI refuses to start when
+  capability confinement fails, like the CLI; history files created under sudo are handed
+  back to the invoking user.
+
 ### Added (2026-09-22 tuner state in the GUI)
 
 - The Auto-Tuner tab names the running test: core, offset, phase, which regime of the

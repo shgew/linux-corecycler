@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from corecycler.config.tools import Resolution
 from corecycler.tuner.config import TunerConfig
 
 
@@ -204,6 +205,44 @@ class TestEnduranceConfig:
     def test_endurance_json_roundtrip(self):
         cfg = TunerConfig(endurance=True)
         assert TunerConfig.from_json(cfg.to_json()) == cfg
+
+    def test_every_referenced_backend_must_be_installed(self, monkeypatch):
+        cfg = TunerConfig()
+        cfg.endurance_workloads = [
+            {
+                "regime": "current",
+                "backend": "stress-ng",
+                "stress_mode": "SSE",
+                "fft_preset": "SMALL",
+            }
+        ]
+        before = cfg.to_json()
+        monkeypatch.setattr(
+            "corecycler.config.tools.resolve",
+            lambda name: Resolution(name, None, "absent", "not found on PATH"),
+        )
+
+        errors = cfg.backend_availability_errors()
+
+        assert errors == [
+            "battery backend 'mprime' is unavailable: not found on PATH",
+            "battery backend 'y-cruncher' is unavailable: not found on PATH",
+            "endurance_workloads backend 'stress-ng' is unavailable: not found on PATH",
+        ]
+        assert cfg.to_json() == before
+
+    def test_backend_referenced_by_both_workload_lists_is_reported_once(self, monkeypatch):
+        monkeypatch.setattr(
+            "corecycler.config.tools.resolve",
+            lambda name: Resolution(name, None, "absent", "not found on PATH"),
+        )
+
+        errors = TunerConfig().backend_availability_errors()
+
+        assert errors == [
+            "battery backend 'mprime' is unavailable: not found on PATH",
+            "battery backend 'y-cruncher' is unavailable: not found on PATH",
+        ]
 
 
 class TestConfigValidationFailsClosed:

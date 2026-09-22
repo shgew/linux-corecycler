@@ -1709,6 +1709,7 @@ CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
         for name in (
             "current_offset",
             "best_offset",
+            "proven_offset",
             "coarse_fail_offset",
             "baseline_offset",
             "backoff_fail_bound",

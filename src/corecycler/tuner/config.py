@@ -7,6 +7,7 @@ import json
 import math
 from dataclasses import asdict, dataclass
 
+from corecycler.config import tools
 from corecycler.engine.backends.base import FFTPreset, StressMode
 from corecycler.tuner import regime
 
@@ -330,6 +331,21 @@ class TunerConfig:
             errors.append("endurance requires at least one endurance_workloads entry")
         if self.endurance_slot_max_seconds < self.endurance_slot_seconds:
             errors.append("endurance_slot_max_seconds must be >= endurance_slot_seconds")
+        return errors
+
+    def backend_availability_errors(self) -> list[str]:
+        """Return unavailable workload backends without changing the requested battery."""
+        errors: list[str] = []
+        seen: set[str] = set()
+        for field, workloads in (("battery", self.battery), ("endurance_workloads", self.endurance_workloads)):
+            backends = sorted({str(workload.get("backend")) for workload in workloads if isinstance(workload, dict)})
+            for backend in backends:
+                if backend in seen:
+                    continue
+                seen.add(backend)
+                resolution = tools.resolve(backend)
+                if resolution.path is None:
+                    errors.append(f"{field} backend {backend!r} is unavailable: {resolution.problem}")
         return errors
 
     def clamp_max_offset(self, co_range: tuple[int, int]) -> None:

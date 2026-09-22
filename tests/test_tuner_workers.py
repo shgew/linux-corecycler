@@ -124,6 +124,12 @@ class TestTunerWorker:
         assert stretch == 0.0
         assert json.loads(mce_json)[0]["cpu"] == 0
 
+    def test_the_logged_duration_is_the_supervised_stress_window(self):
+        worker = self._worker({0: [_result(0, True)]})
+        seen = _collect(worker)
+        worker.run()
+        assert seen[0][4] == 1.0
+
     def test_a_failure_on_another_core_outranks_the_primary_pass(self):
         worker = self._worker({0: [_result(0, True)], 1: [_result(1, False, "mce", "mce")]})
         seen = _collect(worker)
@@ -287,6 +293,12 @@ class TestParallelWorker:
         assert {r["core"] for r in rows} == {0, 1}
         assert all(r["passed"] for r in rows)
         assert seen[0][1] is True
+
+    def test_the_logged_duration_is_the_reported_lane_window(self):
+        worker = self._worker({0: _result(0, True), 1: _result(1, True)})
+        seen = _collect(worker)
+        worker.run()
+        assert seen[0][4] == 1.0
 
     def test_a_failing_lane_is_the_reported_core(self):
         worker = self._worker({0: _result(0, True), 1: _result(1, False, "rounding", "computation")})

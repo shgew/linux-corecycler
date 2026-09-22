@@ -1965,6 +1965,36 @@ class TestRegimeBatteryAndAnnealing:
             assert eng._anneal_candidate() == 0
         assert cs.current_offset == -13
 
+    def test_annealing_never_retests_or_promotes_a_recorded_failure(self, db, simple_topology, mock_smu, mock_backend):
+        eng = self._make_engine(
+            db,
+            simple_topology,
+            mock_smu,
+            mock_backend,
+            fine_step=1,
+            anneal_bank_hours=1.0,
+        )
+        cs = CoreState(
+            core_id=0,
+            phase=TunerPhase.CONFIRMED,
+            current_offset=-39,
+            best_offset=-39,
+            backoff_pass_bound=-39,
+            backoff_fail_bound=-40,
+        )
+        eng._core_states = {0: cs}
+
+        with patch.object(eng, "_banked_hours", return_value=2.0):
+            assert eng._anneal_candidate() is None
+
+        cs.phase = TunerPhase.ANNEALING
+        cs.current_offset = -40
+        eng._advance_core(0, True)
+
+        assert cs.phase is TunerPhase.CONFIRMED
+        assert cs.current_offset == -39
+        assert cs.best_offset == -39
+
     def test_crash_penalty_restarts_the_candidate_battery(self, db, simple_topology, mock_smu, mock_backend):
         eng = self._make_engine(db, simple_topology, mock_smu, mock_backend)
         cs = CoreState(
