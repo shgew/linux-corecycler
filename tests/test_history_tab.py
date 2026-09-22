@@ -139,6 +139,18 @@ class TestViews:
         assert db.get_context(selected_id).notes == "updated"
         assert db.get_context(other_id).notes == "z-note"
 
+    def test_context_menu_with_no_selection_does_nothing(self, db, monkeypatch):
+        from corecycler.gui import history_tab as history_module
+
+        tab = _tab(db)
+        tab._context_table.clearSelection()
+        menu = MagicMock()
+        monkeypatch.setattr(history_module, "QMenu", menu)
+
+        tab._show_context_table_menu(tab._context_table.rect().center())
+
+        menu.assert_not_called()
+
     def test_all_view_shows_seeded_runs(self, db):
         _seed_run(db, "2026-07-20T10:00:00+00:00")
         _seed_run(db, "2026-07-21T10:00:00+00:00")
