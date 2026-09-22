@@ -512,6 +512,9 @@ class TunerEngine(QObject):
     co_drift_detected = Signal(str)  # JSON-encoded {core_id: {expected, actual}}
     validation_progress = Signal(int, int, int)  # stage, current_index, total
     worker_started = Signal(int)  # core_id — emitted when mprime actually starts
+    # JSON: the launching workload plus what it is testing - cores, battery
+    # position for search slots, live set for hunt probes, validation stage.
+    slot_started = Signal(str)
 
     def __init__(
         self,
@@ -3170,6 +3173,7 @@ class TunerEngine(QObject):
         *,
         freeze_context: str | None = None,
         emit_started: int | None = None,
+        slot: dict | None = None,
     ) -> bool:
         self._worker = worker
         worker.finished.connect(self._on_test_finished)
@@ -3183,9 +3187,22 @@ class TunerEngine(QObject):
             self._freeze_context(freeze_context)
         self._start_freeze_monitor()
         worker.start()
+        self.slot_started.emit(json.dumps(self._describe_slot(workload, cores, slot or {})))
         if emit_started is not None:
             self.worker_started.emit(emit_started)
         return True
+
+    def _describe_slot(self, workload: dict, cores: list[int], extra: dict) -> dict:
+        described = {**workload, **extra, "cores": sorted(cores)}
+        if self._hunting and self._hunt is not None:
+            described["hunt"] = {
+                "stage": str(self._hunt.stage),
+                "level": self._hunt.level,
+                "live": sorted(self._hunt.in_flight),
+            }
+        elif self._validation_stage > 0:
+            described["validation_stage"] = self._validation_stage
+        return described
 
     def _start_worker(
         self,
@@ -3283,12 +3300,18 @@ class TunerEngine(QObject):
         )
         workload["duration_seconds"] = duration
         workload["kind"] = "solo"
+        slot: dict = {"core": core_id, "offset": cs.current_offset, "phase": str(cs.phase)}
+        if not self._hunting and self._validation_stage == 0:
+            regimes = self._slot_regimes(cs)
+            slot["battery_regimes"] = regimes
+            slot["battery_position"] = cs.battery_index % len(regimes) + 1
         self._launch_worker(
             worker,
             workload,
             self._cores_under_stress or [core_id],
             freeze_context=f"core {core_id} at {cs.current_offset} ({self._worker_profile}, {regime})",
             emit_started=core_id,
+            slot=slot,
         )
 
     @Slot(int, bool, str, str, float, float, str, str)

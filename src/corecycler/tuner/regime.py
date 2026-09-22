@@ -39,6 +39,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
 
 
 class Regime(StrEnum):
@@ -76,14 +80,7 @@ class Workload:
 
     @property
     def label(self) -> str:
-        parts = [self.backend, self.stress_mode, self.fft_preset]
-        if self.threads:
-            parts.append(f"{self.threads}T")
-        if self.tests:
-            parts.append("/".join(self.tests))
-        if self.profile is not Profile.SUSTAINED:
-            parts.append(str(self.profile))
-        return " ".join(parts)
+        return workload_label(self.to_dict())
 
     def to_dict(self) -> dict[str, object]:
         data: dict[str, object] = {
@@ -113,6 +110,20 @@ class Workload:
             tests=tuple(data["tests"]) if data.get("tests") else None,
             memory_coupled=bool(data.get("memory_coupled", False)),
         )
+
+
+def workload_label(data: Mapping[str, object]) -> str:
+    """Human name of a serialized workload, test-log row or slot description."""
+    parts = [str(data[key]) for key in ("backend", "stress_mode", "fft_preset") if data.get(key)]
+    if data.get("threads"):
+        parts.append(f"{data['threads']}T")
+    tests = data.get("tests")
+    if tests:
+        parts.append("/".join(str(test) for test in tests))
+    profile = data.get("profile")
+    if profile and profile != Profile.SUSTAINED:
+        parts.append(str(profile))
+    return " ".join(parts)
 
 
 #: The shipped battery. One entry minimum per regime; several entries in a

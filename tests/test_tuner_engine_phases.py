@@ -883,6 +883,28 @@ class TestWorkerLaunch:
         assert not worker.start.called
         assert failed[0][0] == 99
 
+    def test_a_search_slot_announces_its_place_in_the_offset_battery(self, engine, monkeypatch):
+        self._real_launch(engine, monkeypatch)
+        monkeypatch.setattr(engine, "_start_freeze_monitor", lambda: None)
+        announced = []
+        engine.slot_started.connect(lambda payload: announced.append(json.loads(payload)))
+        cs = engine._core_states[0]
+        cs.phase = TunerPhase.COARSE_SEARCH
+        cs.current_offset = -10
+        regimes = engine._slot_regimes(cs)
+        cs.battery_index = 1
+
+        engine._start_worker(0, 10, duty_cycle=eng._duty_cycle_for(engine._battery_entry(cs)))
+
+        (slot,) = announced
+        assert (slot["core"], slot["offset"], slot["phase"]) == (0, -10, "coarse_search")
+        assert slot["cores"] == [0]
+        assert slot["battery_regimes"] == regimes
+        assert slot["battery_position"] == 2
+        assert slot["regime"] == regimes[1]
+        assert slot["duration_seconds"] == 10
+        assert "hunt" not in slot
+
 
 class TestMultiCoreLaunch:
     def test_every_core_is_stressed_at_once(self, engine, monkeypatch):
@@ -1779,6 +1801,36 @@ class TestEngineSafetyReviewRegressions:
         engine._run_next_hunt_slot()
 
         assert observed == {"armed": True, "in_test": True}
+
+    def test_a_hunt_probe_announces_which_cores_stay_live(self, engine, monkeypatch):
+        for core_id in engine._core_states:
+            _confirm(engine, core_id, -20)
+        engine._hunt = bisect.HuntState(
+            candidates=[0, 1, 2, 3],
+            stage=bisect.Stage.PROBE,
+            pending=[],
+            queue=[[0, 1], [2, 3]],
+            parent=[0, 1, 2, 3],
+            level=1,
+            loaded=[0, 1],
+        )
+        engine._hunt.vector = dict.fromkeys(engine._core_states, -20)
+        engine._hunt.workload = {"regime": "current", "backend": "mprime", "stress_mode": "avx2", "fft_preset": "small"}
+        engine._hunting = True
+        announced = []
+        engine.slot_started.connect(lambda payload: announced.append(json.loads(payload)))
+        monkeypatch.setattr(eng, "ParallelStress", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(eng, "_ParallelWorker", MagicMock(return_value=MagicMock()))
+        monkeypatch.setattr(engine, "_get_backend_for_name", lambda _name: engine._backend)
+        monkeypatch.setattr(engine, "_start_freeze_monitor", lambda: None)
+
+        engine._run_next_hunt_slot()
+
+        (slot,) = announced
+        assert slot["hunt"] == {"stage": "probe", "level": 1, "live": [0, 1]}
+        assert slot["cores"] == [0, 1]
+        assert slot["regime"] == "current"
+        assert "battery_position" not in slot
 
     def test_unarmed_persisted_hunt_resumes_without_a_reproduction(self, engine, monkeypatch):
         sid = engine._session_id

@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
+import time
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -25,6 +28,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSpinBox,
     QSplitter,
@@ -42,7 +46,7 @@ from corecycler.history.timefmt import format_local
 from corecycler.tuner import report as tuner_report
 from corecycler.tuner.config import FIELD_BOUNDS, TEST_ORDERS, TunerConfig
 from corecycler.tuner.engine import TunerEngine
-from corecycler.tuner.regime import Regime
+from corecycler.tuner.regime import Regime, workload_label
 from corecycler.tuner.state import TunerPhase
 
 if TYPE_CHECKING:
@@ -59,7 +63,82 @@ _PHASE_TO_GRID = PHASE_TO_GRID
 _REGIMES: tuple[str, ...] = tuple(str(r) for r in Regime)
 
 _MAX_LOG_ROWS = 2000
+_LOG_RESULT_COLUMN = 6
 ACTIVE_STATUSES = ("running", "validating", "hunting")
+
+VALIDATION_STAGES: dict[int, str] = {
+    1: "per-core",
+    2: "all-core",
+    3: "half-core",
+    4: "transitions",
+    5: "spectrum",
+    6: "memory",
+    7: "soak",
+    9: "endurance",
+}
+
+
+def _span(seconds: float) -> str:
+    return f"{seconds:g} s" if seconds < 120 else f"{seconds / 60:g} min"
+
+
+def _per_offset(count: int, seconds: int) -> str:
+    return f"{count} x {seconds} s = {_span(count * seconds)} per offset"
+
+
+def battery_summary(cfg: TunerConfig) -> list[str]:
+    """What one offset costs in each phase, from the config the engine runs."""
+    coarse = list(cfg.coarse_regimes)
+    full = list(_REGIMES)
+    search = cfg.search_duration_seconds
+    backoff = int(search * cfg.backoff_preconfirm_multiplier)
+    return [
+        f"Coarse: {', '.join(coarse)} - {_per_offset(len(coarse), search)}",
+        f"Fine: {', '.join(full)} - {_per_offset(len(full), search)}",
+        f"Backoff: {_per_offset(len(full), backoff)}",
+        f"Confirm, anneal: {_per_offset(len(full), cfg.confirm_duration_seconds)}",
+        "The first failing regime ends the offset. Time shifts toward regimes that catch failures, "
+        f"at least {cfg.regime_floor_pct:g}% each.",
+    ]
+
+
+def battery_workloads(cfg: TunerConfig) -> list[str]:
+    return [
+        f"{name}: " + " | ".join(workload_label(entry) for entry in cfg.battery if entry["regime"] == name)
+        for name in _REGIMES
+    ]
+
+
+def describe_slot(slot: dict, elapsed: float | None = None) -> str:
+    """One line saying what the running test is and why it runs."""
+    parts: list[str] = []
+    hunt = slot.get("hunt")
+    if hunt is not None:
+        if hunt["stage"] == "control":
+            parts.append("Hunt control probe: every core at stock")
+        else:
+            parts.append(f"Hunt {hunt['stage']} (level {hunt['level']}): cores {hunt['live']} live, the rest at stock")
+        parts.append(f"load on cores {slot['cores']}")
+    else:
+        stage = slot.get("validation_stage")
+        if stage is not None:
+            parts.append(f"Validation S{stage} ({VALIDATION_STAGES.get(stage, f'stage {stage}')})")
+        if "core" in slot:
+            parts.append(f"core {slot['core']} at {slot['offset']} ({phase_label(slot['phase'])})")
+        else:
+            parts.append(f"cores {slot['cores']}")
+    regimes = slot.get("battery_regimes")
+    if regimes:
+        parts.append(f"regime {slot['battery_position']} of {len(regimes)}: {slot['regime']} ({', '.join(regimes)})")
+    elif slot.get("regime"):
+        parts.append(f"regime {slot['regime']}")
+    label = workload_label(slot)
+    if label:
+        parts.append(label)
+    duration = slot.get("duration_seconds")
+    if duration:
+        parts.append(f"{int(elapsed)}/{duration} s" if elapsed is not None else f"{duration} s")
+    return "Now: " + " | ".join(parts)
 
 
 class TunerTab(QWidget):
@@ -93,6 +172,8 @@ class TunerTab(QWidget):
         self._tuner_timer.timeout.connect(self._tick_tuner)
         self._active_test_core: int | None = None
         self._test_start_time: float = 0
+        self._slot: dict | None = None
+        self._slot_started_at: float = 0
 
         self._setup_ui()
         self._check_resume()
@@ -112,6 +193,11 @@ class TunerTab(QWidget):
         status_layout.addWidget(self._progress_label)
         status_layout.addStretch()
         layout.addLayout(status_layout)
+
+        self._slot_label = QLabel("")
+        self._slot_label.setWordWrap(True)
+        self._slot_label.setStyleSheet(f"color: {theme.COLOR_TEXT_DIM};")
+        layout.addWidget(self._slot_label)
 
         # Main splitter: config+table on top, log on bottom
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -168,7 +254,7 @@ class TunerTab(QWidget):
 
         # Core status table
         self._core_table = QTableWidget()
-        self._core_table.setColumnCount(7 + len(_REGIMES))
+        self._core_table.setColumnCount(10 + len(_REGIMES))
         self._core_table.setHorizontalHeaderLabels(
             [
                 "Core",
@@ -176,11 +262,18 @@ class TunerTab(QWidget):
                 "Phase",
                 "Candidate",
                 "Accepted",
+                "BIOS",
                 "Confidence",
                 *(regime.capitalize() for regime in _REGIMES),
                 "Suspicion",
+                "Crashes",
+                "Strikes",
             ]
         )
+        bios_header = self._core_table.horizontalHeaderItem(5)
+        bios_header.setToolTip("Accepted offset moved toward stock by the BIOS guard band, for persistent BIOS use")
+        strikes_header = self._core_table.horizontalHeaderItem(self._core_table.columnCount() - 1)
+        strikes_header.setToolTip("Failed anneal probes one step deeper; each doubles the clean time the next needs")
         self._core_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         self._core_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._core_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
@@ -214,19 +307,22 @@ class TunerTab(QWidget):
         bottom_layout.addLayout(log_header)
 
         self._log_table = QTableWidget()
-        self._log_table.setColumnCount(7)
+        self._log_table.setColumnCount(9)
         self._log_table.setHorizontalHeaderLabels(
             [
                 "Time",
                 "Core",
                 "Offset",
                 "Phase",
+                "Regime",
+                "Workload",
                 "Result",
                 "Duration",
                 "Error",
             ]
         )
         self._log_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._log_table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self._log_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._log_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
         self._log_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
@@ -234,7 +330,20 @@ class TunerTab(QWidget):
         bottom_layout.addWidget(self._log_table)
 
         splitter.addWidget(bottom)
-        splitter.setSizes([400, 200])
+
+        events = QWidget()
+        events_layout = QVBoxLayout(events)
+        events_layout.setContentsMargins(0, 0, 0, 0)
+        events_label = QLabel("Tuner Events")
+        events_label.setFont(QFont("monospace", 10, QFont.Weight.Bold))
+        events_layout.addWidget(events_label)
+        self._events_view = QPlainTextEdit()
+        self._events_view.setReadOnly(True)
+        self._events_view.setMaximumBlockCount(_MAX_LOG_ROWS)
+        events_layout.addWidget(self._events_view)
+        splitter.addWidget(events)
+
+        splitter.setSizes([400, 200, 120])
         layout.addWidget(splitter)
 
     def _build_config_panel(self, parent_layout: QVBoxLayout) -> None:
@@ -244,6 +353,7 @@ class TunerTab(QWidget):
         right_column.addWidget(self._build_workload_panel())
         right_column.addWidget(self._build_timing_panel())
         columns.addLayout(right_column)
+        columns.addWidget(self._build_battery_panel())
         parent_layout.addLayout(columns)
 
         button_row = QHBoxLayout()
@@ -332,7 +442,8 @@ class TunerTab(QWidget):
         from corecycler.engine.backends import available_backends, load_all
 
         load_all()
-        group = QGroupBox("Stress Test")
+        group = QGroupBox("Validation Stress")
+        group.setToolTip("Workload for multi-core validation stages. Search slots run the regime battery instead.")
         layout = QFormLayout(group)
         layout.setSpacing(6)
 
@@ -357,18 +468,40 @@ class TunerTab(QWidget):
         self._search_dur_spin = QSpinBox()
         self._apply_field_bounds(self._search_dur_spin, "search_duration_seconds")
         self._search_dur_spin.setSuffix("s")
-        layout.addRow("Search duration:", self._search_dur_spin)
+        layout.addRow("Search, per regime:", self._search_dur_spin)
 
         self._confirm_dur_spin = QSpinBox()
         self._apply_field_bounds(self._confirm_dur_spin, "confirm_duration_seconds")
         self._confirm_dur_spin.setSuffix("s")
-        layout.addRow("Confirm duration:", self._confirm_dur_spin)
+        layout.addRow("Confirm, per regime:", self._confirm_dur_spin)
 
         self._validate_dur_spin = QSpinBox()
         self._apply_field_bounds(self._validate_dur_spin, "validate_duration_seconds")
         self._validate_dur_spin.setSuffix("s")
         layout.addRow("Validate duration:", self._validate_dur_spin)
         return group
+
+    def _build_battery_panel(self) -> QGroupBox:
+        group = QGroupBox("Search Battery")
+        layout = QVBoxLayout(group)
+        self._battery_label = QLabel("")
+        self._battery_label.setWordWrap(True)
+        self._battery_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        layout.addWidget(self._battery_label)
+        layout.addStretch()
+        self._battery_config = TunerConfig()
+        self._search_dur_spin.valueChanged.connect(self._refresh_battery_summary)
+        self._confirm_dur_spin.valueChanged.connect(self._refresh_battery_summary)
+        return group
+
+    def _refresh_battery_summary(self) -> None:
+        cfg = dataclasses.replace(
+            self._battery_config,
+            search_duration_seconds=self._search_dur_spin.value(),
+            confirm_duration_seconds=self._confirm_dur_spin.value(),
+        )
+        self._battery_label.setText("\n".join(battery_summary(cfg)))
+        self._battery_label.setToolTip("\n".join(battery_workloads(cfg)))
 
     def _get_config(self) -> TunerConfig:
         return TunerConfig(
@@ -399,6 +532,7 @@ class TunerTab(QWidget):
         config, so the panel must show those values, not whatever was left
         in the boxes from before.
         """
+        self._battery_config = cfg
         self._start_offset_spin.setValue(cfg.start_offset)
         self._coarse_step_spin.setValue(cfg.coarse_step)
         self._fine_step_spin.setValue(cfg.fine_step)
@@ -414,6 +548,7 @@ class TunerTab(QWidget):
         self._backend_combo.setCurrentText(cfg.backend)
         self._mode_combo.setCurrentText(cfg.stress_mode)
         self._fft_combo.setCurrentText(cfg.fft_preset)
+        self._refresh_battery_summary()
 
     # ------------------------------------------------------------------
     # Actions
@@ -478,6 +613,7 @@ class TunerTab(QWidget):
         )
         self._wire_engine()
 
+        self._events_view.clear()
         self._engine.start()
         if self._engine.status not in ACTIVE_STATUSES:
             QMessageBox.warning(
@@ -626,12 +762,7 @@ class TunerTab(QWidget):
             )
             self._wire_engine()
         log.info("Resuming tuner session %d with its saved config", session_id)
-        for event in self._db.get_tuner_events(session_id, limit=20):
-            log.info(
-                "[tuner] story: %s %s",
-                format_local(event.get("timestamp", "")),
-                event.get("message", ""),
-            )
+        self._show_session_events(session_id)
         self._engine.resume(session_id)
         if self._engine.status not in ACTIVE_STATUSES:
             QMessageBox.warning(
@@ -721,6 +852,7 @@ class TunerTab(QWidget):
             (self._engine.status_changed, self._on_status_changed),
             (self._engine.progress_updated, self._on_progress_updated),
             (self._engine.log_message, self._on_log_message),
+            (self._engine.slot_started, self._on_slot_started),
             (self._engine.platform_fault, self._on_platform_fault),
             (self._engine.co_drift_detected, self._on_co_drift),
             (self._engine.validation_progress, self._on_validation_progress),
@@ -781,8 +913,6 @@ class TunerTab(QWidget):
 
         self._active_test_core = core_id
         self.tuner_core_testing.emit(core_id, "testing")
-        import time
-
         self._test_start_time = time.monotonic()
         if not self._tuner_timer.isActive():
             self._tuner_timer.start(1000)
@@ -795,6 +925,7 @@ class TunerTab(QWidget):
         if self._active_test_core == core_id:
             self._active_test_core = None
             self._tuner_timer.stop()
+        self._clear_slot()
         self._update_core_row(core_id)
         self._add_log_entry(core_id, offset, passed)
 
@@ -842,6 +973,8 @@ class TunerTab(QWidget):
             self._status_label.setText(f"Status: {status_label(status)}")
             # Clear validation progress when leaving validation
             self._progress_label.setText("")
+        if status not in ACTIVE_STATUSES and not (self._engine is not None and self._engine.test_in_flight):
+            self._clear_slot()
         # The engine pauses ITSELF on apparatus/SMU/startup faults ("fix the
         # cause, then Resume"). The buttons must follow the engine's status,
         # or every self-pause is a dead end with Resume greyed out.
@@ -878,17 +1011,7 @@ class TunerTab(QWidget):
     @Slot(int, int, int)
     def _on_validation_progress(self, stage: int, current: int, total: int) -> None:
         """Update status and progress labels during multi-core validation."""
-        stage_names = {
-            1: "per-core",
-            2: "all-core",
-            3: "half-core",
-            4: "transitions",
-            5: "spectrum",
-            6: "memory",
-            7: "soak",
-            9: "endurance",
-        }
-        stage_name = stage_names.get(stage, f"stage {stage}")
+        stage_name = VALIDATION_STAGES.get(stage, f"stage {stage}")
         self._status_label.setText(f"Status: Validating S{stage} ({stage_name})")
         self._progress_label.setText(f"S{stage}: {current}/{total}")
 
@@ -899,11 +1022,33 @@ class TunerTab(QWidget):
     @Slot(str)
     def _on_log_message(self, msg: str) -> None:
         log.info("[tuner] %s", msg)
+        self._append_event(datetime.now(UTC).isoformat(), msg)
+
+    @Slot(str)
+    def _on_slot_started(self, payload: str) -> None:
+        self._slot = json.loads(payload)
+        self._slot_started_at = time.monotonic()
+        self._slot_label.setText(describe_slot(self._slot))
+        if not self._tuner_timer.isActive():
+            self._tuner_timer.start(1000)
+
+    def _clear_slot(self) -> None:
+        self._slot = None
+        self._slot_label.setText("")
+
+    def _append_event(self, timestamp: str, message: str, severity: str = "info") -> None:
+        marker = "" if severity == "info" else f"[{severity}] "
+        self._events_view.appendPlainText(f"{format_local(timestamp)}  {marker}{message}")
+
+    def _show_session_events(self, session_id: int) -> None:
+        self._events_view.clear()
+        for event in self._db.get_tuner_events(session_id):
+            self._append_event(event.get("timestamp", ""), event.get("message", ""), event.get("severity", "info"))
 
     def _tick_tuner(self) -> None:
+        if self._slot is not None:
+            self._slot_label.setText(describe_slot(self._slot, time.monotonic() - self._slot_started_at))
         if self._active_test_core is not None:
-            import time
-
             elapsed = time.monotonic() - self._test_start_time
             self.tuner_core_elapsed.emit(self._active_test_core, elapsed)
         elif self._engine is None or self._engine.status == "idle":
@@ -928,17 +1073,22 @@ class TunerTab(QWidget):
 
         core_info = self._topology.cores.get(core_id) if self._topology else None
         ccd = core_info.ccd if core_info else None
+        ccd_text = "-" if ccd is None else f"{ccd} V-Cache" if core_info.has_vcache else str(ccd)
         hours = projection["hours"]
         accepted = projection["accepted_offset"]
+        bios = projection["bios_offset"]
         items = [
             str(core_id),
-            str(ccd) if ccd is not None else "-",
+            ccd_text,
             phase_label(cs.phase),
             str(projection["candidate_offset"]),
             str(accepted) if accepted is not None else "-",
+            str(bios) if bios is not None else "-",
             f"{projection['confidence_hours']:.1f}h",
             *(f"{hours.get(regime, 0.0):.1f}h" for regime in _REGIMES),
             f"{projection['suspicion']:.1f}" if projection["suspicion"] else "-",
+            str(projection["crashes"]),
+            str(projection["anneal_strikes"]),
         ]
         self._core_table.setVerticalHeaderItem(row, QTableWidgetItem(phase_label(cs.phase)))
 
@@ -979,6 +1129,8 @@ class TunerTab(QWidget):
             str(entry["core_id"]),
             str(entry["offset_tested"]),
             entry.get("phase", ""),
+            entry.get("regime") or "-",
+            workload_label(entry) or "-",
             "PASS" if passed else "FAIL",
             f"{entry.get('duration_seconds', 0):.1f}s" if entry.get("duration_seconds") else "-",
             entry.get("error_message", "") or "",
@@ -986,7 +1138,7 @@ class TunerTab(QWidget):
         color = QColor(theme.COLOR_PASS) if passed else QColor(theme.COLOR_FAIL)
         for column, text in enumerate(items):
             item = QTableWidgetItem(text)
-            if column == 4:
+            if column == _LOG_RESULT_COLUMN:
                 item.setForeground(color)
             self._log_table.setItem(row, column, item)
 

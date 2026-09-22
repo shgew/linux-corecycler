@@ -536,6 +536,7 @@ class TestEngineSignals:
             status_changed = Signal(str)
             progress_updated = Signal(int, int)
             log_message = Signal(str)
+            slot_started = Signal(str)
             platform_fault = Signal(str)
             co_drift_detected = Signal(str)
             validation_progress = Signal(int, int, int)
@@ -605,7 +606,7 @@ class TestEngineSignals:
         assert tab._active_test_core is None
         assert not tab._tuner_timer.isActive()
         assert tab._log_table.rowCount() == 1
-        assert tab._log_table.item(0, 4).text() == "PASS"
+        assert tab._log_table.item(0, 6).text() == "PASS"
 
     def test_session_completion_releases_the_ui(self, tab, monkeypatch):
         _mute_notify(monkeypatch)
@@ -751,7 +752,7 @@ class TestLogTable:
 
         assert tab._log_table.rowCount() == 2000
         assert tab._log_table.item(0, 0) is None
-        assert tab._log_table.item(1999, 4).text() == "FAIL"
+        assert tab._log_table.item(1999, 6).text() == "FAIL"
 
     def test_selecting_a_core_filters_the_log(self, tab):
         sid = _seed_session(tab._db)
@@ -765,7 +766,7 @@ class TestLogTable:
         tab._on_core_selected(0, 0, -1, -1)
         assert tab._selected_core == 1
         assert tab._log_table.rowCount() == 1
-        assert tab._log_table.item(0, 4).text() == "FAIL"
+        assert tab._log_table.item(0, 6).text() == "FAIL"
 
     def test_selecting_an_empty_row_shows_every_core(self, tab):
         sid = _seed_session(tab._db)
@@ -776,7 +777,7 @@ class TestLogTable:
         tab._on_core_selected(5, 0, -1, -1)
         assert tab._selected_core is None
         assert tab._log_table.rowCount() == 2
-        assert tab._log_table.item(1, 5).text() == "-"
+        assert tab._log_table.item(1, 7).text() == "-"
 
     def test_refresh_keeps_only_the_newest_rows(self, tab):
         sid = _seed_session(tab._db)

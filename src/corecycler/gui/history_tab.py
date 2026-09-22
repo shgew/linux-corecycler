@@ -32,10 +32,12 @@ from PySide6.QtWidgets import (
 )
 
 from corecycler.config.paths import user_home
-from corecycler.gui.style import duration_str, font_mono, phase_label, span_str, theme
+from corecycler.gui.style import duration_str, font_mono, phase_label, span_str, status_label, theme
 from corecycler.gui.widgets import table_item as _item
 from corecycler.history.db import InFlightRecord
 from corecycler.history.timefmt import format_local
+from corecycler.tuner import report as tuner_report
+from corecycler.tuner.regime import workload_label
 from corecycler.tuner.state import TunerPhase, TunerSession
 
 if TYPE_CHECKING:
@@ -926,7 +928,7 @@ class HistoryTab(QWidget):
             ]
             items = [
                 (date_str, Qt.AlignmentFlag.AlignLeft),
-                (sess.status.capitalize(), Qt.AlignmentFlag.AlignCenter),
+                (status_label(sess.status), Qt.AlignmentFlag.AlignCenter),
                 (sess.cpu_model[:30] if sess.cpu_model else "-", Qt.AlignmentFlag.AlignLeft),
                 (str(total), Qt.AlignmentFlag.AlignCenter),
                 (f"{confirmed}/{total}", Qt.AlignmentFlag.AlignCenter),
@@ -977,6 +979,8 @@ class HistoryTab(QWidget):
         ]
         if sess.bios_version:
             info_parts.append(f"BIOS {sess.bios_version}")
+        if sess.app_version:
+            info_parts.append(f"build {sess.app_version}")
         self._detail_info.setText("  |  ".join(info_parts))
         self._detail_info.setStyleSheet(f"color: {theme.COLOR_TEXT_DIM}; padding: 2px;")
 
@@ -1041,7 +1045,12 @@ class HistoryTab(QWidget):
 
         self._auto_size_core_results_table()
 
-        lines: list[str] = []
+        lines: list[str] = ["── Report ──"]
+        try:
+            lines.extend(tuner_report.render(tuner_report.build(self._db, sess.id)))
+        except ValueError as exc:
+            lines.append(f"Report unavailable: {exc}")
+        lines.append("")
         lines.append("── Tuner Configuration ──")
         lines.append(json.dumps(cfg, indent=2))
 
@@ -1061,10 +1070,12 @@ class HistoryTab(QWidget):
                 dur = f"{entry.get('duration_seconds', 0):.1f}s" if entry.get("duration_seconds") else "-"
                 err = entry.get("error_message", "")
                 err_str = f" - {err}" if err else ""
+                regime = entry.get("regime")
+                ran = f"  {regime}: {workload_label(entry)}" if regime else ""
                 lines.append(
                     f"  {ts}  Core {entry['core_id']}  "
                     f"offset {entry['offset_tested']}  "
-                    f"[{entry.get('phase', '?')}] {result}  {dur}{err_str}"
+                    f"[{entry.get('phase', '?')}] {result}  {dur}{ran}{err_str}"
                 )
 
         profile = self._db.get_tuner_best_profile(sess.id)

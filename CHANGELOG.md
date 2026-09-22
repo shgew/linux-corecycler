@@ -10,6 +10,24 @@ A per-core CPU stability tester and AMD PBO Curve Optimizer tuner for Linux,
 packaged as a NixOS module with an overlay. Forked from
 [Daaboulex/linux-corecycler](https://github.com/Daaboulex/linux-corecycler).
 
+### Added (2026-09-22 tuner state in the GUI)
+
+- The Auto-Tuner tab names the running test: core, offset, phase, which regime of the
+  offset's battery it is (for example "regime 2 of 2: current"), workload, and elapsed
+  against its duration. Hunt probes show which cores stay live, and validation slots show
+  their stage. The engine announces each launch through a new `slot_started` signal.
+- A Search Battery panel shows what one offset costs in each phase. The duration fields
+  now read "per regime", because coarse search runs two regimes per offset and fine
+  search runs four. The stress panel is relabelled Validation Stress, since search slots
+  run the battery instead.
+- The test log gains Regime and Workload columns. The core table gains the BIOS
+  recommendation, crash count, anneal strikes and V-Cache CCDs.
+- A live Tuner Events pane shows the engine's narrative (hunt probes, seeds, anneals,
+  pauses), replayed from the session's stored events on resume.
+- History's tuner detail starts with the `corecycler report` text, adds regime and
+  workload to each test-log line, and shows the build that created the session.
+- `hunting`, `platform_fault` and `profile_quarantined` have status labels and colors.
+
 ### Fixed (2026-09-22 every mprime test paused the tuner)
 
 - mprime traps SIGTERM, shuts its workers down and exits 0. Since the senior review pass

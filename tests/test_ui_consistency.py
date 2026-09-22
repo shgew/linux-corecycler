@@ -259,6 +259,7 @@ class TestLoadToCOEnabledForConfirmed:
             config_json="{}",
             cpu_model="cpu",
             bios_version=None,
+            app_version="",
             created_at="2026-07-17T00:00:00+00:00",
         )
         states = {
@@ -271,6 +272,7 @@ class TestLoadToCOEnabledForConfirmed:
         ns._db.get_tuner_core_states.return_value = states
         ns._db.get_tuner_test_log.return_value = []
         ns._db.get_tuner_events.return_value = []
+        ns._db.get_tuner_session.return_value = None
         MethodType(HistoryTab._show_tuner_session_detail, ns)(sess)
         return ns
 
@@ -369,6 +371,7 @@ class TestEngineInitiatedStops:
         ns._validate_btn = MagicMock()
         ns._export_btn = MagicMock()
         ns._notify = MagicMock()
+        ns._clear_slot = MagicMock()
         return ns
 
     def test_engine_self_abort_reenables_ui(self):

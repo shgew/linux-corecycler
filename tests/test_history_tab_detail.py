@@ -27,6 +27,7 @@ from corecycler.history.db import (
     TelemetrySample,
     TuningContextRecord,
 )
+from corecycler.tuner import report as tuner_report
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.state import CoreState, TunerPhase
 
@@ -591,6 +592,50 @@ class TestTunerSessionDetail:
         assert "Confirmed CO Profile" in text
         assert "Tuner Events" in text
         assert "[error] Restoration could not be verified" in text
+
+    def test_detail_shows_the_canonical_report_regimes_and_build(self, db):
+        sid = _seed_session(db, "running")
+        db.upsert_tuner_core_state(
+            sid, CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-20, proven_offset=-20)
+        )
+        db.insert_tuner_test_log(
+            sid,
+            0,
+            -20,
+            "coarse",
+            True,
+            duration=60.0,
+            backend="mprime",
+            stress_mode="AVX2",
+            fft_preset="SMALL",
+            threads=2,
+            profile="transient",
+            regime="transient",
+        )
+        tab = _tab(db)
+        sess = db.get_tuner_session(sid)
+        sess.app_version = "0.1.0+gabc1234"
+
+        tab._show_tuner_session_detail(sess)
+
+        text = tab._events_log.toPlainText()
+        for line in tuner_report.render(tuner_report.build(db, sid)):
+            assert line in text
+        assert "transient: mprime AVX2 SMALL 2T transient" in text
+        assert "build 0.1.0+gabc1234" in tab._detail_info.text()
+
+    def test_a_session_the_report_cannot_read_still_renders(self, db):
+        legacy = json.loads(TunerConfig().to_json())
+        legacy["hardening_tiers"] = 2
+        sid = db.create_tuner_session(json.dumps(legacy), bios_version="2402", cpu_model="Test 8C")
+        db.insert_tuner_test_log(sid, 0, -5, "coarse", True, duration=60.0)
+        tab = _tab(db)
+
+        tab._show_tuner_session_detail(db.get_tuner_session(sid))
+
+        text = tab._events_log.toPlainText()
+        assert "Report unavailable: unknown tuner config fields: hardening_tiers" in text
+        assert "offset -5" in text
 
     def test_unparsable_config_falls_back_to_empty(self, db):
         sid = _seed_session(db, "completed")
