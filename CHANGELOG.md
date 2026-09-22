@@ -28,6 +28,15 @@ packaged as a NixOS module with an overlay. Forked from
   workload to each test-log line, and shows the build that created the session.
 - `hunting`, `platform_fault` and `profile_quarantined` have status labels and colors.
 
+### Fixed (2026-09-22 every y-cruncher slot paused the tuner)
+
+- The default battery named its y-cruncher workloads `ycruncher`, but the backend is
+  registered as `y-cruncher`. Every y-cruncher slot failed its backend lookup and paused
+  the tuner with "test could not run - 'ycruncher'", even with y-cruncher installed. The
+  battery now uses the registered name, and config validation rejects a battery or
+  endurance workload whose backend is not registered, so a bad name is refused before a
+  session starts instead of mid-search.
+
 ### Fixed (2026-09-22 every mprime test paused the tuner)
 
 - mprime traps SIGTERM, shuts its workers down and exits 0. Since the senior review pass

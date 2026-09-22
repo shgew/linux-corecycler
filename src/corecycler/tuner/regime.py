@@ -41,6 +41,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
+from corecycler.engine.backends import BACKEND_REGISTRY
+
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
@@ -130,12 +132,12 @@ def workload_label(data: Mapping[str, object]) -> str:
 #: regime rotate freely, since they all bank into the same confidence bucket.
 DEFAULT_BATTERY: tuple[Workload, ...] = (
     Workload(Regime.BOOST, "mprime", "SSE", "SMALL", threads=1),
-    Workload(Regime.BOOST, "ycruncher", "AVX2", "SMALL", threads=1, tests=("BKT",)),
+    Workload(Regime.BOOST, "y-cruncher", "AVX2", "SMALL", threads=1, tests=("BKT",)),
     Workload(Regime.CURRENT, "mprime", "AVX2", "SMALL", threads=2),
-    Workload(Regime.CURRENT, "ycruncher", "AVX2", "SMALL", threads=2, tests=("FFTv4", "N63")),
+    Workload(Regime.CURRENT, "y-cruncher", "AVX2", "SMALL", threads=2, tests=("FFTv4", "N63")),
     Workload(Regime.TRANSIENT, "mprime", "AVX2", "SMALL", threads=2, profile=Profile.TRANSIENT),
     Workload(Regime.COUPLED, "mprime", "AVX2", "LARGE", threads=2, memory_coupled=True),
-    Workload(Regime.COUPLED, "ycruncher", "AVX2", "SMALL", threads=2, tests=("VT3",), memory_coupled=True),
+    Workload(Regime.COUPLED, "y-cruncher", "AVX2", "SMALL", threads=2, tests=("VT3",), memory_coupled=True),
 )
 
 #: Coarse search runs only the regimes most likely to fail fast, because a
@@ -155,6 +157,11 @@ def workload_errors(name: str, index: int, item: object) -> list[str]:
         return [f"{name}[{index}].regime must be one of {sorted(r.value for r in Regime)}"]
     if not all(isinstance(item.get(k), str) and item[k].strip() for k in ("backend", "stress_mode", "fft_preset")):
         return [f"{name}[{index}] requires non-blank string backend, stress_mode, fft_preset"]
+    if item["backend"] not in BACKEND_REGISTRY:
+        return [
+            f"{name}[{index}].backend {item['backend']!r} is not a registered backend "
+            f"({', '.join(sorted(BACKEND_REGISTRY))})"
+        ]
     try:
         profile = Profile(item.get("profile", "sustained"))
     except (TypeError, ValueError):

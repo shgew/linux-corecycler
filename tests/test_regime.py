@@ -29,7 +29,7 @@ def test_default_battery_is_the_decided_execution_contract():
         },
         {
             "regime": "boost",
-            "backend": "ycruncher",
+            "backend": "y-cruncher",
             "stress_mode": "AVX2",
             "fft_preset": "SMALL",
             "profile": "sustained",
@@ -46,7 +46,7 @@ def test_default_battery_is_the_decided_execution_contract():
         },
         {
             "regime": "current",
-            "backend": "ycruncher",
+            "backend": "y-cruncher",
             "stress_mode": "AVX2",
             "fft_preset": "SMALL",
             "profile": "sustained",
@@ -72,7 +72,7 @@ def test_default_battery_is_the_decided_execution_contract():
         },
         {
             "regime": "coupled",
-            "backend": "ycruncher",
+            "backend": "y-cruncher",
             "stress_mode": "AVX2",
             "fft_preset": "SMALL",
             "profile": "sustained",
@@ -88,13 +88,13 @@ def test_workload_labels_describe_the_actual_stress_recipe():
     assert (
         Workload(
             Regime.BOOST,
-            "ycruncher",
+            "y-cruncher",
             "AVX2",
             "SMALL",
             threads=1,
             tests=("BKT", "BBP"),
         ).label
-        == "ycruncher AVX2 SMALL 1T BKT/BBP"
+        == "y-cruncher AVX2 SMALL 1T BKT/BBP"
     )
     assert (
         Workload(
@@ -111,7 +111,7 @@ def test_workload_labels_describe_the_actual_stress_recipe():
 def test_workload_serialization_preserves_optional_execution_details():
     serialized = {
         "regime": "coupled",
-        "backend": "ycruncher",
+        "backend": "y-cruncher",
         "stress_mode": "AVX2",
         "fft_preset": "SMALL",
         "profile": "spectrum",
@@ -127,7 +127,7 @@ def test_regimes_covered_reports_each_distinct_load_class():
     battery = [
         _entry(regime="boost"),
         _entry(regime="current"),
-        _entry(regime="boost", backend="ycruncher"),
+        _entry(regime="boost", backend="y-cruncher"),
         _entry(regime="transient"),
         _entry(regime="coupled"),
     ]
@@ -168,6 +168,16 @@ def test_workload_errors_explain_malformed_entries_exactly():
         "battery[2].tests has unknown tags: AAA, ZZZ"
     ]
     assert workload_errors("battery", 2, _entry(threads=2, tests=["BKT"])) == []
+
+
+def test_workload_errors_reject_a_backend_the_registry_cannot_launch():
+    assert workload_errors("battery", 2, _entry(backend="ycruncher")) == [
+        "battery[2].backend 'ycruncher' is not a registered backend (mprime, stress-ng, stressapptest, y-cruncher)"
+    ]
+
+
+def test_the_shipped_config_validates():
+    assert TunerConfig().validate() == []
 
 
 def test_config_rejects_blank_fields_in_search_and_endurance_batteries():
