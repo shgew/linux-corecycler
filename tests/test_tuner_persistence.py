@@ -273,6 +273,16 @@ class TestEvidenceSummary:
 
         assert summary == {0: {"mprime AVX2 SMALL": 360.0}}
 
+    def test_transition_and_soak_validation_contribute_evidence(self, db):
+        sid = db.create_tuner_session(TunerConfig().to_json(), "", "")
+        common = dict(backend="mprime", stress_mode="AVX2", fft_preset="SMALL", regime="current")
+        db.insert_tuner_test_log(sid, 0, -10, "validate_s4", True, duration=120.0, **common)
+        db.insert_tuner_test_log(sid, 0, -10, "validate_s7", True, duration=180.0, **common)
+
+        summary = evidence_summary(db, sid, {0: CoreState(core_id=0, best_offset=-10)}, direction=-1)
+
+        assert summary == {0: {"mprime AVX2 SMALL": 300.0}}
+
     def test_promoted_annealing_offset_contributes_evidence(self, db):
         context_id = db.get_or_create_context(TuningContextRecord(bios_version="1.0", context_hash="ctx"))
         sid = db.create_tuner_session(TunerConfig().to_json(), "", "", context_id=context_id)
@@ -529,6 +539,8 @@ class TestSchemaV15Narrative:
             sid = db.create_tuner_session("{}", "1.0", "TestCPU")
             assert tp.pick_auto_resume_session(db).id == sid  # running
             db.update_tuner_session_status(sid, "validating")
+            assert tp.pick_auto_resume_session(db).id == sid
+            db.update_tuner_session_status(sid, "hunting")
             assert tp.pick_auto_resume_session(db).id == sid
             db.update_tuner_session_status(sid, "paused")
             assert tp.pick_auto_resume_session(db) is None  # human choice

@@ -732,14 +732,15 @@ class TestResumeConfigOverride:
         assert cli.cli_main(["resume", "7", "--config", "f.json"]) == cli.EXIT_COMPLETED
         assert seen == {"config_path": "f.json", "resume_id": 7, "auto_resume": False}
 
-    def test_completed_session_is_rejected_before_engine_start(self, db, capsys):
+    @pytest.mark.parametrize("status", ["completed", "platform_fault"])
+    def test_terminal_session_is_rejected_before_engine_start(self, db, capsys, status):
         sid = db.create_tuner_session(TunerConfig().to_json(), "", "")
-        db.update_tuner_session_status(sid, "completed")
+        db.update_tuner_session_status(sid, status)
 
-        code = cli.cmd_run(None, sid, False, engine_factory=lambda *_: pytest.fail("completed session resumed"), db=db)
+        code = cli.cmd_run(None, sid, False, engine_factory=lambda *_: pytest.fail("terminal session resumed"), db=db)
 
         assert code == cli.EXIT_REFUSED
-        assert "completed" in capsys.readouterr().err
+        assert status in capsys.readouterr().err
 
     def test_a_compatible_override_replaces_the_saved_config(self, db, tmp_path):
         sid = self._resumable_session(db)

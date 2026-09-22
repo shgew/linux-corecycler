@@ -344,6 +344,7 @@ def _cmd_run(
     from PySide6.QtCore import QCoreApplication, QLockFile, QTimer
 
     from corecycler.config.paths import ensure_state_directory
+    from corecycler.history.db import RECOVERABLE_STATUSES
 
     app = QCoreApplication.instance() or QCoreApplication(sys.argv[:1])
 
@@ -374,8 +375,8 @@ def _cmd_run(
     if (resume_id is not None or auto_resume) and session is None:
         print("corecycler: no resumable session", file=sys.stderr)
         return EXIT_REFUSED
-    if session is not None and session.status == "completed":
-        print(f"corecycler: session {session.id} is completed and cannot be resumed", file=sys.stderr)
+    if session is not None and session.status not in RECOVERABLE_STATUSES:
+        print(f"corecycler: session {session.id} is {session.status} and cannot be resumed", file=sys.stderr)
         return EXIT_REFUSED
     seeds: dict[int, int] | None = None
     if seed_from is not None:

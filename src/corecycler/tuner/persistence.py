@@ -37,7 +37,7 @@ def journal_values(db: HistoryDB, session_id: int) -> dict[int, int]:
 def pick_auto_resume_session(db: HistoryDB) -> TunerSession | None:
     """Return the active session only when unattended resume is appropriate."""
     session = db.get_active_tuner_session()
-    if session is not None and session.status in ("running", "validating"):
+    if session is not None and session.status in ("running", "validating", "hunting"):
         return session
     return None
 
@@ -57,8 +57,10 @@ VALIDATION_EVIDENCE_PHASES = frozenset(
         "validate_s1",
         "validate_s2",
         "validate_s3",
+        "validate_s4",
         "validate_s5",
         "validate_s6",
+        "validate_s7",
         "endurance",
     }
 )
