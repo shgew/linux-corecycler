@@ -86,11 +86,8 @@ class ParallelStress:
         if not lanes:
             return {}
         try:
-            if self.stress_config.memory_mb is not None:
-                per_lane_memory = self.stress_config.memory_mb // len(lanes)
-                if per_lane_memory < 1:
-                    raise RuntimeError("parallel memory budget is too small for every lane")
-            else:
+            per_lane_memory = self.stress_config.memory_mb
+            if per_lane_memory is None:
                 per_lane_memory = self.backend.default_memory_mb(len(lanes))
         except RuntimeError as exc:
             return {

@@ -100,7 +100,7 @@ class TestLaneBuilding:
         runner.run()
         assert seen == [(1, 17)]
 
-    def test_lanes_share_one_backend_memory_budget(self, tmp_path):
+    def test_backend_default_memory_is_split_per_lane(self, tmp_path):
         class MemoryBackend(RecordingBackend):
             def default_memory_mb(self, lanes: int = 1) -> int | None:
                 assert lanes == 2
@@ -117,9 +117,26 @@ class TestLaneBuilding:
         runner.run()
         assert seen == [256, 256]
 
-    def test_memory_budget_too_small_for_every_lane_is_an_apparatus_failure(self, tmp_path):
+    def test_explicit_memory_is_preserved_per_lane(self, tmp_path):
         runner = make_parallel(tmp_path)
-        runner.stress_config.memory_mb = 1
+        runner.stress_config.memory_mb = 512
+        seen: list[int | None] = []
+
+        def inspect(sup, lanes, config_for, duration):
+            seen.extend(config_for(one).memory_mb for one in lanes)
+            return {one.core_id: ok(one.core_id) for one in lanes}
+
+        ScriptedSupervisor.script = [inspect]
+        runner.run()
+
+        assert seen == [512, 512]
+
+    def test_invalid_default_memory_is_an_apparatus_failure(self, tmp_path):
+        class InvalidMemoryBackend(RecordingBackend):
+            def default_memory_mb(self, lanes: int = 1) -> int | None:
+                raise RuntimeError("parallel memory budget is too small")
+
+        runner = make_parallel(tmp_path, backend=InvalidMemoryBackend())
 
         results = runner.run()
 

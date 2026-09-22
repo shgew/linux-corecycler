@@ -373,6 +373,7 @@ class CoreScheduler:
         core_info = self.topology.cores.get(core_id)
         cpus = tuple(core_info.logical_cpus) if core_info else ()
         error = execution.watch_idle(
+            duration=duration,
             cpus=cpus,
             sibling_cpus=cpus,
             thermal=self._thermal or self._new_thermal(),

@@ -379,17 +379,17 @@ class TestRunOrchestration:
 
 class TestIdleComposition:
     def test_inter_core_idle_runs_between_cores(self, tmp_path, monkeypatch):
-        calls: list[str] = []
+        calls: list[tuple[str, float]] = []
 
         def fake_idle(**kwargs):
-            calls.append(kwargs["phase"])
+            calls.append((kwargs["phase"], kwargs["duration"]))
             return None
 
         monkeypatch.setattr(execution, "watch_idle", fake_idle)
         sched = make_scheduler(tmp_path, idle_between_cores=0.01)
         ScriptedSupervisor.script = [step_pass, step_pass]
         sched.run()
-        assert calls == ["inter-core idle", "inter-core idle"]
+        assert calls == [("inter-core idle", 0.01), ("inter-core idle", 0.01)]
 
     def test_an_idle_error_is_recorded_without_a_verdict_change(self, tmp_path, monkeypatch):
         monkeypatch.setattr(execution, "watch_idle", lambda **kwargs: "MCE during inter-core idle: bang")
