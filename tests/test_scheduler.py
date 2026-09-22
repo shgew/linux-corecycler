@@ -5,6 +5,7 @@ from __future__ import annotations
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import ClassVar
 
 import pytest
@@ -496,6 +497,21 @@ class TestRapidTransitions:
         result = sched.run_rapid_transitions([0], total_duration=1.0, load_seconds=0.02, idle_seconds=0.02)
         assert not result.passed
         assert result.error_type == "mce"
+
+
+class TestReportedDuration:
+    def test_teardown_after_the_deadline_is_not_stress_time(self, tmp_path, monkeypatch):
+        clock = [1000.0]
+        monkeypatch.setattr(scheduler_mod, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+        sched = make_scheduler(tmp_path, cores_to_test=[0])
+
+        def step(sup, lanes, config_for, duration):
+            clock[0] += 73.1
+            return {one.core_id: StressResult(core_id=one.core_id, passed=True, duration_seconds=72.0) for one in lanes}
+
+        ScriptedSupervisor.script = [step]
+        sched.run()
+        assert sched.results[0][0].duration_seconds == 72.0
 
 
 class TestSignalMarshallingAudit:

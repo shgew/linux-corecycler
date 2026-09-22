@@ -268,7 +268,6 @@ class CoreScheduler:
 
         self.stress_config.threads = len(lane.cpus)
         self.stress_config.duty_cycle = self.config.duty_cycle
-        start_time = time.monotonic()
         self._set_phase(core_id, "stress")
         supervisor = self._supervisor(f"stress (CPU {lane.cpu_list})")
         verdict = supervisor.run([lane], lambda _lane: self.stress_config, float(self.config.seconds_per_core))[core_id]
@@ -281,6 +280,7 @@ class CoreScheduler:
             status.current_phase = ""
             self.backend.cleanup(lane.work_dir, preserve_on_error=False)
             return
+        phases_start = time.monotonic()
         if not verdict.passed:
             passed = False
             error_msg = verdict.error_message
@@ -310,7 +310,7 @@ class CoreScheduler:
             self.backend.cleanup(lane.work_dir, preserve_on_error=False)
             return
 
-        elapsed = time.monotonic() - start_time
+        elapsed = verdict.duration_seconds + time.monotonic() - phases_start
         status.elapsed_seconds = elapsed
         status.iterations += 1
         status.state = "passed" if passed else "failed"
