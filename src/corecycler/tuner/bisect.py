@@ -471,6 +471,7 @@ def record(state: HuntState, *, reproduced: bool, control_confirmations: int, ma
         state.level = 0
         if not reproduced:
             state.found.append(suspect)
+            state.found.sort()
             state.no_reproduce = 0
         elif state.pending:
             state.deferred.append(suspect)
@@ -505,7 +506,7 @@ def record(state: HuntState, *, reproduced: bool, control_confirmations: int, ma
     if state.no_reproduce >= max_no_reproduce:
         state.pending = []
         state.deferred = []
-        state.stage = Stage.EXHAUSTED
+        state.stage = Stage.CULPRIT if state.found else Stage.EXHAUSTED
     else:
         state.pending.insert(0, parent)
     return state

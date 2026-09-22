@@ -103,10 +103,24 @@ class TestIsolation:
         assert probes <= 1 + 2 * 3 + 1
 
     def test_two_culprits_are_both_found(self):
-        state, _ = run_hunt(list(range(8)), {1, 6}, cap=400)
+        state, _ = run_hunt(list(range(8)), {1, 7}, cap=400)
         assert state.stage is Stage.CULPRIT
-        assert set(state.found) == {1, 6}
+        assert state.found == [1, 7]
         assert state.pending == []
+
+    def test_exhaustion_preserves_an_already_confirmed_culprit(self):
+        state = bisect.begin([0, 1, 2], [0])
+        state.stage = Stage.PROBE
+        state.found = [0]
+        state.pending = [[1, 2]]
+
+        assert bisect.next_live_set(state) == [1]
+        bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
+        assert bisect.next_live_set(state) == [2]
+        bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
+
+        assert state.stage is Stage.CULPRIT
+        assert state.found == [0]
 
     def test_confirmation_uses_persisted_leave_one_out_mask(self):
         state = bisect.begin([3], [3])
