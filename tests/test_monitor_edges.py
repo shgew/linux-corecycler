@@ -296,6 +296,19 @@ class TestCpufreqSysfsReaders:
         assert freq.read_max_frequency(0) is None
         assert freq.read_min_frequency(0) is None
 
+    def test_a_counter_the_kernel_does_not_expose_is_not_logged(self, tmp_path, monkeypatch, caplog):
+        freq = self._tree(tmp_path, monkeypatch, {"cpu0": {"scaling_cur_freq": "3600000\n"}})
+        with caplog.at_level("DEBUG", logger="corecycler.monitor.files"):
+            assert freq.read_core_frequencies() == {0: 3600.0}
+        assert [r for r in caplog.records if r.name == "corecycler.monitor.files"] == []
+
+    def test_a_counter_that_exists_but_cannot_be_read_is_logged(self, tmp_path, monkeypatch, caplog):
+        freq = self._tree(tmp_path, monkeypatch, {"cpu0": {"scaling_cur_freq": "3600000\n"}})
+        (tmp_path / "cpu" / "cpu0" / "cpufreq" / "cpuinfo_cur_freq").mkdir()
+        with caplog.at_level("DEBUG", logger="corecycler.monitor.files"):
+            assert freq.read_core_frequencies() == {0: 3600.0}
+        assert any("cpuinfo_cur_freq" in r.getMessage() for r in caplog.records)
+
 
 class TestRaplPowerReader:
     def _rapl(self, tmp_path, monkeypatch, domains, *, sibling=False):

@@ -10,6 +10,19 @@ A per-core CPU stability tester and AMD PBO Curve Optimizer tuner for Linux,
 packaged as a NixOS module with an overlay. Forked from
 [Daaboulex/linux-corecycler](https://github.com/Daaboulex/linux-corecycler).
 
+### Fixed (2026-09-22 every mprime test paused the tuner)
+
+- mprime traps SIGTERM, shuts its workers down and exits 0. Since the senior review pass
+  the supervisor read that deadline stop as "exited with code 0 - verdict unavailable",
+  so every mprime test that ran its full duration paused the tuner as an environment
+  issue. An exit 0 that answers the supervisor's own SIGTERM to a still-running payload
+  now counts as the supervisor's stop; an exit 0 nobody asked for still proves nothing.
+- The tuner tab kept showing the core as testing, with its elapsed timer counting, after
+  the engine paused itself on a test that could not run.
+- Optional telemetry files the kernel does not expose (`cpuinfo_cur_freq` on most AMD
+  systems) are no longer logged on every poll. On a 32-thread machine that noise rotated
+  the 20 MB debug log in about six minutes and erased the engine's own lines.
+
 ### Added (2026-09-21 senior review)
 
 - Seed a new tuning session with `corecycler tune --seed-from SESSION_ID`. Seeded offsets

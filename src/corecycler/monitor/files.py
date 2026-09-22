@@ -14,6 +14,8 @@ log = logging.getLogger(__name__)
 def read_text_optional(path: Path) -> str | None:
     try:
         return path.read_text().strip()
+    except FileNotFoundError:
+        return None
     except (OSError, UnicodeError):
         log.debug("Unable to read optional telemetry file %s", path, exc_info=True)
         return None
