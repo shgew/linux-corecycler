@@ -3553,7 +3553,11 @@ class TunerEngine(QObject):
                 self._apply_foreign_evidence(foreign)
             if self._session_id:
                 self._db.upsert_tuner_core_state(self._session_id, cs)
-            if self._status == "validating":
+            if self._hunting and self._hunt is not None:
+                self._requeue_hunt_probe()
+                if not self._restore_hunt_stock():
+                    return
+            elif self._status == "validating":
                 self._revert_all_to_baseline()
             else:
                 self._revert_core_to_baseline(core_id)

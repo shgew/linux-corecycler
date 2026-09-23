@@ -622,6 +622,33 @@ class TestOnsetHunt:
         assert persisted.in_flight == []
         assert bisect.next_live_set(persisted) == probe
 
+    def test_a_probe_that_could_not_run_is_requeued_at_stock(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
+        """Session 12 paused on "mprime exited with code 0" mid-probe and lost
+        probe [0, 1]: resume went straight to [2, 3]."""
+        eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
+        eng._start_hunt(observed_mttf=900.0, loaded=[5])
+        self._launch(eng, True)
+        probe = list(eng._hunt.in_flight)
+
+        eng._on_test_finished(5, False, "mprime exited with code 0 - verdict unavailable", "startup", 0.0, 0.0)
+
+        assert eng.status == "paused"
+        persisted = bisect.HuntState.from_json(db.get_tuner_session(eng._session_id).hunt_state)
+        assert bisect.next_live_set(persisted) == probe
+        assert all(eng._smu.written[c] == 0 for c in BEST)
+
+    def test_a_probe_that_could_not_run_quarantines_when_stock_will_not_restore(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
+        eng._start_hunt(observed_mttf=900.0, loaded=[5])
+        self._launch(eng, True)
+        eng._smu.set_co_offset = lambda core_id, value: False
+
+        eng._on_test_finished(5, False, "mprime exited with code 0 - verdict unavailable", "startup", 0.0, 0.0)
+
+        assert db.get_tuner_session(eng._session_id).status == "profile_quarantined"
+
     def test_a_long_failure_keeps_one_launch_per_probe(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
         eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
         eng._start_hunt(observed_mttf=900.0, loaded=[5])

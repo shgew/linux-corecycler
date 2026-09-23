@@ -24,6 +24,10 @@ packaged as a NixOS module with an overlay. Forked from
   `onset_failure_seconds` of load start is probed with repeated short launches instead of
   ever-longer windows, and every solo slot idles `co_settle_seconds` between its CO write
   and its load step.
+- A hunt probe that could not run (for example `mprime exited with code 0` when the tuner
+  is stopped) is requeued and every core goes back to stock before the pause. It used to
+  drop the probe, so resume skipped half of a bisection, and it left the other live cores
+  at their offsets while idle.
 
 ### Fixed (2026-09-23 review of the fork's own changes)
 
