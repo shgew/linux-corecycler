@@ -980,14 +980,13 @@ class TunerEngine(QObject):
             streak = self._db.get_resume_crash_streak(session_id) + 1
             self._db.set_resume_crash_streak(session_id, streak)
             if streak >= self._config.resume_crash_quarantine_threshold and not pending_hunt:
-                # Repeated crashes on re-engage used to dead-end here. There is
-                # a better question to ask first: does the machine still die
-                # with every core at stock? The hunt opens with exactly that
-                # control probe, and answers platform-fault-or-not instead of
-                # handing the problem back.
+                # Each crash was charged to a core and the machine still dies
+                # before any test survives, so those verdicts are not
+                # converging. Bisecting the live vector asks the question again
+                # without trusting them.
                 self.log_message.emit(
                     f"{streak} crash-resumes in a row with no surviving test. "
-                    "Asking whether the machine survives at full stock before blaming any offset."
+                    "The per-crash verdicts are not converging; bisecting the live offsets instead."
                 )
                 self._start_hunt(observed_mttf=self._pending_hunt_mttf, loaded=self._pending_hunt_loaded)
                 return
@@ -1097,12 +1096,19 @@ class TunerEngine(QObject):
                 if resumed.armed:
                     self.log_message.emit(
                         f"Resumed session {session_id} — the machine died under hunt probe "
-                        f"{resumed.in_flight or 'stock'}; recording that reproduction."
+                        f"{resumed.in_flight}; recording that reproduction."
                     )
                     resumed.armed = False
                     self._record_hunt_probe(reproduced=True)
-                else:
+                elif resumed.started:
                     self.log_message.emit(f"Resumed session {session_id} — continuing the pending attribution hunt")
+                else:
+                    if self._pending_hunt_mttf:
+                        resumed.observed_failure_time = self._pending_hunt_mttf
+                    self.log_message.emit(
+                        f"Resumed session {session_id}: attribution hunt over {resumed.candidates}, "
+                        "bisecting the live set under the load that was running."
+                    )
                 self._run_next_hunt_slot()
                 return
             self.log_message.emit(f"Resumed session {session_id} — starting attribution hunt")
@@ -2554,10 +2560,9 @@ class TunerEngine(QObject):
     def _start_hunt(self, observed_mttf: float = 0.0, loaded: list[int] | None = None) -> None:
         """Attribute a failure that named no core.
 
-        Bisection over the live-offset mask, preceded by a control probe at
-        full stock. The old isolated-per-core hunt could not work: it parked
-        every other core at stock, deleting the whole-vector condition that
-        caused the failure in the first place.
+        Bisection over the live-offset mask. The old isolated-per-core hunt
+        could not work: it parked every other core at stock, deleting the
+        whole-vector condition that caused the failure in the first place.
         """
         vector = dict(self._pending_hunt_vector)
         self._pending_hunt_vector = {}
@@ -2585,9 +2590,7 @@ class TunerEngine(QObject):
         self._validation_thermal_aborts = 0
         self._transition_status("hunting")
         self._save_hunt()
-        self.log_message.emit(
-            f"Attribution hunt over {candidates}: control probe at stock first, then bisection of the live set."
-        )
+        self.log_message.emit(f"Attribution hunt over {candidates}: bisecting the live set.")
         self._run_next_hunt_slot()
 
     def _restore_hunt_stock(self) -> bool:
@@ -2735,16 +2738,9 @@ class TunerEngine(QObject):
                 )
                 if done:
                     span += f"; {done} already ran clean"
-            if self._hunt.stage is bisect.Stage.CONTROL:
-                self.log_message.emit(
-                    f"Hunt control probe: every core at stock for {span}. "
-                    "If the machine dies here the offsets are not the cause."
-                )
-            else:
-                self.log_message.emit(
-                    f"Hunt probe ({self._hunt.stage}, level {self._hunt.level}): live {live}, "
-                    f"every other core at stock, for {span}"
-                )
+            self.log_message.emit(
+                f"Hunt probe (level {self._hunt.level}): live {live}, every other core at stock, for {span}"
+            )
         workload = self._hunt.workload or {}
         match workload.get("kind"):
             case "rapid_transition":
@@ -2780,9 +2776,7 @@ class TunerEngine(QObject):
         live = set(self._hunt.in_flight)
         reported_stock_failure = not passed and (core_id not in live or self._hunt.vector.get(core_id, 0) == 0)
         foreign_stock_failure = any(core not in live or self._hunt.vector.get(core, 0) == 0 for core in foreign)
-        inconsistent = self._hunt.stage is not bisect.Stage.CONTROL and (
-            reported_stock_failure or foreign_stock_failure
-        )
+        inconsistent = reported_stock_failure or foreign_stock_failure
         if inconsistent:
             self.log_message.emit(
                 "Attribution hunt saw hardware evidence on a core at stock; requeueing the probe and pausing."
@@ -2850,7 +2844,6 @@ class TunerEngine(QObject):
         bisect.record(
             self._hunt,
             reproduced=reproduced,
-            control_confirmations=self._config.control_run_confirmations,
             max_no_reproduce=self._config.max_unattributed_crash_hunts,
         )
         self._save_hunt()
@@ -2862,10 +2855,6 @@ class TunerEngine(QObject):
         self._hunting = False
         if self._session_id is not None:
             self._db.set_hunt_state(self._session_id, "")
-
-        if state.stage is bisect.Stage.PLATFORM:
-            self._platform_fault("the machine failed with every core at stock")
-            return
 
         if state.stage is bisect.Stage.CULPRIT and state.found:
             for culprit in state.found:

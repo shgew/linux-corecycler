@@ -18,8 +18,6 @@ def run_hunt(
     culprits: set[int],
     *,
     together: set[int] | None = None,
-    stock_dies: bool = False,
-    control_confirmations: int = 2,
     max_no_reproduce: int = 3,
     cap: int = 200,
 ) -> tuple[HuntState, int]:
@@ -35,61 +33,44 @@ def run_hunt(
             break
         probes += 1
         live_set = set(live)
-        reproduced = (
-            stock_dies
-            if state.stage is Stage.CONTROL
-            else bool(culprits & live_set) or (together is not None and together <= live_set)
-        )
+        reproduced = bool(culprits & live_set) or (together is not None and together <= live_set)
         bisect.record(
             state,
             reproduced=reproduced,
-            control_confirmations=control_confirmations,
             max_no_reproduce=max_no_reproduce,
         )
     return state, probes
 
 
 def _state_at(stage: Stage) -> HuntState:
-    if stage is Stage.CONTROL:
-        return bisect.begin([0, 1, 2, 3], [0])
-
     state = bisect.begin([0, 1, 2, 3], [0])
-    bisect.next_live_set(state)
-    bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
-    if stage is Stage.PROBE:
-        return state
     if stage is Stage.CULPRIT:
         state.pending = [[0]]
         bisect.next_live_set(state)
-        return state
-    if stage is Stage.EXHAUSTED:
+    elif stage is Stage.EXHAUSTED:
         state.pending = []
         bisect.next_live_set(state)
-        return state
-
-    state = bisect.begin([0, 1, 2, 3], [0])
-    bisect.next_live_set(state)
-    bisect.record(state, reproduced=True, control_confirmations=1, max_no_reproduce=1)
     return state
 
 
-class TestControl:
-    def test_stock_survival_opens_bisection(self):
-        state, _ = run_hunt([0, 1, 2, 3], {2})
-        assert state.stage is Stage.CULPRIT
+class TestCrashContext:
+    def test_the_first_probe_is_the_larger_half_of_the_live_set(self):
+        state = bisect.begin([0, 1, 2, 3, 4], [4])
+        assert bisect.next_live_set(state) == [0, 1, 2]
 
-    def test_stock_dying_twice_is_a_platform_fault(self):
-        state, probes = run_hunt([0, 1, 2, 3], {2}, stock_dies=True)
-        assert state.stage is Stage.PLATFORM
-        assert state.found == []
-        assert probes == 2
-
-    def test_one_stock_death_is_not_enough(self):
-        state = bisect.begin([0, 1], [0])
+    def test_a_hunt_that_has_asked_nothing_is_only_crash_context(self):
+        state = bisect.begin([0, 1, 2, 3], [3])
+        assert state.started is False
         bisect.next_live_set(state)
-        bisect.record(state, reproduced=True, control_confirmations=2, max_no_reproduce=3)
-        assert state.stage is Stage.CONTROL
-        assert state.control_fails == 1
+        assert state.started is True
+
+    def test_a_hunt_back_on_its_whole_set_after_clean_halves_has_started(self):
+        state = bisect.begin([0, 1], [0])
+        for _ in range(2):
+            bisect.next_live_set(state)
+            bisect.record(state, reproduced=False, max_no_reproduce=5)
+        assert state.pending == [[0, 1]]
+        assert state.started is True
 
 
 class TestIsolation:
@@ -101,8 +82,8 @@ class TestIsolation:
 
     def test_isolation_is_logarithmic(self):
         _, probes = run_hunt(list(range(8)), {5})
-        # One control probe, then at most two probes per halving of 8.
-        assert probes <= 1 + 2 * 3
+        # At most two probes per halving of 8.
+        assert probes <= 2 * 3
 
     def test_two_culprits_are_both_found(self):
         state, _ = run_hunt(list(range(8)), {1, 7}, cap=400)
@@ -117,19 +98,17 @@ class TestIsolation:
         state.pending = [[1, 2]]
 
         assert bisect.next_live_set(state) == [1]
-        bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
+        bisect.record(state, reproduced=False, max_no_reproduce=1)
         assert bisect.next_live_set(state) == [2]
-        bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
+        bisect.record(state, reproduced=False, max_no_reproduce=1)
         assert bisect.next_live_set(state) == [1, 2]
-        bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
+        bisect.record(state, reproduced=False, max_no_reproduce=1)
 
         assert state.stage is Stage.CULPRIT
         assert state.found == [0]
 
-    def test_a_lone_candidate_that_survives_the_stock_control_is_the_culprit(self):
+    def test_a_lone_live_candidate_is_the_culprit_without_a_probe(self):
         state = bisect.begin([3], [3])
-        assert bisect.next_live_set(state) == []
-        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=3)
 
         assert bisect.next_live_set(state) is None
         assert state.stage is Stage.CULPRIT
@@ -142,17 +121,15 @@ class TestIsolation:
         probes = []
         while (live := bisect.next_live_set(state)) is not None and len(probes) < 10:
             probes.append(live)
-            bisect.record(state, reproduced=3 in live, control_confirmations=1, max_no_reproduce=1)
+            bisect.record(state, reproduced=3 in live, max_no_reproduce=1)
 
-        assert probes == [[], [0, 1], [2, 3], [2], [3]]
+        assert probes == [[0, 1], [2, 3], [2], [3]]
         assert state.stage is Stage.CULPRIT
         assert state.found == [3]
 
     def test_an_unanswered_probe_is_replayed_before_the_queue_moves_on(self):
         """A shutdown mid-probe must not skip to the other half, as the 09:26 pause skipped [0, 1]."""
         state = bisect.begin([0, 1, 2, 3], [3])
-        bisect.next_live_set(state)
-        bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
         first = bisect.next_live_set(state)
 
         restored = HuntState.from_json(state.to_json())
@@ -187,11 +164,9 @@ class TestNonReproduction:
         """Neither half reproducing means splitting again would invent facts."""
         state = bisect.begin([0, 1, 2, 3], [0])
         bisect.next_live_set(state)
-        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=5)
+        bisect.record(state, reproduced=False, max_no_reproduce=5)
         bisect.next_live_set(state)
-        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=5)
-        bisect.next_live_set(state)
-        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=5)
+        bisect.record(state, reproduced=False, max_no_reproduce=5)
         assert state.pending == [[0, 1, 2, 3]]
 
 
@@ -209,27 +184,23 @@ class TestConjunction:
 
     def test_the_whole_set_is_rechecked_only_once_halves_are_out_of_retries(self):
         state = bisect.begin([0, 1], [0])
-        bisect.next_live_set(state)
-        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=2)
         seen = []
         while (live := bisect.next_live_set(state)) is not None:
             seen.append(live)
-            bisect.record(state, reproduced=live == [0, 1], control_confirmations=2, max_no_reproduce=2)
+            bisect.record(state, reproduced=live == [0, 1], max_no_reproduce=2)
         assert seen == [[0], [1], [0], [1], [0, 1]]
         assert state.found == [0, 1]
 
     def test_a_whole_set_that_no_longer_reproduces_exhausts(self):
         state = bisect.begin([0, 1], [0])
-        bisect.next_live_set(state)
-        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=1)
         assert bisect.next_live_set(state) == [0]
-        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=1)
+        bisect.record(state, reproduced=False, max_no_reproduce=1)
         assert bisect.next_live_set(state) == [1]
-        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=1)
+        bisect.record(state, reproduced=False, max_no_reproduce=1)
         assert bisect.next_live_set(state) == [0, 1]
         restored = HuntState.from_json(state.to_json())
         assert restored is not None and restored.in_flight == [0, 1]
-        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=1)
+        bisect.record(state, reproduced=False, max_no_reproduce=1)
         assert state.stage is Stage.EXHAUSTED
         assert state.found == []
 
@@ -301,6 +272,7 @@ class TestPersistence:
 
     def test_armed_probe_evidence_survives_a_round_trip(self):
         state = bisect.begin([0, 1], [0])
+        bisect.next_live_set(state)
         state.armed = True
         state.vector = {0: -20, 1: 0}
         state.workload = {
@@ -341,9 +313,6 @@ class TestPersistence:
         [
             {"version": 1},
             {"level": float("nan")},
-            {"control_fails": True},
-            {"control_fails": -1},
-            {"control_fails": 2**31},
             {"no_reproduce": float("inf")},
             {"observed_failure_time": -1},
             {"observed_failure_time": True},
@@ -385,8 +354,13 @@ class TestPersistence:
         [
             (Stage.PROBE, {"pending": [], "queue": [[0, 1], [1, 2]]}, "queued sets must be disjoint"),
             (Stage.PROBE, {"pending": [], "guilty_halves": [[0, 1], [1, 2]]}, "guilty sets must be disjoint"),
-            (Stage.CONTROL, {"pending": [[0, 4]]}, "search sets must be subsets of candidates"),
-            (Stage.CONTROL, {"found": [4]}, "resolved search sets must be subsets of candidates"),
+            (Stage.PROBE, {"pending": [[0, 4]]}, "search sets must be subsets of candidates"),
+            (Stage.PROBE, {"found": [4]}, "resolved search sets must be subsets of candidates"),
+            (
+                Stage.PROBE,
+                {"armed": True, "vector": {"0": -1}},
+                "an armed probe requires its exact vector and live set",
+            ),
             (Stage.PROBE, {"pending": [], "queue": [[0], [1], [2]]}, "probe stage has too many split sets"),
             (Stage.PROBE, {"pending": [], "parent": [0], "in_flight": [0]}, "probe parent and level are inconsistent"),
             (
@@ -413,7 +387,6 @@ class TestPersistence:
             (Stage.PROBE, {"pending": []}, "probe stage has no remaining work"),
             (Stage.CULPRIT, {"found": []}, "culprit stage requires only confirmed culprits"),
             (Stage.CULPRIT, {"launches_done": 2}, "launch progress requires an unanswered probe"),
-            (Stage.PLATFORM, {"pending": []}, "platform stage must be a completed stock control"),
             (Stage.EXHAUSTED, {"pending": [[0]]}, "exhausted stage has unresolved work"),
         ],
     )
@@ -433,8 +406,6 @@ class TestPersistence:
 
     def test_active_and_resolved_partition_cannot_overlap(self):
         state = bisect.begin([0, 1, 2, 3], [0])
-        bisect.next_live_set(state)
-        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=3)
         assert bisect.next_live_set(state) == [0, 1]
         raw = json.loads(state.to_json())
         raw["found"] = [0]
@@ -451,10 +422,9 @@ class TestPersistence:
 
     def test_terminal_states_survive_round_trip(self):
         culprit, _ = run_hunt([0, 1], {1})
-        platform, _ = run_hunt([0, 1], {1}, stock_dies=True)
         exhausted, _ = run_hunt([0, 1], set(), max_no_reproduce=1)
 
-        for state in (culprit, platform, exhausted):
+        for state in (culprit, exhausted):
             assert HuntState.from_json(state.to_json()) == state
 
     @pytest.mark.parametrize(
@@ -496,7 +466,7 @@ class TestPersistence:
         stages = set()
         requeued = False
 
-        while state.stage not in (Stage.CULPRIT, Stage.PLATFORM, Stage.EXHAUSTED):
+        while state.stage not in (Stage.CULPRIT, Stage.EXHAUSTED):
             restored = HuntState.from_json(state.to_json())
             assert restored is not state
             state = restored
@@ -512,12 +482,12 @@ class TestPersistence:
                 state = HuntState.from_json(state.to_json())
                 requeued = True
 
-            reproduced = state.stage is not Stage.CONTROL and 6 in state.in_flight
-            bisect.record(state, reproduced=reproduced, control_confirmations=2, max_no_reproduce=3)
+            reproduced = 6 in state.in_flight
+            bisect.record(state, reproduced=reproduced, max_no_reproduce=3)
             state = HuntState.from_json(state.to_json())
 
         assert requeued
-        assert stages == {Stage.CONTROL, Stage.PROBE}
+        assert stages == {Stage.PROBE}
         assert state == uninterrupted
 
 

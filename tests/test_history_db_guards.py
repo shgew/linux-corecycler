@@ -209,14 +209,14 @@ class TestOpenGuards:
         state.update(changes)
         return json.dumps(state)
 
-    def _migrate_v22(self, tmp_path, config: dict, hunt_state: str):
+    def _migrate_v22(self, tmp_path, config: dict, hunt_state: str, *, version: int = 22):
         path = tmp_path / "history.db"
         db = HistoryDB(path)
         session_id = db.create_tuner_session(json.dumps(config), "", "")
         db.set_hunt_state(session_id, hunt_state)
         db.close()
         conn = sqlite3.connect(path)
-        conn.execute("UPDATE schema_version SET version=22")
+        conn.execute("UPDATE schema_version SET version=?", (version,))
         conn.commit()
         conn.close()
         migrated = HistoryDB(path)
@@ -262,6 +262,56 @@ class TestOpenGuards:
         session = self._migrate_v22(tmp_path, {}, hunt)
 
         assert session.hunt_state == hunt
+
+    @staticmethod
+    def _v4_control_hunt(**changes) -> str:
+        state = {
+            "version": 4,
+            "stage": "control",
+            "candidates": [0, 1, 2, 3],
+            "pending": [[0, 1, 2, 3]],
+            "queue": [],
+            "in_flight": [],
+            "parent": [],
+            "guilty_halves": [],
+            "control_fails": 1,
+            "level": 0,
+            "found": [],
+            "no_reproduce": 0,
+            "launches_done": 3,
+            "observed_failure_time": 0.0,
+            "loaded": [3],
+            "armed": True,
+            "vector": {"0": -50, "1": -33, "2": -36, "3": -40},
+            "workload": None,
+        }
+        state.update(changes)
+        return json.dumps(state)
+
+    def test_v24_migration_turns_a_stock_control_into_the_first_bisection(self, tmp_path):
+        """Session 12 was 30 minutes into an all-stock control probe."""
+        session = self._migrate_v22(
+            tmp_path,
+            {"max_offset": -50, "control_run_confirmations": 2},
+            self._v4_control_hunt(),
+            version=23,
+        )
+
+        state = HuntState.from_json(session.hunt_state)
+        assert state.stage is Stage.PROBE
+        assert (state.armed, state.launches_done, state.vector[3]) == (False, 0, -40)
+        assert bisect.next_live_set(state) == [0, 1]
+        assert json.loads(session.config_json) == {"max_offset": -50}
+
+    def test_v24_migration_keeps_an_open_bisection_as_it_was(self, tmp_path):
+        hunt = self._v4_control_hunt(
+            stage="probe", pending=[], queue=[[1]], in_flight=[0], parent=[0, 1], level=2, control_fails=0
+        )
+
+        session = self._migrate_v22(tmp_path, {}, hunt, version=23)
+
+        state = HuntState.from_json(session.hunt_state)
+        assert (state.in_flight, state.queue, state.armed, state.launches_done) == ([0], [[1]], True, 3)
 
 
 class TestMissingRows:

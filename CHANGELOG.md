@@ -17,6 +17,13 @@ test, quality, Nix, hardware-contract, mutation, live-scenario, and history-db w
 
 ### Fixed (2026-09-23 evening run on the 9950X3D2)
 
+- A hunt started from a slot's persisted crash context inherits the breadcrumb's failure
+  time. It replayed with 0 s, so the probe budget ignored the measured 82 s.
+- The attribution hunt no longer opens with an all-stock control probe, and
+  `control_run_confirmations` is gone. The control spent 30 minutes or more of every hunt,
+  twice to call a platform fault, on the least likely answer; a crash with no live
+  offset is already a platform fault and hardware errors on a stock core already pause.
+  History schema v24 restarts a hunt parked on its control as its first bisection probe.
 - The attribution hunt convicts a core that reproduces the failure alone. The
   leave-one-out confirmation and `probe_final_multiplier` are gone: core 3 reproduced
   with every other core at stock, then the hunt queued 131 launches (4.5 h) of the other

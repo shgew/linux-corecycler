@@ -165,9 +165,8 @@ bound recovery:
    without a passing non-hunt test are counted. Hunt passes, thermal stops, apparatus
    faults, and plain app restarts do not clear the counter. Finding and backing off a
    hunt culprit does. After `resume_crash_quarantine_threshold` (default 3) the tuner
-   does not dead-end: it starts the attribution hunt, whose first probe runs every
-   core at CO=0. If the machine dies there too, the fault is not in the offsets and
-   the tuner says so. `profile_quarantined` is now reserved for the one case it always meant
+   stops trusting those per-crash verdicts and starts the attribution hunt over the
+   live offsets. `profile_quarantined` is reserved for the one case it always meant
    literally: stock restoration itself failed, so offsets may still be resident.
 
 An interrupted session is detected on next launch and offered for resume. Resume
@@ -191,20 +190,21 @@ when the loaded core was on a search, confirmation, backoff, or annealing step a
 every other live offset had already survived, that step is the only change from a
 vector that survived, and the crash fails it directly. A crash that no kernel machine
 check, no un-survived CO journal write, and no such lone trial names starts the
-attribution hunt:
+attribution hunt, replaying the workload and offset vector the slot persisted before
+it launched. A crash with no core holding a live offset is a platform fault outright
+and needs no hunt.
 
-1. **Stock control run** -- every core at CO=0 under the same workload. It has to
-   reproduce `control_run_confirmations` times to call a platform fault, which stops
-   the tuner from spending a week chasing a board current limit as if it were CO.
-2. **Group bisection over the live mask** -- half the cores keep their offsets, half
+1. **Group bisection over the live mask** -- half the cores keep their offsets, half
    drop to stock. A crash means the culprit is in the live half; log2(n) probes.
    Both halves failing means two culprits, and both subtrees are pursued. A set that
    fails while both of its halves run clean fails only as a whole, so every member
-   backs off one step.
-3. **Lone reproduction** -- a single core that reproduces the failure with every
+   backs off one step. There is no all-stock control probe first: it cost the longest
+   probe of every hunt to rule out the least likely cause, and hardware errors
+   reported by a core at stock already pause the hunt.
+2. **Lone reproduction** -- a single core that reproduces the failure with every
    other core at stock is the culprit. That reproduction is the answer the hunt was
    asking for, so nothing re-runs the other cores without it.
-4. **Suspicion fallback** -- when nothing reproduces inside budget, every core that
+3. **Suspicion fallback** -- when nothing reproduces inside budget, every core that
    held a live offset accrues suspicion weighted by offset depth and by whether it
    was loaded or idle. It only acts on a two-to-one separation after at least three
    unattributed failures; a near-tie refuses to act, which is exactly where a guess
@@ -332,7 +332,7 @@ The status is the session's flow, and the CLI exit code follows it.
 | `hunting` | Attribution hunt: who crashed the machine | -- |
 | `paused` | Stopped on an instrument failure and waiting for you | 3 |
 | `profile_quarantined` | Stock restoration itself failed; offsets may still be resident | 4 |
-| `platform_fault` | The attribution hunt reproduced the failure with every core at stock | 9 |
+| `platform_fault` | The machine died with no core holding a live offset | 9 |
 | `aborted` | Deliberate stop; baselines restored, progress resumable | 6, or 130 from SIGINT |
 | `completed` | Every core confirmed and validation clean, endurance off | 0 |
 | `idle` | No session in flight | -- |
@@ -360,10 +360,8 @@ The status is the session's flow, and the CLI exit code follows it.
 
 | Stage | Question | Outcome |
 |---|---|---|
-| `control` | Does the machine die with every core at CO=0? | `platform` after `control_run_confirmations` reproductions; otherwise bisection starts |
 | `probe` | Which half of the live mask carries the culprit? | Recurses into the failing half, or into both halves when both fail. A lone core that reproduces is a culprit. A set that fails while both halves ran clean backs off every member |
 | `culprit` | -- | The core is backed off one step and its banked confidence is discarded |
-| `platform` | -- | Tuner stops and reports a platform fault with the MCE, dmesg, thermal and PPT/TDC/EDC evidence. The answer is not in the offsets |
 | `exhausted` | Nothing reproduced inside budget | Counts one unattributed failure for the suspicion model, which acts only on a 2:1 separation after at least three; the search step that was running records a fail |
 
 A probe that is interrupted by a thermal stop, an apparatus fault, a pause, or a
@@ -402,7 +400,7 @@ the SMU, and only then continues from the persisted cursor.
 | Test Order | sequential | see below | Core testing order |
 | Stretch Threshold | 3.0% | 0-20% | Clock-stretch failure threshold (0 = off, requires root) |
 | Abort on Consecutive Failures | 0 | >= 0 | Abort if N cores fail at start_offset (0 = off) |
-| Resume Crash Quarantine Threshold | 3 | 1-20 | Crash-resumes (no surviving test between) before the attribution hunt opens with a stock control run |
+| Resume Crash Quarantine Threshold | 3 | 1-20 | Crash-resumes (no surviving test between) before the attribution hunt replaces the per-crash verdicts |
 | Allow Missing Thermal Sensor | false | true/false | Permit running with no readable temperature sensor (false = fail closed) |
 | Inherit Current CO | false | true/false | Read current SMU offsets as starting points |
 | Regime Floor Pct | 15.0 | 0-100 | Smallest share of slot time any regime may be scheduled down to |

@@ -321,10 +321,11 @@ class TestForensicAttribution:
 
 
 class TestCrashHunt:
-    def test_in_flight_control_probe_owns_attribution(self, db, topo_dual_ccd_x3d, mock_backend):
+    def test_in_flight_probe_owns_attribution(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         _seed_confirmed_validating(eng, db, BEST, BASELINES)
         state = bisect.begin(sorted(BEST), loaded=[5])
+        bisect.next_live_set(state)
         state.vector = dict(BEST)
         state.workload = eng._workload_snapshot(eng._core_states[5])
         state.armed = True
@@ -342,7 +343,7 @@ class TestCrashHunt:
         assert all(cs.crash_count == 0 for cs in eng._core_states.values())
         assert all(not cs.in_test for cs in eng._core_states.values())
 
-    def test_hunt_opens_with_a_stock_control_probe(self, db, topo_dual_ccd_x3d, mock_backend):
+    def test_hunt_opens_by_bisecting_the_live_set(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         _seed_confirmed_validating(eng, db, BEST, BASELINES)
         eng._smu.written = dict(BEST)
@@ -353,8 +354,8 @@ class TestCrashHunt:
 
         assert eng.status == "hunting"
         assert eng._hunt is not None
-        assert eng._hunt.stage is bisect.Stage.CONTROL
-        assert eng._smu.written == dict.fromkeys(BEST, 0)
+        assert eng._hunt.in_flight == [0, 1, 2, 3]
+        assert eng._smu.written == {core: BEST[core] if core < 4 else 0 for core in BEST}
         assert probes and probes[0][0] == 5
         assert eng._core_states[5].in_test is True
 
@@ -600,8 +601,8 @@ class TestOnsetHunt:
         )
 
     @staticmethod
-    def _launch(eng, passed: bool) -> None:
-        eng._on_test_finished(5, passed, "" if passed else "mprime error: FATAL ERROR", "", 32.0, 0.0)
+    def _launch(eng, passed: bool, core: int = 5) -> None:
+        eng._on_test_finished(core, passed, "" if passed else "mprime error: FATAL ERROR", "", 32.0, 0.0)
         eng._run_next_hunt_slot()
 
     def test_a_probe_is_answered_only_after_its_last_clean_launch(
@@ -609,16 +610,16 @@ class TestOnsetHunt:
     ):
         eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
         eng._start_hunt(observed_mttf=8.0, loaded=[5])
+        first = list(eng._hunt.in_flight)
         budget = self._budget(eng)
-        control_launches = 0
-        while eng._hunt.stage is bisect.Stage.CONTROL:
-            control_launches += 1
+        launches = 0
+        while eng._hunt.in_flight == first:
+            launches += 1
             self._launch(eng, True)
 
         assert eng.launches[0] == 32
-        assert control_launches == -(-budget // 32)
-        assert set(eng.launches[:control_launches]) == {32}
-        assert eng._hunt.stage is bisect.Stage.PROBE
+        assert launches == -(-budget // 32)
+        assert set(eng.launches[:launches]) == {32}
 
     @staticmethod
     def _replaying(eng, *, duration: int, observed: float) -> None:
@@ -634,12 +635,14 @@ class TestOnsetHunt:
         and 112s and a pair could be cleared on two load starts."""
         eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
         self._replaying(eng, duration=75, observed=8.0)
-        control_launches = 1
-        while eng._hunt.stage is bisect.Stage.CONTROL:
+        first = list(eng._hunt.in_flight)
+        budget = self._budget(eng)
+        launches = 1
+        while eng._hunt.in_flight == first:
             self._launch(eng, True)
-            control_launches += 1
+            launches += 1
 
-        assert control_launches - 1 == -(-eng._config.probe_base_seconds // 32)
+        assert launches - 1 == -(-budget // 32)
 
     def test_a_replayed_slot_longer_than_the_floor_keeps_its_length(
         self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
@@ -647,23 +650,27 @@ class TestOnsetHunt:
         eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
         self._replaying(eng, duration=3600, observed=0.0)
 
-        assert eng.launches == [3600]
+        assert eng.launches == [
+            bisect.probe_seconds(
+                eng._hunt,
+                base=3600,
+                mttf_multiplier=eng._config.probe_mttf_multiplier,
+                level_multiplier=eng._config.probe_level_multiplier,
+            )
+        ]
 
     def test_a_failing_launch_answers_the_probe_at_once(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
         eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
-        eng._start_hunt(observed_mttf=8.0, loaded=[5])
-        self._launch(eng, True)
-        assert eng._hunt.control_fails == 0
+        eng._start_hunt(observed_mttf=8.0, loaded=[0])
+        first = list(eng._hunt.in_flight)
+        self._launch(eng, True, core=0)
+        assert eng._hunt.in_flight == first
 
-        self._launch(eng, False)
+        self._launch(eng, False, core=0)
 
-        assert eng._hunt.control_fails == 1
-        budget = self._budget(eng)
-        clean = 0
-        while eng._hunt.stage is bisect.Stage.CONTROL:
-            clean += 1
-            self._launch(eng, True)
-        assert clean == -(-budget // 32)
+        assert eng._hunt.guilty_halves == [first]
+        assert eng._hunt.in_flight != first
+        assert eng._hunt.launches_done == 0
 
     def test_a_pause_between_launches_keeps_its_clean_launches(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
         """Session 12 paused after 44 clean launches of a 131-launch probe and
@@ -672,8 +679,6 @@ class TestOnsetHunt:
 
         eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
         eng._start_hunt(observed_mttf=8.0, loaded=[5])
-        while eng._hunt.stage is bisect.Stage.CONTROL:
-            self._launch(eng, True)
         probe = list(eng._hunt.in_flight)
         launches = -(-self._budget(eng) // 32)
         for _ in range(3):
@@ -993,13 +998,16 @@ class TestResumeHuntAttribution:
         assert pending_hunt is True
         assert any("mprime AVX2 large" in message for message in messages)
 
+    @pytest.mark.parametrize("slot_left_context", [False, True])
     def test_the_hunt_inherits_the_freeze_time_the_breadcrumb_measured(
-        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch, slot_left_context
     ):
         import corecycler.tuner.engine as engine_mod
 
         engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         _seed_confirmed_validating(engine, db, BEST, BASELINES)
+        if slot_left_context:
+            engine._checkpoint_worker(engine._workload_snapshot(engine._core_states[5]), sorted(BEST))
         engine._forensics = lambda *_a, **_kw: ([], True)
         engine._read_breadcrumb = lambda: ("core 5 at -30 (sustained, current), about 8s into the slot", 8.0)
         monkeypatch.setattr(engine_mod, "_rebooted_since", lambda *_a, **_kw: True)
@@ -1038,7 +1046,6 @@ def _armed_probe_state(engine):
     bisect.record(
         state,
         reproduced=False,
-        control_confirmations=engine._config.control_run_confirmations,
         max_no_reproduce=engine._config.max_unattributed_crash_hunts,
     )
     bisect.next_live_set(state)
@@ -1278,7 +1285,6 @@ class TestHuntExecution:
         bisect.record(
             state,
             reproduced=False,
-            control_confirmations=engine._config.control_run_confirmations,
             max_no_reproduce=engine._config.max_unattributed_crash_hunts,
         )
         state.vector = dict(BEST)
@@ -1342,7 +1348,6 @@ class TestHuntExecution:
         bisect.record(
             state,
             reproduced=False,
-            control_confirmations=engine._config.control_run_confirmations,
             max_no_reproduce=engine._config.max_unattributed_crash_hunts,
         )
         in_flight = bisect.next_live_set(state)

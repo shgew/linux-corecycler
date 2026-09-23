@@ -270,12 +270,6 @@ class TestSlotLine:
         assert "Hunt probe (level 1): cores [0, 1] live, the rest at stock" in text
         assert "1800 s" in text
 
-    def test_hunt_control_probe_says_everything_is_at_stock(self, db):
-        tab = _tab(db)
-        slot = {"cores": [0], "duration_seconds": 600, "hunt": {"stage": "control", "level": 0, "live": []}}
-        tab._on_slot_started(json.dumps(slot))
-        assert "Hunt control probe: every core at stock" in tab._slot_label.text()
-
     def test_validation_slot_names_its_stage_and_cores(self, db):
         tab = _tab(db)
         slot = {"kind": "parallel", "cores": [0, 1, 2], "validation_stage": 2, "duration_seconds": 300}
@@ -312,8 +306,8 @@ class TestBatterySummary:
 class TestEventsPane:
     def test_tuner_narrative_is_shown_live(self, db):
         tab = _tab(db)
-        tab._on_log_message("Hunt control probe: every core at stock for 600s.")
-        assert "Hunt control probe" in tab._events_view.toPlainText()
+        tab._on_log_message("Hunt probe (level 1): live [0, 1], every other core at stock, for 600s")
+        assert "Hunt probe (level 1)" in tab._events_view.toPlainText()
 
     def test_resume_replays_the_stored_story(self, db):
         sid = _sid(db)

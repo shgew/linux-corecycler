@@ -32,6 +32,7 @@ from corecycler.engine.scheduler import CoreScheduler, SchedulerConfig
 from corecycler.history.db import HistoryDB
 from corecycler.tuner import engine as engine_mod
 from corecycler.tuner import persistence as tp
+from corecycler.tuner.bisect import HuntState
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.engine import TunerEngine
 from corecycler.tuner.regime import Mask, Regime
@@ -652,9 +653,9 @@ class TestUnstableBaselineEscapes:
 
 
 class TestResumeCrashCircuitBreaker:
-    def test_threshold_starts_stock_control_hunt_instead_of_dead_ending(self, db, topo, smu, mock_backend):
+    def test_threshold_starts_a_hunt_instead_of_dead_ending(self, db, topo, smu, mock_backend):
         cfg = TunerConfig(
-            cores_to_test=[0],
+            cores_to_test=[0, 1],
             resume_crash_quarantine_threshold=1,
             crash_penalty_steps=1,
             fine_step=1,
@@ -671,7 +672,11 @@ class TestResumeCrashCircuitBreaker:
                 in_test=True,
             ),
         )
+        db.upsert_tuner_core_state(
+            sid, CoreState(core_id=1, phase=TunerPhase.CONFIRMED, current_offset=-8, best_offset=-8, baseline_offset=0)
+        )
         db.journal_co_intent(sid, 0, -10, survived=True)
+        db.journal_co_intent(sid, 1, -8, survived=True)
 
         eng = _resume_fresh(
             db,
@@ -679,7 +684,7 @@ class TestResumeCrashCircuitBreaker:
             smu,
             mock_backend,
             sid,
-            cores_to_test=[0],
+            cores_to_test=[0, 1],
             resume_crash_quarantine_threshold=1,
             crash_penalty_steps=1,
             fine_step=1,
@@ -687,8 +692,8 @@ class TestResumeCrashCircuitBreaker:
 
         session = db.get_tuner_session(sid)
         assert eng.status == "hunting"
-        assert session.hunt_state
-        assert smu.applied[0] == 0
+        assert HuntState.from_json(session.hunt_state).in_flight == [0]
+        assert (smu.applied[0], smu.applied[1]) == (-10, 0)
         assert db.get_resume_crash_streak(sid) == 1
 
     def test_failed_stock_restoration_quarantines(self, db, topo, smu, mock_backend):
@@ -2374,7 +2379,7 @@ class TestUnattributedIncidentOnResume:
             db.set_unattributed_crashes(sid, unattributed)
         return sid
 
-    def test_dirty_reboot_mid_validation_starts_stock_control_hunt(self, db, topo, smu, mock_backend, monkeypatch):
+    def test_dirty_reboot_mid_validation_starts_an_attribution_hunt(self, db, topo, smu, mock_backend, monkeypatch):
         monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0, **kwargs: False)
         sid = self._seed(db, {0: -10, 1: -12})
         eng = make_engine(db, topo, smu, mock_backend, cores_to_test=[0, 1])
@@ -2388,7 +2393,7 @@ class TestUnattributedIncidentOnResume:
         assert eng.status == "hunting"
         assert session.hunt_state
         assert db.get_unattributed_crashes(sid) == 0
-        assert smu.applied == dict.fromkeys(topo.cores, 0)
+        assert smu.applied == {core: -10 if core == 0 else 0 for core in topo.cores}
 
     def test_clean_reboot_mid_validation_is_not_an_incident(self, db, topo, smu, mock_backend, monkeypatch):
         monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0, **kwargs: True)

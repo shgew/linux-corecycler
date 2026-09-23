@@ -690,10 +690,10 @@ class TestEngineSignals:
 
         tab._on_status_changed("platform_fault")
         assert not notify.called
-        tab._on_platform_fault("stock control failed twice")
+        tab._on_platform_fault("no core held a live offset at the time of the failure")
 
         assert notify.call_count == 1
-        assert "stock control failed twice" in notify.call_args.args[1]
+        assert "no core held a live offset at the time of the failure" in notify.call_args.args[1]
 
 
 def _mute_notify(monkeypatch, *, enabled=True):

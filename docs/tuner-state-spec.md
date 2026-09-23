@@ -138,7 +138,10 @@ penalty. Attribution uses this strict priority:
 
 1. **An in-flight attribution hunt owns the event.** Its persisted `hunt_state`
    determines which mask was loaded and advances the hunt; ordinary attribution
-   must not corrupt that experiment.
+   must not corrupt that experiment. Every ordinary slot persists its crash
+   context (vector, loaded cores, workload) as an unstarted `HuntState` before
+   launch; a crash under it starts the hunt from that context, with the
+   breadcrumb's failure time.
 2. **Kernel MCE evidence naming a mapped, non-stock core** penalizes exactly
    that core at its journaled resident offset. Evidence naming an unknown or
    stock core is an instrument/evidence inconsistency, never permission to
@@ -153,10 +156,10 @@ penalty. Attribution uses this strict priority:
    other un-survived resident still goes to the hunt.
 4. **Otherwise start or resume the attribution hunt.** An aggregate validation
    failure with no per-core verdict starts a hunt using the exact failed
-   workload; it never guesses the most-aggressive core. `CONTROL` applies
-   stock CO=0 to every physical core. `PROBE` applies the persisted in-flight
-   group from `HuntState`; an in-flight group that was never answered is
-   replayed, never skipped. A lone core that reproduces with every other core
+   workload; it never guesses the most-aggressive core. There is no stock
+   control stage. `PROBE` applies the persisted in-flight group from
+   `HuntState`; an in-flight group that was never answered is replayed, never
+   skipped. A lone core that reproduces with every other core
    at stock is a culprit with no further probe. Culprits do not terminate a
    hunt while known guilty pending sets remain.
 

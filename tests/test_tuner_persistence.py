@@ -124,11 +124,9 @@ class TestTunerSessions:
         context_id = db.get_or_create_context(TuningContextRecord(bios_version="1.0", context_hash="ctx"))
         sid = db.create_tuner_session(TunerConfig().to_json(), "", "", context_id=context_id)
         hunt = bisect.begin([0, 1, 2, 3], loaded=[1, 3])
-        assert bisect.next_live_set(hunt) == []
-        bisect.record(hunt, reproduced=True, control_confirmations=2, max_no_reproduce=2)
-        assert bisect.next_live_set(hunt) == []
-        bisect.record(hunt, reproduced=False, control_confirmations=2, max_no_reproduce=2)
         assert bisect.next_live_set(hunt) == [0, 1]
+        bisect.record(hunt, reproduced=True, max_no_reproduce=2)
+        assert bisect.next_live_set(hunt) == [2, 3]
         tp_blob = hunt.to_json()
 
         db.set_hunt_state(sid, tp_blob)

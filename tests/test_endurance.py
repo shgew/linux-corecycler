@@ -369,7 +369,12 @@ class TestWorkloadSelection:
         assert worker.scheduler.stress_config.fft_preset is FFTPreset.LARGE
         assert worker.scheduler.stress_config.threads == 1
         assert worker.scheduler.config.variable_load is True
-        assert worker.scheduler.config.seconds_per_core == max(1200, eng._config.probe_base_seconds)
+        assert worker.scheduler.config.seconds_per_core == bisect.probe_seconds(
+            eng._hunt,
+            base=max(1200, eng._config.probe_base_seconds),
+            mttf_multiplier=eng._config.probe_mttf_multiplier,
+            level_multiplier=eng._config.probe_level_multiplier,
+        )
         assert eng._worker_profile == "spectrum"
 
     def test_transient_slot_reaches_the_scheduler_as_a_duty_cycled_workload(

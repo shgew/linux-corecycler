@@ -137,11 +137,11 @@ A watch for kernel errors with no load applied.
 An unplanned reboot or freeze while offsets were resident, attributed after restart from boot identity and kernel forensics.
 
 **Hunt**:
-The search that attributes a failure naming no core: a control probe, then group bisection over the live mask down to a core that reproduces alone.
+The search that attributes a failure naming no core: group bisection over the live mask down to a core that reproduces alone.
 _Avoid_: bisect (the mechanism, not the whole search), isolated hunt
 
-**Control probe**:
-A hunt slot with every core at stock. A failure here is a platform fault, never a core's.
+**Crash context**:
+The vector, loaded cores and workload an ordinary slot persists as an unstarted hunt before launch. A crash under it starts a hunt that replays exactly that load.
 
 **Probe**:
 A hunt slot.

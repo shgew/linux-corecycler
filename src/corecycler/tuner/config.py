@@ -36,7 +36,6 @@ FIELD_BOUNDS: dict[str, tuple[int | float, int | float]] = {
     "max_apparatus_retries": (0, 20),
     "backoff_preconfirm_multiplier": (0.01, 100),
     "regime_floor_pct": (0.01, 25),
-    "control_run_confirmations": (1, 10),
     "probe_base_seconds": (60, 86400),
     "probe_mttf_multiplier": (0.01, 100),
     "probe_level_multiplier": (1, 10),
@@ -172,13 +171,9 @@ class TunerConfig:
     # proven, so it can never be scheduled away entirely.
     regime_floor_pct: float = 15.0
 
-    # Unattributed-failure pipeline. The control run tests the competing
-    # hypothesis that the platform, not the offsets, is at fault; it must
-    # reproduce this many times at stock before we call it a platform fault.
-    control_run_confirmations: int = 2
-    # Probe budget: max(base, mttf_multiplier x observed time-to-failure),
-    # grown per bisection level,
-    # because a false clean near the leaves costs the whole answer.
+    # Unattributed-failure pipeline. Probe budget: max(base, mttf_multiplier x
+    # observed time-to-failure), grown per bisection level, because a false
+    # clean near the leaves costs the whole answer.
     probe_base_seconds: int = 1800
     probe_mttf_multiplier: float = 4.0
     probe_level_multiplier: float = 1.5

@@ -330,6 +330,17 @@ def _hunt_state_v4(hunt: dict | None) -> dict | None:
     return hunt
 
 
+def _hunt_state_v5(hunt: dict | None) -> dict | None:
+    """Rewrite a version 4 hunt without its stock control stage."""
+    if hunt is None or hunt.get("version") != 4 or "control_fails" not in hunt or hunt.get("stage") == "platform":
+        return None
+    del hunt["control_fails"]
+    if hunt.get("stage") == "control":
+        hunt.update(stage="probe", armed=False, launches_done=0)
+    hunt["version"] = 5
+    return hunt
+
+
 # ---------------------------------------------------------------------------
 # HistoryDB
 # ---------------------------------------------------------------------------
@@ -338,7 +349,7 @@ def _hunt_state_v4(hunt: dict | None) -> dict | None:
 class HistoryDB:
     """Crash-safe SQLite database for test run history."""
 
-    SCHEMA_VERSION = 23
+    SCHEMA_VERSION = 24
     TUNER_CONTRACT_VERSION = 16
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
@@ -1124,13 +1135,26 @@ CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
     # loaders to reject.
     @staticmethod
     def _migrate_v23(conn: sqlite3.Connection) -> None:
+        HistoryDB._rewrite_hunt_sessions(conn, "probe_final_multiplier", _hunt_state_v4)
+
+    # v23 -> v24: the attribution hunt dropped its all-stock control probe and
+    # control_run_confirmations. A hunt still on its control has asked nothing
+    # the bisection needs, so it restarts as the first bisection probe.
+    @staticmethod
+    def _migrate_v24(conn: sqlite3.Connection) -> None:
+        HistoryDB._rewrite_hunt_sessions(conn, "control_run_confirmations", _hunt_state_v5)
+
+    @staticmethod
+    def _rewrite_hunt_sessions(
+        conn: sqlite3.Connection, retired_knob: str, rewrite_hunt: Callable[[dict | None], dict | None]
+    ) -> None:
         rows = conn.execute("SELECT id, config_json, hunt_state FROM tuner_sessions").fetchall()
         for session_id, config_json, hunt_state in rows:
             config = _json_object(config_json)
-            if config is not None and "probe_final_multiplier" in config:
-                del config["probe_final_multiplier"]
+            if config is not None and retired_knob in config:
+                del config[retired_knob]
                 conn.execute("UPDATE tuner_sessions SET config_json=? WHERE id=?", (json.dumps(config), session_id))
-            hunt = _hunt_state_v4(_json_object(hunt_state))
+            hunt = rewrite_hunt(_json_object(hunt_state))
             if hunt is not None:
                 conn.execute(
                     "UPDATE tuner_sessions SET hunt_state=? WHERE id=?",
@@ -1160,6 +1184,7 @@ CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
         21: _migrate_v21,
         22: _DDL_MIGRATE_V22,
         23: _migrate_v23,
+        24: _migrate_v24,
     }
 
     # ------------------------------------------------------------------

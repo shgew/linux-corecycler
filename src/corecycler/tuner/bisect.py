@@ -11,15 +11,17 @@ learned offsets; everyone else sits at stock. Halving the live set and
 reproducing the failure isolates a culprit in log2(n) probes, and the machine
 is in a real operating point the whole time.
 
-A control probe at full stock comes first. If the machine dies with every core
-at CO=0, the offsets are not the problem and no amount of searching will fix
-it. That is a platform fault (current limits, memory, power) and the only
-honest outcome is to say so.
+There is no stock control probe. A crash with every core at stock is already
+recognised without one (no core held a live offset), and asking it of every
+hunt spent the longest probe on the least likely answer.
 
 A single core reaches the end of bisection only by reproducing the failure
 with every other core at stock. That is the whole question the hunt asks, so
 the core is convicted there; re-running everyone else without it would only
 spend hours re-proving the answer.
+
+Every ordinary slot persists its crash context in this same shape before it
+launches, so a crash under it starts a hunt that replays exactly that load.
 
 The state machine is pure and serialisable because a probe's answer arrives by
 way of a reboot: the process that asked the question is gone by the time the
@@ -37,14 +39,10 @@ from corecycler.tuner import regime
 
 
 class Stage(StrEnum):
-    #: Probing at full stock to rule out a platform fault.
-    CONTROL = "control"
     #: Halving the live set to find which half carries the culprit.
     PROBE = "probe"
     #: A culprit was confirmed.
     CULPRIT = "culprit"
-    #: The machine dies at stock too.
-    PLATFORM = "platform"
     #: Nothing reproduced. The caller falls back to accumulated suspicion.
     EXHAUSTED = "exhausted"
 
@@ -55,7 +53,7 @@ def split(candidates: list[int]) -> tuple[list[int], list[int]]:
     return candidates[:mid], candidates[mid:]
 
 
-_STATE_VERSION = 4
+_STATE_VERSION = 5
 _MAX_INTEGER = 2**31 - 1
 _MIN_INTEGER = -(2**31)
 
@@ -137,14 +135,13 @@ def _vector(value: object) -> dict[int, int]:
 class HuntState:
     """Serialisable progress of one attribution hunt."""
 
-    stage: Stage = Stage.CONTROL
+    stage: Stage = Stage.PROBE
     candidates: list[int] = field(default_factory=list)
     pending: list[list[int]] = field(default_factory=list)
     queue: list[list[int]] = field(default_factory=list)
     in_flight: list[int] = field(default_factory=list)
     parent: list[int] = field(default_factory=list)
     guilty_halves: list[list[int]] = field(default_factory=list)
-    control_fails: int = 0
     level: int = 0
     found: list[int] = field(default_factory=list)
     no_reproduce: int = 0
@@ -154,6 +151,15 @@ class HuntState:
     armed: bool = False
     vector: dict[int, int] = field(default_factory=dict)
     workload: dict | None = None
+
+    @property
+    def started(self) -> bool:
+        """Whether any probe was dispatched or answered; until then this is only crash context."""
+        return (
+            self.stage is not Stage.PROBE
+            or self.pending != [self.candidates]
+            or bool(self.in_flight or self.queue or self.parent or self.found or self.no_reproduce)
+        )
 
     def to_json(self) -> str:
         _validate_state(self)
@@ -167,7 +173,6 @@ class HuntState:
                 "in_flight": self.in_flight,
                 "parent": self.parent,
                 "guilty_halves": self.guilty_halves,
-                "control_fails": self.control_fails,
                 "level": self.level,
                 "found": self.found,
                 "no_reproduce": self.no_reproduce,
@@ -202,7 +207,6 @@ class HuntState:
                 "in_flight",
                 "parent",
                 "guilty_halves",
-                "control_fails",
                 "level",
                 "found",
                 "no_reproduce",
@@ -232,7 +236,6 @@ class HuntState:
                 in_flight=_core_set(raw["in_flight"], "in_flight"),
                 parent=_core_set(raw["parent"], "parent"),
                 guilty_halves=_core_sets(raw["guilty_halves"], "guilty_halves"),
-                control_fails=_counter(raw["control_fails"], "control_fails"),
                 level=_counter(raw["level"], "level"),
                 found=_core_set(raw["found"], "found"),
                 no_reproduce=_counter(raw["no_reproduce"], "no_reproduce"),
@@ -260,7 +263,6 @@ def _validate_state(state: HuntState) -> None:
     parent = _core_set(state.parent, "parent")
     found = _core_set(state.found, "found")
     _core_set(state.loaded, "loaded", empty=False)
-    _counter(state.control_fails, "control_fails")
     _counter(state.level, "level")
     _counter(state.no_reproduce, "no_reproduce")
     _counter(state.launches_done, "launches_done")
@@ -275,8 +277,8 @@ def _validate_state(state: HuntState) -> None:
         for core, offset in state.vector.items()
     ):
         raise _invalid("vector must map bounded integer core IDs to bounded integer offsets")
-    if state.armed and not state.vector:
-        raise _invalid("an armed probe requires its exact vector")
+    if state.armed and not (state.vector and state.in_flight):
+        raise _invalid("an armed probe requires its exact vector and live set")
     if state.workload is not None:
         errors = regime.workload_errors("workload", 0, state.workload)
         if errors:
@@ -299,22 +301,8 @@ def _validate_state(state: HuntState) -> None:
     max_level = (len(candidates) - 1).bit_length()
     if state.level > max_level:
         raise _invalid("level exceeds the candidate split depth")
-    if state.launches_done and state.stage is not Stage.CONTROL and not in_flight:
+    if state.launches_done and not in_flight:
         raise _invalid("launch progress requires an unanswered probe")
-
-    if state.stage is Stage.CONTROL:
-        if (
-            pending != [candidates]
-            or queue
-            or in_flight
-            or parent
-            or guilty
-            or found
-            or state.level != 0
-            or state.no_reproduce != 0
-        ):
-            raise _invalid("control stage has impossible search progress")
-        return
 
     if state.stage is Stage.PROBE:
         if len(queue) > 2 or len(guilty) > 2:
@@ -343,11 +331,6 @@ def _validate_state(state: HuntState) -> None:
             raise _invalid("culprit stage requires only confirmed culprits")
         return
 
-    if state.stage is Stage.PLATFORM:
-        if state.control_fails < 1 or pending != [candidates] or queue or in_flight or parent or guilty or found:
-            raise _invalid("platform stage must be a completed stock control")
-        return
-
     if state.stage is Stage.EXHAUSTED:
         if pending or queue or in_flight or parent or guilty:
             raise _invalid("exhausted stage has unresolved work")
@@ -361,7 +344,7 @@ def begin(candidates: list[int], loaded: list[int], *, observed_failure_time: fl
     universe = _core_set(sorted(candidates), "candidates", empty=False)
     loaded_set = _core_set(sorted(loaded), "loaded", empty=False)
     state = HuntState(
-        stage=Stage.CONTROL,
+        stage=Stage.PROBE,
         candidates=universe,
         pending=[list(universe)],
         observed_failure_time=_duration(observed_failure_time, "observed_failure_time"),
@@ -377,11 +360,8 @@ def next_live_set(state: HuntState) -> list[int] | None:
     A mask already in flight has not been answered, so it is replayed rather
     than skipped.
     """
-    if state.stage in (Stage.CULPRIT, Stage.PLATFORM, Stage.EXHAUSTED):
+    if state.stage in (Stage.CULPRIT, Stage.EXHAUSTED):
         return None
-    if state.stage is Stage.CONTROL:
-        state.in_flight = []
-        return []
     if state.in_flight:
         return list(state.in_flight)
     if state.queue:
@@ -405,19 +385,9 @@ def next_live_set(state: HuntState) -> list[int] | None:
     return list(state.in_flight)
 
 
-def record(state: HuntState, *, reproduced: bool, control_confirmations: int, max_no_reproduce: int) -> HuntState:
+def record(state: HuntState, *, reproduced: bool, max_no_reproduce: int) -> HuntState:
     """Fold one probe's answer into the hunt."""
     state.launches_done = 0
-    if state.stage is Stage.CONTROL:
-        state.in_flight = []
-        if reproduced:
-            state.control_fails += 1
-            if state.control_fails >= control_confirmations:
-                state.stage = Stage.PLATFORM
-            return state
-        state.stage = Stage.PROBE
-        return state
-
     probe = list(state.in_flight)
     state.in_flight = []
     if probe == state.parent:

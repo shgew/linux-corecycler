@@ -114,10 +114,7 @@ def describe_slot(slot: dict, elapsed: float | None = None) -> str:
     parts: list[str] = []
     hunt = slot.get("hunt")
     if hunt is not None:
-        if hunt["stage"] == "control":
-            parts.append("Hunt control probe: every core at stock")
-        else:
-            parts.append(f"Hunt {hunt['stage']} (level {hunt['level']}): cores {hunt['live']} live, the rest at stock")
+        parts.append(f"Hunt probe (level {hunt['level']}): cores {hunt['live']} live, the rest at stock")
         parts.append(f"load on cores {slot['cores']}")
     else:
         stage = slot.get("validation_stage")
@@ -962,7 +959,7 @@ class TunerTab(QWidget):
     def _on_platform_fault(self, evidence: str) -> None:
         self._notify(
             "Platform fault",
-            f"The all-stock control also failed: {evidence}. Curve Optimizer offsets are not implicated.",
+            f"Curve Optimizer offsets are not implicated: {evidence}.",
             urgency="critical",
         )
 

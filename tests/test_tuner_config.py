@@ -63,7 +63,6 @@ class TestTunerConfigDefaults:
             battery=TunerConfig().battery,
             coarse_regimes=["current"],
             regime_floor_pct=10.0,
-            control_run_confirmations=3,
             probe_base_seconds=900,
             probe_mttf_multiplier=3.0,
             probe_level_multiplier=2.0,
@@ -112,7 +111,6 @@ class TestNewConfigOptions:
         }
         assert cfg.coarse_regimes == ["current", "transient"]
         assert cfg.regime_floor_pct == 15.0
-        assert cfg.control_run_confirmations == 2
         assert cfg.probe_base_seconds == 1800
         assert cfg.probe_mttf_multiplier == 4.0
         assert cfg.probe_level_multiplier == 1.5
@@ -131,7 +129,6 @@ class TestNewConfigOptions:
             battery=list(reversed(defaults.battery)),
             coarse_regimes=["boost"],
             regime_floor_pct=10.0,
-            control_run_confirmations=3,
             probe_base_seconds=900,
             probe_mttf_multiplier=3.0,
             probe_level_multiplier=2.0,
@@ -270,7 +267,6 @@ class TestConfigValidationFailsClosed:
             {"apparatus_failure_streak": 2},
             {"max_core_time_seconds": 1799},
             {"regime_floor_pct": 0},
-            {"control_run_confirmations": 0},
             {"probe_base_seconds": 59},
             {"probe_mttf_multiplier": 0},
             {"probe_level_multiplier": 0.5},

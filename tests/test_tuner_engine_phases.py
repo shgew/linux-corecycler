@@ -354,13 +354,6 @@ class TestHuntSlots:
 
     def _probing(self, engine):
         self._hunting(engine)
-        assert bisect.next_live_set(engine._hunt) == []
-        bisect.record(
-            engine._hunt,
-            reproduced=False,
-            control_confirmations=engine._config.control_run_confirmations,
-            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
-        )
         live, _ = bisect.split(sorted(engine._core_states))
         engine._save_hunt()
         return live
@@ -405,7 +398,7 @@ class TestHuntSlots:
         assert engine.status == "profile_quarantined"
         engine._start_worker.assert_not_called()
 
-    def test_a_passing_control_probe_starts_bisection(self, engine, monkeypatch):
+    def test_a_passing_probe_is_persisted_and_the_hunt_goes_on(self, engine, monkeypatch):
         self._hunting(engine)
         engine._run_next_hunt_slot()
         queued = []
@@ -444,13 +437,6 @@ class TestApparatusFault:
         for cid in engine._core_states:
             _confirm(engine, cid, -20)
         state = bisect.begin(sorted(engine._core_states), loaded=[0])
-        assert bisect.next_live_set(state) == []
-        bisect.record(
-            state,
-            reproduced=False,
-            control_confirmations=engine._config.control_run_confirmations,
-            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
-        )
         in_flight = bisect.next_live_set(state)
         engine._hunt = state
         engine._hunting = True
@@ -1495,49 +1481,11 @@ class TestHuntDecisions:
         for core_id in candidates:
             _confirm(engine, core_id, -20)
         state = bisect.begin(candidates, loaded=[0])
-        assert bisect.next_live_set(state) == []
-        bisect.record(
-            state,
-            reproduced=False,
-            control_confirmations=engine._config.control_run_confirmations,
-            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
-        )
         first = bisect.next_live_set(state)
         engine._hunt = state
         engine._hunting = True
         engine._save_hunt()
         return state, first
-
-    def test_two_stock_crashes_are_a_persisted_platform_fault(self, engine):
-        for core_id in engine._core_states:
-            _confirm(engine, core_id, -20)
-        engine._co_applied = dict.fromkeys(engine._core_states, -20)
-        engine._hunt = bisect.begin(sorted(engine._core_states), loaded=[0])
-        engine._hunting = True
-        engine._save_hunt()
-
-        assert bisect.next_live_set(engine._hunt) == []
-        engine._record_hunt_probe(reproduced=True)
-        persisted = bisect.HuntState.from_json(engine._db.get_tuner_session(engine._session_id).hunt_state)
-        assert persisted.stage is bisect.Stage.CONTROL
-        assert persisted.control_fails == 1
-
-        assert bisect.next_live_set(engine._hunt) == []
-        engine._record_hunt_probe(reproduced=True)
-        persisted = bisect.HuntState.from_json(engine._db.get_tuner_session(engine._session_id).hunt_state)
-        assert persisted.stage is bisect.Stage.PLATFORM
-
-        faults = []
-        engine.platform_fault.connect(faults.append)
-        engine._resolve_hunt()
-
-        session = engine._db.get_tuner_session(engine._session_id)
-        assert engine.status == "platform_fault"
-        assert session.status == "platform_fault"
-        assert session.hunt_state == ""
-        assert faults == ["the machine failed with every core at stock"]
-        assert engine._co_applied == dict.fromkeys(engine._core_states, 0)
-        assert all(cs.crash_count == 0 for cs in engine._core_states.values())
 
     def test_a_reproducing_half_is_recursed_into(self, engine):
         state, guilty_half = self._probe(engine)
@@ -1577,13 +1525,6 @@ class TestHuntDecisions:
 
     def test_a_consumed_probe_state_becomes_an_exhausted_verdict(self, engine):
         state = bisect.begin([0, 1], loaded=[0])
-        assert bisect.next_live_set(state) == []
-        bisect.record(
-            state,
-            reproduced=False,
-            control_confirmations=engine._config.control_run_confirmations,
-            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
-        )
         state.pending.clear()
 
         assert bisect.next_live_set(state) is None
@@ -1693,7 +1634,7 @@ class TestHuntDecisions:
         assert faults == ["no core held a live offset at the time of the failure"]
         assert engine._db.get_tuner_session(engine._session_id).hunt_state == ""
 
-    def test_multi_core_control_probe_persists_the_replayed_load(self, engine, monkeypatch):
+    def test_multi_core_probe_persists_the_replayed_load(self, engine, monkeypatch):
         for core_id in engine._core_states:
             _confirm(engine, core_id, -20)
         engine._hunt = bisect.begin(sorted(engine._core_states), loaded=[0, 1])
@@ -1703,7 +1644,7 @@ class TestHuntDecisions:
         engine._run_next_hunt_slot()
 
         persisted = bisect.HuntState.from_json(engine._db.get_tuner_session(engine._session_id).hunt_state)
-        assert persisted.stage is bisect.Stage.CONTROL
+        assert persisted.in_flight == [0, 1]
         assert persisted.loaded == [0, 1]
         assert engine._core_states[0].in_test is True
         assert engine._core_states[1].in_test is True
@@ -1842,13 +1783,6 @@ class TestRemainingHuntCoverage:
             cs.in_test = True
             engine._db.upsert_tuner_core_state(sid, cs)
         state = bisect.begin(sorted(engine._core_states), loaded=[0])
-        assert bisect.next_live_set(state) == []
-        bisect.record(
-            state,
-            reproduced=False,
-            control_confirmations=engine._config.control_run_confirmations,
-            max_no_reproduce=engine._config.max_unattributed_crash_hunts,
-        )
         failed_live = bisect.next_live_set(state)
         state.vector = dict.fromkeys(engine._core_states, -20)
         state.workload = {"regime": "current", "backend": "mprime", "stress_mode": "avx2", "fft_preset": "small"}
@@ -1952,6 +1886,7 @@ class TestEngineSafetyReviewRegressions:
         for core_id in engine._core_states:
             _confirm(engine, core_id, -20)
         state = bisect.begin(sorted(engine._core_states), loaded=[0])
+        bisect.next_live_set(state)
         state.vector = dict.fromkeys(engine._core_states, -20)
         state.workload = {
             "regime": "current",
@@ -1969,8 +1904,7 @@ class TestEngineSafetyReviewRegressions:
         engine.resume(sid)
 
         persisted = bisect.HuntState.from_json(engine._db.get_tuner_session(sid).hunt_state)
-        assert persisted.stage is bisect.Stage.CONTROL
-        assert persisted.control_fails == 0
+        assert (persisted.in_flight, persisted.guilty_halves) == ([0, 1], [])
 
     def test_candidate_write_failure_restores_stock(self, engine):
         cs = engine._core_states[0]
@@ -2199,8 +2133,10 @@ class TestStartAndResumeGuards:
         assert engine._hunting is False
         run_next.assert_called_once_with()
 
-    def test_hardware_evidence_during_the_stock_control_reproduces_the_incident(self, engine, monkeypatch):
+    def test_hardware_evidence_on_a_live_core_reproduces_the_incident(self, engine, monkeypatch):
         engine._hunt = bisect.begin(sorted(engine._core_states), [0])
+        bisect.next_live_set(engine._hunt)
+        engine._hunt.vector = dict.fromkeys(engine._core_states, -20)
         engine._hunting = True
         record = MagicMock()
         monkeypatch.setattr(engine, "_record_hunt_probe", record)
