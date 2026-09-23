@@ -586,7 +586,7 @@ def test_the_default_work_dir_is_outside_the_repo(db):
     from corecycler.config.paths import resolve_work_dir
 
     assert instance._work_dir == resolve_work_dir() / "tuner"
-    assert "/tmp/corecycler" not in str(instance._work_dir)
+    assert not instance._work_dir.is_relative_to("/tmp/corecycler")
     assert instance.session_id is None
     assert instance.core_states == {}
 

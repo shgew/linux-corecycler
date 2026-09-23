@@ -232,5 +232,5 @@ class TestLaneBuilding:
             scheduler_config=SchedulerConfig(),
         )
         assert runner.work_dir == resolve_work_dir()
-        assert "/tmp/corecycler" not in str(runner.work_dir)
+        assert not runner.work_dir.is_relative_to("/tmp/corecycler")
         assert not (Path(__file__).parent.parent / "core_0").exists()

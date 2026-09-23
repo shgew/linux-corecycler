@@ -153,7 +153,7 @@ class TestInit:
             scheduler_config=SchedulerConfig(),
         )
         assert sched.work_dir == resolve_work_dir()
-        assert "/tmp/corecycler" not in str(sched.work_dir)
+        assert not sched.work_dir.is_relative_to("/tmp/corecycler")
 
     def test_callbacks_start_empty(self, tmp_path):
         sched = make_scheduler(tmp_path)

@@ -40,7 +40,7 @@ class TestResolveWorkDir:
         monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
         resolved = paths.resolve_work_dir()
         assert resolved == paths.user_home() / ".cache" / "corecycler" / "work"
-        assert "/tmp/corecycler" not in str(resolved)
+        assert not resolved.is_relative_to("/tmp/corecycler")
 
     def test_ensure_creates_the_tree_and_repairs_ownership(self, tmp_path, monkeypatch):
         chowned: list[Path] = []
