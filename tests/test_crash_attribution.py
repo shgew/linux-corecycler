@@ -492,6 +492,27 @@ class TestCrashHunt:
         assert searching.phase is not TunerPhase.COARSE_SEARCH
         assert all(cs.current_offset == BEST[c] for c, cs in eng._core_states.items() if c != 3)
 
+    def test_a_failed_step_that_pauses_leaves_the_machine_at_stock(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        eng = _make_engine(
+            db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1, suspicion_min_failures=99
+        )
+        _seed_confirmed_validating(eng, db, BEST, BASELINES)
+        backing_off = eng._core_states[3]
+        backing_off.phase = TunerPhase.BACKOFF_PRECONFIRM
+        backing_off.baseline_offset = BEST[3]
+        db.upsert_tuner_core_state(eng._session_id, backing_off)
+        db.update_tuner_session_status(eng._session_id, "running")
+        monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
+        eng._start_worker = lambda *a, **k: None
+        eng._start_multi_core_worker = lambda *a, **k: None
+
+        self._exhaust_hunt(eng, [3])
+
+        assert eng.status == "paused"
+        assert set(eng._smu.written.values()) == {0}
+
     def test_exhausted_hunts_feed_the_suspicion_fallback(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
         eng = _make_engine(
             db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1, suspicion_min_failures=1

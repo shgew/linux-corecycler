@@ -435,8 +435,11 @@ class TestIdleComposition:
             return step_pass(sup, lanes, config_for, duration)
 
         ScriptedSupervisor.script = [stress]
+        finished: list[tuple[int, bool]] = []
+        sched.on_core_finish.append(lambda core, result: finished.append((core, result.passed)))
         results = sched.run()
         assert launched == []
+        assert finished == [(0, False)]
         assert results[0][0].passed is False
         assert results[0][0].error_type == "mce"
 
