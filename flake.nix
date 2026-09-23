@@ -234,6 +234,7 @@
             devShells.default = pkgs.mkShell {
               inputsFrom = [ b.default ];
               packages = [
+                pkgs.just
                 pkgs.nixfmt
                 pkgs.ruff
               ];

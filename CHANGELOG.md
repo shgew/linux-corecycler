@@ -10,6 +10,11 @@ A per-core CPU stability tester and AMD PBO Curve Optimizer tuner for Linux,
 packaged as a NixOS module with an overlay. Forked from
 [Daaboulex/linux-corecycler](https://github.com/Daaboulex/linux-corecycler).
 
+### Added (2026-09-23 development workflow)
+
+- Added the `just` dev-shell dependency and a repository `justfile` for recurring
+test, quality, Nix, hardware-contract, mutation, live-scenario, and history-db workflows.
+
 ### Fixed (2026-09-23 overnight run on the 9950X3D2)
 
 - A crash on a search, confirmation, backoff, or annealing step, with every other live

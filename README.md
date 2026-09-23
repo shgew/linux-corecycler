@@ -97,11 +97,12 @@ full guide -- manual tuning workflow, the Auto-Tuner, and reading results -- is 
 ## Development
 
 ```bash
-nix develop                                   # the package's Python env + ruff and nixfmt
-ruff check src                                # lint
-python -m pytest -m 'not slow'                # the suite, inside nix develop
-nix flake check                               # build + every check (what CI runs)
-corecycler doctor                             # every external tool and how it resolved
+just --list                                   # show recurring workflows
+just test                                     # hermetic suite, distributed
+just focus tests/test_smu_commands.py         # one target, serial
+just gate                                     # lint, formatting, and 100% coverage
+just check                                    # build + every check
+just doctor                                   # every external tool and how it resolved
 ```
 
 ## Options

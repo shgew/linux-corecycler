@@ -61,14 +61,17 @@ Supervisor polling checks, per tick: thermal state, dmesg MCEs, backend live err
 ## Development Commands
 
 ```bash
-nix develop                                     # the package's Python env + ruff and nixfmt
-ruff check src                                  # lint
-ruff format --check src                        # formatting check
-nix fmt -- flake.nix nix/*.nix                  # Nix formatting
-python -m pytest -m 'not slow'                  # the suite, inside nix develop
-nix flake check                                 # build + every repository check
-corecycler doctor                               # tool resolution preflight
+just --list                                     # show recurring workflows
+just test                                       # hermetic suite, distributed
+just focus tests/test_smu_commands.py           # one target, serial
+just gate                                       # lint, formatting, and 100% coverage
+just check                                      # build + every repository check
+just doctor                                     # tool resolution preflight
 ```
+
+The dev shell provides `just`; each recipe enters it automatically when needed.
+Use `just fmt` to rewrite Python, Nix, and Just formatting. Run `just contract`
+or `just live SCENARIO` only on the real hardware they require.
 
 Non-Nix distros: `python3 -m venv .venv && source .venv/bin/activate && pip install -e ".[dev]" && pip install PySide6`, then `pytest tests/ -v`. PySide6 is required by the whole suite, not just GUI tests: autouse fixtures import the tuner engine.
 
@@ -147,16 +150,12 @@ Test-driven development is required for every behavior change. Follow the cycle 
 Every bug fix starts with a regression test that reproduces the bug. Exercise hardware-dependent behavior through the existing hermetic seams; put external assumptions in the Ring A and Ring B contract tests. Documentation-only, comment-only, and formatting-only changes are exempt because they do not change behavior.
 
 ```bash
-python -m pytest -m "not slow" --cov=corecycler --cov-report=term --cov-fail-under=100
-python -m pytest -m "not slow" --cov=corecycler --cov-report=term-missing   # find gaps
-python -m pytest tests/test_smu_commands.py -n0 -v                          # one module
-python -m pytest tests/test_smu_commands.py::TestCoEncoding -n0 -v          # one class
-QT_QPA_PLATFORM=offscreen python -m pytest -m 'not slow'                    # headless
-CORECYCLER_HW_CONTRACTS=1 python -m pytest -m contract -n0                  # Ring B live
-sudo -E env CORECYCLER_HW_CONTRACTS=1 CORECYCLER_HW_PRIVILEGED=1 \
-  python -m pytest -m contract -n0                                          # privileged
-python3 scripts/mutate.py --src src/corecycler/smu/commands.py \
-  --tests tests/test_smu_commands.py --max 60                               # mutation
+just cov
+just focus tests/test_smu_commands.py -v
+just focus tests/test_smu_commands.py::TestCoEncoding -v
+just contract
+just contract-privileged
+just mutate --src src/corecycler/smu/commands.py --tests tests/test_smu_commands.py --max 60
 ```
 
 **Coverage floor is 100% line coverage** for the non-slow suite, enforced by `checks.coverage` (`--cov-fail-under=100`, `branch = false`, `*/main.py` omitted). New code should have tests. When coverage is not meaningful, use `# pragma: no cover  # reason: <why>` and explain the unreachable or unobservable path. The guard test rejects bare exemptions.
