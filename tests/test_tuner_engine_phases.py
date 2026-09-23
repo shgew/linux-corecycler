@@ -424,8 +424,7 @@ class TestHuntSlots:
         engine._on_hunt_slot_finished(0, True, "", {2: {"source": "mce"}})
         assert engine.status == "paused"
         assert engine._hunt.stage is bisect.Stage.PROBE
-        assert engine._hunt.in_flight == []
-        assert engine._hunt.queue[0] == live
+        assert bisect.next_live_set(engine._hunt) == live
 
 
 class TestApparatusFault:
@@ -458,8 +457,7 @@ class TestApparatusFault:
         engine._save_hunt()
         monkeypatch.setattr(eng.QTimer, "singleShot", lambda _ms, _fn: None)
         engine._handle_apparatus_fault(0, "backend missing", "startup", {})
-        assert state.in_flight == []
-        assert state.queue[0] == in_flight
+        assert bisect.next_live_set(state) == in_flight
         persisted = bisect.HuntState.from_json(engine._db.get_tuner_session(engine._session_id).hunt_state)
         assert persisted == state
 
@@ -688,8 +686,7 @@ class TestVerdictRouter:
         engine._hunting = True
         engine._save_hunt()
         engine._on_test_finished(0, False, "too hot", "thermal", 1.0, 0.0)
-        assert state.in_flight == []
-        assert state.queue == [[0, 1], [2, 3]]
+        assert bisect.next_live_set(state) == [0, 1]
         assert engine._validation_thermal_aborts == 1
         assert engine._hunting is True
         persisted = bisect.HuntState.from_json(engine._db.get_tuner_session(engine._session_id).hunt_state)
@@ -853,12 +850,11 @@ class TestAbortTeardown:
         worker.isRunning.return_value = True
         worker.wait.return_value = True
         engine._worker = worker
-        unchanged = (state.pending, state.found, state.exonerated, state.level)
+        unchanged = (state.pending, state.found, state.level)
         engine.abort()
         persisted = bisect.HuntState.from_json(engine._db.get_tuner_session(engine._session_id).hunt_state)
-        assert persisted.in_flight == []
-        assert persisted.queue == [[0, 1], [2, 3]]
-        assert (persisted.pending, persisted.found, persisted.exonerated, persisted.level) == unchanged
+        assert (persisted.pending, persisted.found, persisted.level) == unchanged
+        assert bisect.next_live_set(persisted) == [0, 1]
         assert engine._hunting is False
         assert engine._worker is None
         assert worker.scheduler.force_stop.called
@@ -913,8 +909,7 @@ class TestShutdownForExit:
         engine._worker = None
         engine.shutdown()
         persisted = bisect.HuntState.from_json(self._session(engine).hunt_state)
-        assert persisted.in_flight == []
-        assert persisted.queue == [[0, 1], [2, 3]]
+        assert bisect.next_live_set(persisted) == [0, 1]
         assert self._session(engine).status == "paused"
 
     def test_exit_retains_ownership_when_baselines_cannot_be_restored(self, engine, monkeypatch):

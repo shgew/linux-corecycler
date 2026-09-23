@@ -137,7 +137,7 @@ implementation detail, because it decides what a crash can prove.
   take the box down, and a search that parks everyone at stock is structurally unable
   to see that.
 - **Isolated mask** -- one core at its offset, every other core at stock. Only the
-  attribution hunt uses it, for leave-one-out confirmation. Its result is a
+  attribution hunt uses it, as the last step of bisection. Its result is a
   hypothesis about a core's limit, never proof of one, so nothing banks confidence
   from an isolated run.
 
@@ -201,8 +201,9 @@ attribution hunt:
    Both halves failing means two culprits, and both subtrees are pursued. A set that
    fails while both of its halves run clean fails only as a whole, so every member
    backs off one step.
-3. **Leave-one-out confirmation** -- the named core alone at its offset, at four
-   times the base probe budget, because a false clean at the leaf costs the answer.
+3. **Lone reproduction** -- a single core that reproduces the failure with every
+   other core at stock is the culprit. That reproduction is the answer the hunt was
+   asking for, so nothing re-runs the other cores without it.
 4. **Suspicion fallback** -- when nothing reproduces inside budget, every core that
    held a live offset accrues suspicion weighted by offset depth and by whether it
    was loaded or idle. It only acts on a two-to-one separation after at least three
@@ -210,7 +211,7 @@ attribution hunt:
    would be worst.
 
 Probe budgets are `max(probe_base_seconds, probe_mttf_multiplier x observed
-time-to-failure)`, grown per bisection level and again for the final confirmation.
+time-to-failure)`, grown per bisection level.
 A replayed slot longer than `probe_base_seconds` (a soak) raises that base to its own
 length; a shorter one never lowers it.
 The observed time comes from the micro-freeze breadcrumb, which records when its slot
@@ -218,7 +219,8 @@ started. A failure within `onset_failure_seconds` of load starting is an onset
 failure: load starts reproduce it and wall time does not, so the probe budget is
 spent as launches of `max(onset_launch_seconds, probe_mttf_multiplier x observed
 time)` each. The probe is answered after its last clean launch or at its first
-failure, and a series cut short by a pause is rerun whole.
+failure. A series cut short by a pause, a shutdown, a thermal stop, or an apparatus
+fault resumes the same probe from its last clean launch.
 
 Every solo slot idles `co_settle_seconds` between its CO write and its load step,
 watched for machine checks. The breadcrumb names the settle, so a freeze reads as
@@ -359,15 +361,14 @@ The status is the session's flow, and the CLI exit code follows it.
 | Stage | Question | Outcome |
 |---|---|---|
 | `control` | Does the machine die with every core at CO=0? | `platform` after `control_run_confirmations` reproductions; otherwise bisection starts |
-| `probe` | Which half of the live mask carries the culprit? | Recurses into the failing half, or into both halves when both fail. A set that fails while both halves ran clean backs off every member |
-| `confirm` | Does the named core alone reproduce it, at 4x the probe budget? | `culprit` on a reproduction; back to `probe` otherwise |
+| `probe` | Which half of the live mask carries the culprit? | Recurses into the failing half, or into both halves when both fail. A lone core that reproduces is a culprit. A set that fails while both halves ran clean backs off every member |
 | `culprit` | -- | The core is backed off one step and its banked confidence is discarded |
 | `platform` | -- | Tuner stops and reports a platform fault with the MCE, dmesg, thermal and PPT/TDC/EDC evidence. The answer is not in the offsets |
 | `exhausted` | Nothing reproduced inside budget | Counts one unattributed failure for the suspicion model, which acts only on a 2:1 separation after at least three; the search step that was running records a fail |
 
-A probe that is interrupted by a thermal stop, an apparatus fault, or a deliberate
-abort is returned to the head of the queue rather than counted as an answer, so a
-clean stop costs no attribution progress.
+A probe that is interrupted by a thermal stop, an apparatus fault, a pause, or a
+deliberate abort stays in flight rather than counting as an answer, with its clean
+launches kept, so a clean stop costs no attribution progress.
 
 #### Interrupting a run
 

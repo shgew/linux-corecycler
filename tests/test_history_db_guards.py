@@ -7,6 +7,7 @@ raise or return a safe default, never quietly hand back nonsense.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 
 import pytest
@@ -20,7 +21,9 @@ from corecycler.history.db import (
     TableSpec,
     TuningContextRecord,
 )
+from corecycler.tuner import bisect
 from corecycler.tuner import persistence as tp
+from corecycler.tuner.bisect import HuntState, Stage
 from corecycler.tuner.config import TunerConfig
 from corecycler.tuner.state import CoreState, TunerPhase
 
@@ -169,6 +172,96 @@ class TestOpenGuards:
             assert migrated.get_tuner_session(paused).status == "paused"
         finally:
             migrated.close()
+
+    @staticmethod
+    def _v3_hunt(**changes) -> str:
+        state = {
+            "version": 3,
+            "stage": "confirm",
+            "candidates": [0, 1, 2, 3],
+            "pending": [],
+            "queue": [],
+            "in_flight": [0, 1, 2],
+            "parent": [],
+            "guilty_halves": [],
+            "deferred": [],
+            "suspect": 3,
+            "control_fails": 0,
+            "level": 2,
+            "found": [],
+            "exonerated": [],
+            "no_reproduce": 0,
+            "observed_failure_time": 31.0,
+            "loaded": [3],
+            "armed": True,
+            "vector": {"0": -50, "1": -34, "2": -36, "3": -41},
+            "workload": {
+                "regime": "current",
+                "backend": "mprime",
+                "stress_mode": "AVX2",
+                "fft_preset": "SMALL",
+                "profile": "sustained",
+                "threads": 2,
+                "duration_seconds": 75,
+                "kind": "solo",
+            },
+        }
+        state.update(changes)
+        return json.dumps(state)
+
+    def _migrate_v22(self, tmp_path, config: dict, hunt_state: str):
+        path = tmp_path / "history.db"
+        db = HistoryDB(path)
+        session_id = db.create_tuner_session(json.dumps(config), "", "")
+        db.set_hunt_state(session_id, hunt_state)
+        db.close()
+        conn = sqlite3.connect(path)
+        conn.execute("UPDATE schema_version SET version=22")
+        conn.commit()
+        conn.close()
+        migrated = HistoryDB(path)
+        session = migrated.get_tuner_session(session_id)
+        migrated.close()
+        return session
+
+    def test_v23_migration_convicts_the_suspect_of_a_leave_one_out_probe(self, tmp_path):
+        """Session 12 was paused inside the retired confirmation of core 3."""
+        session = self._migrate_v22(tmp_path, {"max_offset": -50, "probe_final_multiplier": 4.0}, self._v3_hunt())
+
+        state = HuntState.from_json(session.hunt_state)
+        assert state.stage is Stage.CULPRIT
+        assert state.found == [3]
+        assert state.armed is False
+        assert state.vector[3] == -41
+        assert json.loads(session.config_json) == {"max_offset": -50}
+
+    def test_v23_migration_keeps_an_open_bisection_on_its_probe(self, tmp_path):
+        session = self._migrate_v22(
+            tmp_path,
+            {},
+            self._v3_hunt(
+                stage="probe",
+                pending=[],
+                queue=[[1]],
+                in_flight=[0],
+                parent=[0, 1],
+                suspect=None,
+                deferred=[3],
+                level=2,
+            ),
+        )
+
+        state = HuntState.from_json(session.hunt_state)
+        assert state.stage is Stage.PROBE
+        assert state.found == [3]
+        assert bisect.next_live_set(state) == [0]
+
+    def test_v23_migration_leaves_a_malformed_hunt_for_its_loader_to_reject(self, tmp_path):
+        hunt = self._v3_hunt(deferred="3")
+
+        session = self._migrate_v22(tmp_path, {}, hunt)
+
+        assert session.hunt_state == hunt
 
 
 class TestMissingRows:

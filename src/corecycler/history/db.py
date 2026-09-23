@@ -6,6 +6,8 @@ process-crash safety with good performance - data survives kill -9 and OOM.
 
 from __future__ import annotations
 
+import contextlib
+import json
 import logging
 import os
 import sqlite3
@@ -300,6 +302,34 @@ TUNER_REGIME_BANKS = TableSpec(
     "tuner_regime_banks",
     ("context_id", "core_id", "regime", "offset_value", "clean_seconds", "updated_at"),
 )
+
+
+def _json_object(text: str) -> dict | None:
+    with contextlib.suppress(ValueError):
+        value = json.loads(text)
+        return value if isinstance(value, dict) else None
+    return None
+
+
+def _hunt_state_v4(hunt: dict | None) -> dict | None:
+    """Rewrite a version 3 hunt without its leave-one-out confirmation."""
+    if hunt is None or hunt.get("version") != 3:
+        return None
+    lists = ("found", "deferred", "exonerated", "pending", "queue", "in_flight")
+    suspect = hunt.get("suspect")
+    if any(not isinstance(hunt.get(key), list) for key in lists) or not (suspect is None or type(suspect) is int):
+        return None
+    convicted = hunt.pop("deferred") + hunt.pop("exonerated") + ([] if suspect is None else [suspect])
+    del hunt["suspect"]
+    hunt["found"] = sorted(set(hunt["found"] + convicted))
+    if hunt.get("stage") == "confirm":
+        hunt.update(stage="probe", in_flight=[], level=0, armed=False)
+    if hunt.get("stage") in ("probe", "exhausted") and not (hunt["pending"] or hunt["queue"] or hunt["in_flight"]):
+        hunt["stage"] = "culprit" if hunt["found"] else "exhausted"
+    hunt.update(version=4, launches_done=0)
+    return hunt
+
+
 # ---------------------------------------------------------------------------
 # HistoryDB
 # ---------------------------------------------------------------------------
@@ -308,7 +338,7 @@ TUNER_REGIME_BANKS = TableSpec(
 class HistoryDB:
     """Crash-safe SQLite database for test run history."""
 
-    SCHEMA_VERSION = 22
+    SCHEMA_VERSION = 23
     TUNER_CONTRACT_VERSION = 16
 
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
@@ -1087,6 +1117,26 @@ CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
     # v21 -> v22: the engine renamed "quarantined" to "profile_quarantined".
     _DDL_MIGRATE_V22 = "UPDATE tuner_sessions SET status='profile_quarantined' WHERE status='quarantined';"
 
+    # v22 -> v23: the attribution hunt dropped its leave-one-out confirmation
+    # and its probe_final_multiplier. A lone core reaches the end of bisection
+    # only by reproducing the failure alone, so a persisted suspect, deferred or
+    # exonerated core is a culprit. Blobs that do not parse are left for their
+    # loaders to reject.
+    @staticmethod
+    def _migrate_v23(conn: sqlite3.Connection) -> None:
+        rows = conn.execute("SELECT id, config_json, hunt_state FROM tuner_sessions").fetchall()
+        for session_id, config_json, hunt_state in rows:
+            config = _json_object(config_json)
+            if config is not None and "probe_final_multiplier" in config:
+                del config["probe_final_multiplier"]
+                conn.execute("UPDATE tuner_sessions SET config_json=? WHERE id=?", (json.dumps(config), session_id))
+            hunt = _hunt_state_v4(_json_object(hunt_state))
+            if hunt is not None:
+                conn.execute(
+                    "UPDATE tuner_sessions SET hunt_state=? WHERE id=?",
+                    (json.dumps(hunt, separators=(",", ":")), session_id),
+                )
+
     _MIGRATIONS: dict[int, str | callable] = {
         2: _migrate_v2,
         3: _DDL_MIGRATE_V3,
@@ -1109,6 +1159,7 @@ CREATE INDEX idx_regime_bank_core ON tuner_regime_banks(context_id, core_id);
         20: _migrate_v20,
         21: _migrate_v21,
         22: _DDL_MIGRATE_V22,
+        23: _migrate_v23,
     }
 
     # ------------------------------------------------------------------

@@ -11,15 +11,15 @@ learned offsets; everyone else sits at stock. Halving the live set and
 reproducing the failure isolates a culprit in log2(n) probes, and the machine
 is in a real operating point the whole time.
 
-Two things have to happen before any of that is trustworthy:
+A control probe at full stock comes first. If the machine dies with every core
+at CO=0, the offsets are not the problem and no amount of searching will fix
+it. That is a platform fault (current limits, memory, power) and the only
+honest outcome is to say so.
 
-* A control probe at full stock. If the machine dies with every core at CO=0,
-  the offsets are not the problem and no amount of searching will fix it. That
-  is a platform fault (current limits, memory, power) and the only honest
-  outcome is to say so.
-* A single-core confirmation at the end. Bisection narrows to one core, but the
-  narrowing steps are short and probabilistic, so the last step gets a longer
-  budget before a core is blamed and demoted.
+A single core reaches the end of bisection only by reproducing the failure
+with every other core at stock. That is the whole question the hunt asks, so
+the core is convicted there; re-running everyone else without it would only
+spend hours re-proving the answer.
 
 The state machine is pure and serialisable because a probe's answer arrives by
 way of a reboot: the process that asked the question is gone by the time the
@@ -41,8 +41,6 @@ class Stage(StrEnum):
     CONTROL = "control"
     #: Halving the live set to find which half carries the culprit.
     PROBE = "probe"
-    #: Re-proving a lone suspect with a longer budget before blaming it.
-    CONFIRM = "confirm"
     #: A culprit was confirmed.
     CULPRIT = "culprit"
     #: The machine dies at stock too.
@@ -57,7 +55,7 @@ def split(candidates: list[int]) -> tuple[list[int], list[int]]:
     return candidates[:mid], candidates[mid:]
 
 
-_STATE_VERSION = 3
+_STATE_VERSION = 4
 _MAX_INTEGER = 2**31 - 1
 _MIN_INTEGER = -(2**31)
 
@@ -146,13 +144,11 @@ class HuntState:
     in_flight: list[int] = field(default_factory=list)
     parent: list[int] = field(default_factory=list)
     guilty_halves: list[list[int]] = field(default_factory=list)
-    deferred: list[int] = field(default_factory=list)
-    suspect: int | None = None
     control_fails: int = 0
     level: int = 0
     found: list[int] = field(default_factory=list)
-    exonerated: list[int] = field(default_factory=list)
     no_reproduce: int = 0
+    launches_done: int = 0
     loaded: list[int] = field(default_factory=list)
     observed_failure_time: float = 0.0
     armed: bool = False
@@ -171,13 +167,11 @@ class HuntState:
                 "in_flight": self.in_flight,
                 "parent": self.parent,
                 "guilty_halves": self.guilty_halves,
-                "deferred": self.deferred,
-                "suspect": self.suspect,
                 "control_fails": self.control_fails,
                 "level": self.level,
                 "found": self.found,
-                "exonerated": self.exonerated,
                 "no_reproduce": self.no_reproduce,
+                "launches_done": self.launches_done,
                 "observed_failure_time": self.observed_failure_time,
                 "loaded": self.loaded,
                 "armed": self.armed,
@@ -208,13 +202,11 @@ class HuntState:
                 "in_flight",
                 "parent",
                 "guilty_halves",
-                "deferred",
-                "suspect",
                 "control_fails",
                 "level",
                 "found",
-                "exonerated",
                 "no_reproduce",
+                "launches_done",
                 "observed_failure_time",
                 "loaded",
                 "armed",
@@ -227,9 +219,6 @@ class HuntState:
                 raise _invalid("unsupported version")
             if type(raw["armed"]) is not bool:
                 raise _invalid("armed must be a boolean")
-            suspect = raw["suspect"]
-            if suspect is not None and (type(suspect) is not int or not 0 <= suspect <= _MAX_INTEGER):
-                raise _invalid("suspect must be a core ID or null")
             workload = raw["workload"]
             if workload is not None:
                 errors = regime.workload_errors("workload", 0, workload)
@@ -243,13 +232,11 @@ class HuntState:
                 in_flight=_core_set(raw["in_flight"], "in_flight"),
                 parent=_core_set(raw["parent"], "parent"),
                 guilty_halves=_core_sets(raw["guilty_halves"], "guilty_halves"),
-                deferred=_core_set(raw["deferred"], "deferred"),
-                suspect=suspect,
                 control_fails=_counter(raw["control_fails"], "control_fails"),
                 level=_counter(raw["level"], "level"),
                 found=_core_set(raw["found"], "found"),
-                exonerated=_core_set(raw["exonerated"], "exonerated"),
                 no_reproduce=_counter(raw["no_reproduce"], "no_reproduce"),
+                launches_done=_counter(raw["launches_done"], "launches_done"),
                 observed_failure_time=_duration(raw["observed_failure_time"], "observed_failure_time"),
                 loaded=_core_set(raw["loaded"], "loaded", empty=False),
                 armed=raw["armed"],
@@ -271,13 +258,12 @@ def _validate_state(state: HuntState) -> None:
     guilty = [_core_set(group, "guilty set", empty=False) for group in state.guilty_halves]
     in_flight = _core_set(state.in_flight, "in_flight")
     parent = _core_set(state.parent, "parent")
-    deferred = _core_set(state.deferred, "deferred")
     found = _core_set(state.found, "found")
-    exonerated = _core_set(state.exonerated, "exonerated")
     _core_set(state.loaded, "loaded", empty=False)
     _counter(state.control_fails, "control_fails")
     _counter(state.level, "level")
     _counter(state.no_reproduce, "no_reproduce")
+    _counter(state.launches_done, "launches_done")
     _duration(state.observed_failure_time, "observed_failure_time")
     if type(state.armed) is not bool:
         raise _invalid("armed must be a boolean")
@@ -306,21 +292,15 @@ def _validate_state(state: HuntState) -> None:
     grouped = pending + queue + guilty
     if any(not set(group) <= candidate_set for group in grouped) or not set(in_flight + parent) <= candidate_set:
         raise _invalid("search sets must be subsets of candidates")
-    if state.suspect is not None and state.suspect not in candidate_set:
-        raise _invalid("suspect must belong to candidates")
-    resolved = [found, exonerated, deferred]
-    if not _disjoint(resolved):
-        raise _invalid("found, exonerated, and deferred sets must be disjoint")
-    resolved_set = set(found + exonerated)
-    active_set = set(deferred + in_flight + parent)
-    active_set.update(core for group in grouped for core in group)
-    if resolved_set & active_set:
+    if set(found) & (set(in_flight + parent) | {core for group in grouped for core in group}):
         raise _invalid("resolved and active search sets must be disjoint")
-    if not set(found + exonerated + deferred) <= candidate_set:
+    if not set(found) <= candidate_set:
         raise _invalid("resolved search sets must be subsets of candidates")
     max_level = (len(candidates) - 1).bit_length()
     if state.level > max_level:
         raise _invalid("level exceeds the candidate split depth")
+    if state.launches_done and state.stage is not Stage.CONTROL and not in_flight:
+        raise _invalid("launch progress requires an unanswered probe")
 
     if state.stage is Stage.CONTROL:
         if (
@@ -329,10 +309,7 @@ def _validate_state(state: HuntState) -> None:
             or in_flight
             or parent
             or guilty
-            or deferred
-            or state.suspect is not None
             or found
-            or exonerated
             or state.level != 0
             or state.no_reproduce != 0
         ):
@@ -340,8 +317,6 @@ def _validate_state(state: HuntState) -> None:
         return
 
     if state.stage is Stage.PROBE:
-        if state.suspect is not None:
-            raise _invalid("probe stage cannot have a suspect")
         if len(queue) > 2 or len(guilty) > 2:
             raise _invalid("probe stage has too many split sets")
         if parent:
@@ -359,22 +334,12 @@ def _validate_state(state: HuntState) -> None:
                 raise _invalid("a fully queued split must partition its parent")
         elif queue or guilty or in_flight or state.level != 0:
             raise _invalid("probe progress requires a parent set")
-        if not (pending or queue or in_flight or deferred):
+        if not (pending or queue or in_flight):
             raise _invalid("probe stage has no remaining work")
         return
 
-    if state.stage is Stage.CONFIRM:
-        if state.suspect is None or queue or guilty or parent:
-            raise _invalid("confirm stage requires exactly one suspect and its mask")
-        if any(state.suspect in group for group in pending) or state.suspect in deferred:
-            raise _invalid("confirm suspect cannot also be pending or deferred")
-        expected_mask = candidate_set - set(found) - set(deferred) - {state.suspect}
-        if set(in_flight) != expected_mask:
-            raise _invalid("confirm in-flight set must be the persisted leave-one-out mask")
-        return
-
     if state.stage is Stage.CULPRIT:
-        if not found or pending or queue or in_flight or parent or guilty or deferred or state.suspect is not None:
+        if not found or pending or queue or in_flight or parent or guilty:
             raise _invalid("culprit stage requires only confirmed culprits")
         return
 
@@ -384,7 +349,7 @@ def _validate_state(state: HuntState) -> None:
         return
 
     if state.stage is Stage.EXHAUSTED:
-        if pending or queue or in_flight or parent or guilty or deferred or state.suspect is not None:
+        if pending or queue or in_flight or parent or guilty:
             raise _invalid("exhausted stage has unresolved work")
         return
 
@@ -406,40 +371,30 @@ def begin(candidates: list[int], loaded: list[int], *, observed_failure_time: fl
     return state
 
 
-def _confirmation(state: HuntState, suspect: int) -> list[int]:
-    state.stage = Stage.CONFIRM
-    state.suspect = suspect
-    state.parent = []
-    state.queue = []
-    state.guilty_halves = []
-    excluded = set(state.found + state.deferred + [suspect])
-    state.in_flight = [core for core in state.candidates if core not in excluded]
-    state.level = (len(state.candidates) - 1).bit_length()
-    return list(state.in_flight)
-
-
 def next_live_set(state: HuntState) -> list[int] | None:
-    """Return and persist the exact live mask for the next probe."""
+    """Return and persist the exact live mask for the next probe.
+
+    A mask already in flight has not been answered, so it is replayed rather
+    than skipped.
+    """
     if state.stage in (Stage.CULPRIT, Stage.PLATFORM, Stage.EXHAUSTED):
         return None
     if state.stage is Stage.CONTROL:
         state.in_flight = []
         return []
-    if state.stage is Stage.CONFIRM:
+    if state.in_flight:
         return list(state.in_flight)
     if state.queue:
         state.in_flight = state.queue.pop(0)
         return list(state.in_flight)
-    if state.pending:
-        target = state.pending.pop(0)
-    elif state.deferred:
-        target = [state.deferred.pop(0)]
-    else:
+    # A lone core is pending only after reproducing the failure with every
+    # other core at stock, or as the whole live set of the crash.
+    while state.pending and len(state.pending[0]) == 1:
+        state.found = sorted(state.found + state.pending.pop(0))
+    if not state.pending:
         state.stage = Stage.CULPRIT if state.found else Stage.EXHAUSTED
-        state.in_flight = []
         return None
-    if len(target) == 1:
-        return _confirmation(state, target[0])
+    target = state.pending.pop(0)
     left, right = split(target)
     state.parent = list(target)
     state.guilty_halves = []
@@ -452,6 +407,7 @@ def next_live_set(state: HuntState) -> list[int] | None:
 
 def record(state: HuntState, *, reproduced: bool, control_confirmations: int, max_no_reproduce: int) -> HuntState:
     """Fold one probe's answer into the hunt."""
+    state.launches_done = 0
     if state.stage is Stage.CONTROL:
         state.in_flight = []
         if reproduced:
@@ -460,30 +416,6 @@ def record(state: HuntState, *, reproduced: bool, control_confirmations: int, ma
                 state.stage = Stage.PLATFORM
             return state
         state.stage = Stage.PROBE
-        return state
-
-    if state.stage is Stage.CONFIRM:
-        suspect = state.suspect
-        if suspect is None:
-            raise ValueError("confirmation has no suspect")
-        state.in_flight = []
-        state.suspect = None
-        state.level = 0
-        if not reproduced:
-            state.found.append(suspect)
-            state.found.sort()
-            state.no_reproduce = 0
-        elif state.pending:
-            state.deferred.append(suspect)
-        else:
-            state.exonerated.append(suspect)
-            state.no_reproduce += 1
-        if state.pending or state.deferred:
-            state.stage = Stage.PROBE
-        elif state.found:
-            state.stage = Stage.CULPRIT
-        else:
-            state.stage = Stage.EXHAUSTED
         return state
 
     probe = list(state.in_flight)
@@ -525,11 +457,10 @@ def _record_whole_set(state: HuntState, *, reproduced: bool) -> HuntState:
     if reproduced:
         state.found = sorted(state.found + whole)
         state.no_reproduce = 0
-        if not (state.pending or state.deferred):
+        if not state.pending:
             state.stage = Stage.CULPRIT
         return state
     state.pending = []
-    state.deferred = []
     state.stage = Stage.CULPRIT if state.found else Stage.EXHAUSTED
     return state
 
@@ -540,17 +471,14 @@ def probe_seconds(
     base: int,
     mttf_multiplier: float,
     level_multiplier: float,
-    final_multiplier: float,
 ) -> int:
     """How long this probe runs before a survival counts as clean.
 
     A false clean near the leaves throws away the whole answer, so the budget
-    grows with depth and again for the single-core confirmation.
+    grows with depth.
     """
     budget = max(float(base), state.observed_failure_time * mttf_multiplier)
     budget *= level_multiplier**state.level
-    if state.stage is Stage.CONFIRM:
-        budget *= final_multiplier
     return max(1, int(budget))
 
 

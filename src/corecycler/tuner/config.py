@@ -40,7 +40,6 @@ FIELD_BOUNDS: dict[str, tuple[int | float, int | float]] = {
     "probe_base_seconds": (60, 86400),
     "probe_mttf_multiplier": (0.01, 100),
     "probe_level_multiplier": (1, 10),
-    "probe_final_multiplier": (1, 100),
     "onset_failure_seconds": (0, 3600),
     "onset_launch_seconds": (10, 3600),
     "co_settle_seconds": (0, 60),
@@ -129,8 +128,8 @@ class TunerConfig:
     # the session instead of re-applying a profile that keeps crashing the machine.
     resume_crash_quarantine_threshold: int = 3
 
-    # Crash hunts control-probe stock, bisect reproducing groups, then confirm
-    # each suspect by removing it from the original live candidate universe.
+    # Crash hunts control-probe stock, then bisect reproducing groups down to
+    # the core that reproduces alone.
     # Repeated fruitless hunts pause instead of guessing a culprit.
     max_unattributed_crash_hunts: int = 2
 
@@ -178,12 +177,11 @@ class TunerConfig:
     # reproduce this many times at stock before we call it a platform fault.
     control_run_confirmations: int = 2
     # Probe budget: max(base, mttf_multiplier x observed time-to-failure),
-    # grown per bisection level and again for final leave-one-out confirmation,
+    # grown per bisection level,
     # because a false clean near the leaves costs the whole answer.
     probe_base_seconds: int = 1800
     probe_mttf_multiplier: float = 4.0
     probe_level_multiplier: float = 1.5
-    probe_final_multiplier: float = 4.0
     # A failure landing this soon after load starts is an onset failure: its
     # probe budget is spent as launches of at least onset_launch_seconds, each
     # outlasting mttf_multiplier x the observed failure time. 0 disables.

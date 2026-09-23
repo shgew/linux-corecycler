@@ -597,7 +597,6 @@ class TestOnsetHunt:
             base=eng._config.probe_base_seconds,
             mttf_multiplier=eng._config.probe_mttf_multiplier,
             level_multiplier=eng._config.probe_level_multiplier,
-            final_multiplier=eng._config.probe_final_multiplier,
         )
 
     @staticmethod
@@ -666,20 +665,52 @@ class TestOnsetHunt:
             self._launch(eng, True)
         assert clean == -(-budget // 32)
 
-    def test_a_pause_between_launches_requeues_the_whole_probe(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
+    def test_a_pause_between_launches_keeps_its_clean_launches(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
+        """Session 12 paused after 44 clean launches of a 131-launch probe and
+        the resume started the series over."""
+        import corecycler.tuner.engine as engine_mod
+
         eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
         eng._start_hunt(observed_mttf=8.0, loaded=[5])
         while eng._hunt.stage is bisect.Stage.CONTROL:
             self._launch(eng, True)
         probe = list(eng._hunt.in_flight)
-        eng._on_test_finished(5, True, "", "", 32.0, 0.0)
-
+        launches = -(-self._budget(eng) // 32)
+        for _ in range(3):
+            self._launch(eng, True)
         eng.pause()
+        eng._on_test_finished(5, True, "", "", 32.0, 0.0)
         eng._run_next_hunt_slot()
 
-        persisted = bisect.HuntState.from_json(db.get_tuner_session(eng._session_id).hunt_state)
-        assert persisted.in_flight == []
-        assert bisect.next_live_set(persisted) == probe
+        monkeypatch.setattr(engine_mod, "_rebooted_since", lambda *_a, **_kw: False)
+        resumed = _make_engine(db, topo_dual_ccd_x3d, mock_backend, probe_base_seconds=300)
+        resumed._start_worker = lambda *_a, **_k: None
+        resumed._start_multi_core_worker = lambda *_a, **_k: None
+        resumed.resume(eng._session_id)
+        assert resumed._hunt.in_flight == probe
+        remaining = 0
+        while resumed._hunt.in_flight == probe and remaining < launches:
+            self._launch(resumed, True)
+            remaining += 1
+
+        assert remaining == launches - 4
+        assert resumed._hunt.in_flight != probe
+
+    def test_a_hunt_slot_reports_the_offset_its_core_actually_held(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        """Session 12 logged "Core 3 offset -41: PASS" for 44 launches that ran core 3 at stock."""
+        eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
+        messages: list[str] = []
+        eng.log_message.connect(messages.append)
+        eng._start_hunt(observed_mttf=8.0, loaded=[5])
+
+        self._launch(eng, True)
+
+        assert eng._smu.written[5] == 0
+        assert "Core 5 offset 0: PASS" in messages
+        hunt_rows = [row for row in db.get_tuner_test_log(eng._session_id, core_id=5) if row["phase"] == "hunt"]
+        assert [row["offset_tested"] for row in hunt_rows] == [0]
 
     def test_a_probe_that_could_not_run_is_requeued_at_stock(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
         """Session 12 paused on "mprime exited with code 0" mid-probe and lost
@@ -1104,6 +1135,34 @@ class TestPersistedHuntResume:
         assert engine.status == "hunting"
         assert db.get_tuner_session(engine._session_id).status == "hunting"
 
+    def test_a_paused_hunt_with_a_culprit_backs_it_off_on_resume(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        """Session 12 migrates to a convicted core 3; resuming must act on it, not probe again."""
+        import corecycler.tuner.engine as engine_mod
+
+        engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_confirmed_validating(engine, db, BEST, BASELINES)
+        state = bisect.begin([5, 6], [5])
+        state.stage = bisect.Stage.CULPRIT
+        state.pending = []
+        state.found = [5]
+        state.vector = dict(BEST)
+        db.set_hunt_state(engine._session_id, state.to_json())
+        db.update_tuner_session_status(engine._session_id, "paused")
+        monkeypatch.setattr(engine_mod, "_rebooted_since", lambda *_a, **_kw: False)
+        monkeypatch.setattr(engine_mod.QTimer, "singleShot", lambda *_a: None)
+        launches = []
+        engine._start_worker = lambda *a, **_k: launches.append(a)
+        engine._start_multi_core_worker = lambda *a, **_k: launches.append(a)
+
+        engine.resume(engine._session_id)
+
+        assert launches == []
+        assert engine._hunt is None
+        assert db.get_tuner_session(engine._session_id).hunt_state == ""
+        assert BEST[5] < engine.core_states[5].current_offset <= 0
+
     def test_resume_discards_another_sessions_in_memory_hunt(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
         import corecycler.tuner.engine as engine_mod
 
@@ -1186,38 +1245,6 @@ class TestPersistedHuntSafety:
         tp.journal_co_intent(db, engine._session_id, 99, -40, survived=False)
 
         assert engine._hunt_candidates() == [2, 5]
-
-    def test_disarming_confirm_probe_requeues_suspect_without_a_verdict(self, db, topo_dual_ccd_x3d, mock_backend):
-        engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
-        _seed_confirmed_validating(engine, db, BEST, BASELINES)
-        state = bisect.HuntState(
-            candidates=sorted(BEST),
-            stage=bisect.Stage.CONFIRM,
-            pending=[[6, 7]],
-            suspect=5,
-            in_flight=[0, 1, 2, 3, 4, 6, 7],
-            loaded=[5, 6],
-            armed=True,
-            vector=dict(BEST),
-            workload=engine._workload_snapshot(engine._core_states[5]),
-        )
-        engine._hunt = state
-        engine._hunting = True
-        engine._core_states[5].in_test = True
-        db.upsert_tuner_core_state(engine._session_id, engine._core_states[5])
-        db.set_hunt_state(engine._session_id, state.to_json())
-
-        engine._requeue_hunt_probe()
-
-        restored = bisect.HuntState.from_json(db.get_tuner_session(engine._session_id).hunt_state)
-        assert restored is not None
-        assert restored.armed is False
-        assert restored.stage is bisect.Stage.PROBE
-        assert restored.pending == [[5], [6, 7]]
-        assert restored.in_flight == []
-        assert restored.found == []
-        assert restored.exonerated == []
-        assert db.get_tuner_core_states(engine._session_id)[5].in_test is False
 
 
 class TestHuntExecution:

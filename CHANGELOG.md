@@ -15,6 +15,19 @@ packaged as a NixOS module with an overlay. Forked from
 - Added the `just` dev-shell dependency and a repository `justfile` for recurring
 test, quality, Nix, hardware-contract, mutation, live-scenario, and history-db workflows.
 
+### Fixed (2026-09-23 evening run on the 9950X3D2)
+
+- The attribution hunt convicts a core that reproduces the failure alone. The
+  leave-one-out confirmation and `probe_final_multiplier` are gone: core 3 reproduced
+  with every other core at stock, then the hunt queued 131 launches (4.5 h) of the other
+  three without it, and a reproduction there would have cleared core 3. History schema
+  v23 turns a persisted suspect into a culprit.
+- An onset probe cut short by a pause, a shutdown, a thermal stop, or an apparatus fault
+  resumes from its last clean launch, and an unanswered probe is replayed rather than
+  skipped. One power-off threw away 44 clean launches.
+- Hunt slots log and record the offset the core held under the probe mask. The run
+  logged "Core 3 offset -41: PASS" 44 times while core 3 sat at stock.
+
 ### Fixed (2026-09-23 overnight run on the 9950X3D2)
 
 - A crash on a search, confirmation, backoff, or annealing step, with every other live

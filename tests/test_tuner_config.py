@@ -67,7 +67,6 @@ class TestTunerConfigDefaults:
             probe_base_seconds=900,
             probe_mttf_multiplier=3.0,
             probe_level_multiplier=2.0,
-            probe_final_multiplier=5.0,
             suspicion_separation=3.0,
             suspicion_min_failures=4,
             anneal_bank_hours=8.0,
@@ -117,7 +116,6 @@ class TestNewConfigOptions:
         assert cfg.probe_base_seconds == 1800
         assert cfg.probe_mttf_multiplier == 4.0
         assert cfg.probe_level_multiplier == 1.5
-        assert cfg.probe_final_multiplier == 4.0
         assert cfg.suspicion_separation == 2.0
         assert cfg.suspicion_min_failures == 3
         assert cfg.anneal_bank_hours == 6.0
@@ -137,7 +135,6 @@ class TestNewConfigOptions:
             probe_base_seconds=900,
             probe_mttf_multiplier=3.0,
             probe_level_multiplier=2.0,
-            probe_final_multiplier=5.0,
             suspicion_separation=3.0,
             suspicion_min_failures=4,
             anneal_bank_hours=8.0,
@@ -277,7 +274,6 @@ class TestConfigValidationFailsClosed:
             {"probe_base_seconds": 59},
             {"probe_mttf_multiplier": 0},
             {"probe_level_multiplier": 0.5},
-            {"probe_final_multiplier": 0.5},
             {"onset_failure_seconds": -1},
             {"onset_launch_seconds": 9},
             {"co_settle_seconds": 61},

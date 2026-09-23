@@ -2676,7 +2676,7 @@ class TunerEngine(QObject):
         if self._abort_requested or self._paused or self._hunt is None:
             if self._paused and self._hunt_launches_left:
                 # A series cut short has not answered its question; the resume
-                # re-runs the whole probe instead of skipping past it.
+                # finishes the same probe from its last clean launch.
                 self._requeue_hunt_probe()
             return
         if self._hunt_launches_left:
@@ -2700,7 +2700,6 @@ class TunerEngine(QObject):
                 base=probe_base,
                 mttf_multiplier=self._config.probe_mttf_multiplier,
                 level_multiplier=self._config.probe_level_multiplier,
-                final_multiplier=self._config.probe_final_multiplier,
             )
             duration, launches = bisect.onset_launches(
                 self._hunt,
@@ -2709,8 +2708,9 @@ class TunerEngine(QObject):
                 min_launch=self._config.onset_launch_seconds,
                 mttf_multiplier=self._config.probe_mttf_multiplier,
             )
+            done = min(self._hunt.launches_done, launches - 1)
             self._hunt_launch_seconds = duration
-            self._hunt_launches_left = launches - 1
+            self._hunt_launches_left = launches - 1 - done
         self._hunt.armed = False
         self._save_hunt()
         if not self._apply_hunt_mask(live):
@@ -2733,6 +2733,8 @@ class TunerEngine(QObject):
                     f"{launches} launches of {duration}s: the failure came "
                     f"{self._hunt.observed_failure_time:.0f}s after load started, so load starts reproduce it"
                 )
+                if done:
+                    span += f"; {done} already ran clean"
             if self._hunt.stage is bisect.Stage.CONTROL:
                 self.log_message.emit(
                     f"Hunt control probe: every core at stock for {span}. "
@@ -2791,28 +2793,23 @@ class TunerEngine(QObject):
         if foreign:
             reproduced = True
         if not reproduced and self._hunt_launches_left:
+            self._hunt.launches_done += 1
+            self._save_hunt()
             QTimer.singleShot(0, self._run_next_hunt_slot)
             return
         self._record_hunt_probe(reproduced=reproduced)
         QTimer.singleShot(0, self._run_next_hunt_slot)
 
     def _requeue_hunt_probe(self) -> None:
-        """Put the in-flight probe back at the head of the queue.
+        """Leave the in-flight probe to be run again, unanswered.
 
-        A thermal stop or an apparatus fault is not an answer to the question
-        the probe asked, so it must not be folded in as one.
+        A pause, a thermal stop or an apparatus fault is not an answer to the
+        question the probe asked, so it must not be folded in as one. The mask
+        stays in flight and its clean launches stay counted.
         """
         self._hunt_launches_left = 0
         if self._hunt is not None:
             self._hunt.armed = False
-            if self._hunt.stage is bisect.Stage.CONFIRM and self._hunt.suspect is not None:
-                suspect = [self._hunt.suspect]
-                self._hunt.suspect = None
-                self._hunt.stage = bisect.Stage.PROBE
-                self._hunt.pending.insert(0, suspect)
-            elif self._hunt.stage is not bisect.Stage.CONTROL and self._hunt.in_flight:
-                self._hunt.queue.insert(0, list(self._hunt.in_flight))
-            self._hunt.in_flight = []
             self._save_hunt()
         self._clear_all_in_test()
 
@@ -2883,7 +2880,6 @@ class TunerEngine(QObject):
         # Nothing reproduced. Credit suspicion and let the statistical route
         # decide, but only on a clear winner: acting on a near-tie is a guess
         # dressed up as a verdict.
-        self._exonerate(state.exonerated)
         self._credit_suspicion(state.vector)
         if self._session_id is not None:
             self._db.set_unattributed_crashes(self._session_id, self._db.get_unattributed_crashes(self._session_id) + 1)
@@ -3688,13 +3684,17 @@ class TunerEngine(QObject):
 
         # Log to DB (soak is a session-level watch, not one core's test — its
         # record is the narrative plus any mce_evidence rows)
+        # A hunt probe decides each core's offset by its mask, not by the core's search position.
+        tested_offset = cs.current_offset
+        if self._hunting and self._co_applied.get(core_id) is not None:
+            tested_offset = self._co_applied[core_id]
         active_regime = self._active_regime(cs)
         if self._session_id and not self._soaking:
             backend, stress_mode, fft_preset, requested_threads = self._get_active_stress_config(cs)
             self._db.insert_tuner_test_log(
                 self._session_id,
                 core_id,
-                cs.current_offset,
+                tested_offset,
                 log_phase,
                 passed,
                 error_msg=error_msg or None,
@@ -3732,10 +3732,10 @@ class TunerEngine(QObject):
         status_str = "PASS" if passed else "FAIL"
         stretch_info = f" below-nominal:{peak_stretch_pct:.1f}%" if peak_stretch_pct > 0 else ""
         self.log_message.emit(
-            f"Core {core_id} offset {cs.current_offset}: {status_str}{stretch_info}"
+            f"Core {core_id} offset {tested_offset}: {status_str}{stretch_info}"
             + (f" ({error_msg})" if error_msg else "")
         )
-        self.test_completed.emit(core_id, cs.current_offset, passed)
+        self.test_completed.emit(core_id, tested_offset, passed)
 
         # Revert tested core to baseline — no aggressive offset should linger.
         # Skip during validation (all confirmed offsets stay applied) and during
