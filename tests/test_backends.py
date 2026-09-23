@@ -795,23 +795,27 @@ class TestYCruncherBackend:
         assert not passed
         assert msg is not None and "Checksum mismatch" in msg
 
-    def test_parse_error_encountered(self):
-        backend = YCruncherBackend()
-        passed, msg = backend.parse_output("Iteration: 5\nError(s) encountered on logical core 3.\n", "", 0)
+    @pytest.mark.parametrize(
+        "stdout",
+        [
+            "Iteration: 5\nError(s) encountered on logical core 3.\n",
+            "Coefficient is too large\n",
+            "Checksum mismatch\n",
+        ],
+    )
+    def test_parse_wrong_answer_is_a_computation_failure(self, stdout):
+        """A wrong result is the silicon's verdict, never an apparatus fault
+        to retry without one (11 were discarded in one night on core 1)."""
+        passed, msg = YCruncherBackend().parse_output(stdout, "", -15)
         assert not passed
-        assert "y-cruncher error" in msg
+        assert classify_error(msg) == "computation"
 
-    def test_parse_coefficient_too_large(self):
-        backend = YCruncherBackend()
-        passed, msg = backend.parse_output("Coefficient is too large\n", "", 0)
-        assert not passed
-        assert "Coefficient is too large" in msg
-
-    def test_parse_invalid_parameter(self):
-        backend = YCruncherBackend()
-        passed, msg = backend.parse_output(_CAPTURED_INVALID_PARAM_OUTPUT, "", 0)
+    def test_parse_invalid_parameter_is_not_a_computation_failure(self):
+        """y-cruncher rejecting its own config says nothing about the core."""
+        passed, msg = YCruncherBackend().parse_output(_CAPTURED_INVALID_PARAM_OUTPUT, "", 0)
         assert not passed
         assert "Invalid Parameter" in msg
+        assert classify_error(msg) != "computation"
 
     def test_parse_ansi_codes_stripped(self):
         backend = YCruncherBackend()

@@ -42,11 +42,14 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 _UNPINNED_RE = re.compile(r"Failed to set core affinity to core: *\d+", re.IGNORECASE)
 
-_ERROR_PATTERNS: tuple[str, ...] = (
+_COMPUTATION_PATTERNS: tuple[str, ...] = (
     r"Error\(s\) encountered",
     r"Coefficient is too large",
-    r"Invalid Parameter",
     r"Checksum mismatch",
+)
+
+_ERROR_PATTERNS: tuple[str, ...] = (
+    r"Invalid Parameter",
     r"\bFAIL(?:ED)?\b",
     r"(?<!Stop on )\bError\b(?!\s+Checking)",
 )
@@ -119,6 +122,11 @@ class YCruncherBackend(StressBackend):
         unpinned = _UNPINNED_RE.search(combined)
         if unpinned:
             return False, f"harness error: y-cruncher could not keep a thread on its lane ({unpinned.group(0)})"
+
+        for pattern in _COMPUTATION_PATTERNS:
+            match = re.search(pattern, combined, re.IGNORECASE)
+            if match:
+                return False, f"y-cruncher computation error: {match.group(0)}"
 
         for pattern in _ERROR_PATTERNS:
             match = re.search(pattern, combined, re.IGNORECASE)
