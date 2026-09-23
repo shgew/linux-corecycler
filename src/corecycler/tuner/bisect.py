@@ -488,6 +488,8 @@ def record(state: HuntState, *, reproduced: bool, control_confirmations: int, ma
 
     probe = list(state.in_flight)
     state.in_flight = []
+    if probe == state.parent:
+        return _record_whole_set(state, reproduced=reproduced)
     if reproduced:
         state.guilty_halves.append(probe)
         state.no_reproduce = 0
@@ -495,6 +497,7 @@ def record(state: HuntState, *, reproduced: bool, control_confirmations: int, ma
         return state
 
     parent = list(state.parent)
+    level = state.level
     state.parent = []
     state.level = 0
     if state.guilty_halves:
@@ -504,11 +507,30 @@ def record(state: HuntState, *, reproduced: bool, control_confirmations: int, ma
 
     state.no_reproduce += 1
     if state.no_reproduce >= max_no_reproduce:
-        state.pending = []
-        state.deferred = []
-        state.stage = Stage.CULPRIT if state.found else Stage.EXHAUSTED
+        # Both halves stayed clean through every retry. Before calling that a
+        # non-reproduction, ask the whole set once more: a set that fails while
+        # neither half fails alone needs cores from both halves at once.
+        state.parent = parent
+        state.level = level
+        state.queue = [parent]
     else:
         state.pending.insert(0, parent)
+    return state
+
+
+def _record_whole_set(state: HuntState, *, reproduced: bool) -> HuntState:
+    whole = list(state.parent)
+    state.parent = []
+    state.level = 0
+    if reproduced:
+        state.found = sorted(state.found + whole)
+        state.no_reproduce = 0
+        if not (state.pending or state.deferred):
+            state.stage = Stage.CULPRIT
+        return state
+    state.pending = []
+    state.deferred = []
+    state.stage = Stage.CULPRIT if state.found else Stage.EXHAUSTED
     return state
 
 

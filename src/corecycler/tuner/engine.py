@@ -2743,11 +2743,22 @@ class TunerEngine(QObject):
                 self._db.upsert_tuner_core_state(self._session_id, cs)
 
     def _record_hunt_probe(self, *, reproduced: bool) -> None:
+        whole_set = (
+            self._hunt is not None
+            and self._hunt.stage is bisect.Stage.PROBE
+            and bool(self._hunt.parent)
+            and self._hunt.in_flight == self._hunt.parent
+        )
         if reproduced and self._hunt is not None and self._hunt.stage is bisect.Stage.PROBE:
             # The failure happened without these cores' offsets live, which is
             # the one piece of direct exculpatory evidence a hunt produces.
             live = set(self._hunt.in_flight)
             self._exonerate(c for c in self._hunt.parent if c not in live)
+        if whole_set and reproduced:
+            self.log_message.emit(
+                f"Hunt: {self._hunt.parent} fail together, yet every half of that set ran clean. "
+                "No single core carries it, so each of them backs off one step."
+            )
         bisect.record(
             self._hunt,
             reproduced=reproduced,

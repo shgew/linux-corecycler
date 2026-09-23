@@ -437,6 +437,29 @@ class TestCrashHunt:
         assert eng._hunt is not None
         assert eng._hunt.to_json() == completed.to_json()
 
+    def test_a_pair_that_fails_only_together_is_backed_off_as_a_pair(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=2)
+        _seed_confirmed_validating(eng, db, BEST, BASELINES)
+        monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
+        eng._start_worker = lambda *a, **k: None
+        eng._start_multi_core_worker = lambda *a, **k: None
+        messages: list[str] = []
+        eng.log_message.connect(messages.append)
+
+        eng._start_hunt(loaded=[5])
+        while eng._hunt is not None:
+            both_live = {4, 5} <= set(eng._hunt.in_flight)
+            eng._on_test_finished(5, not both_live, "mprime error: FATAL ERROR" if both_live else "", "", 60.0, 0.0)
+            if eng._hunt is not None:
+                eng._run_next_hunt_slot()
+
+        moved = {c for c, cs in eng._core_states.items() if cs.current_offset != BEST[c]}
+        assert moved == {4, 5}
+        assert all(eng._core_states[c].current_offset > BEST[c] for c in moved)
+        assert any("[4, 5]" in m and "together" in m for m in messages)
+
 
 class TestForeignMceEvidence:
     def test_parse_groups_by_core_and_severity(self, db, topo_dual_ccd_x3d, mock_backend):

@@ -17,12 +17,16 @@ def run_hunt(
     candidates: list[int],
     culprits: set[int],
     *,
+    together: set[int] | None = None,
     stock_dies: bool = False,
     control_confirmations: int = 2,
     max_no_reproduce: int = 3,
     cap: int = 200,
 ) -> tuple[HuntState, int]:
-    """Drive a hunt against an oracle where any live culprit reproduces."""
+    """Drive a hunt against an oracle where any live culprit reproduces.
+
+    ``together`` is a set that fails only when every member is live at once.
+    """
     state = bisect.begin(candidates, [candidates[0]])
     probes = 0
     while probes < cap:
@@ -30,7 +34,12 @@ def run_hunt(
         if live is None:
             break
         probes += 1
-        reproduced = stock_dies if state.stage is Stage.CONTROL else bool(culprits & set(live))
+        live_set = set(live)
+        reproduced = (
+            stock_dies
+            if state.stage is Stage.CONTROL
+            else bool(culprits & live_set) or (together is not None and together <= live_set)
+        )
         bisect.record(
             state,
             reproduced=reproduced,
@@ -118,6 +127,8 @@ class TestIsolation:
         bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
         assert bisect.next_live_set(state) == [2]
         bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
+        assert bisect.next_live_set(state) == [1, 2]
+        bisect.record(state, reproduced=False, control_confirmations=1, max_no_reproduce=1)
 
         assert state.stage is Stage.CULPRIT
         assert state.found == [0]
@@ -171,6 +182,50 @@ class TestNonReproduction:
         bisect.next_live_set(state)
         bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=5)
         assert state.pending == [[0, 1, 2, 3]]
+
+
+class TestConjunction:
+    def test_a_pair_that_fails_only_together_is_found(self):
+        """Session 12: [2, 3] froze 5/5, [2] and [3] alone never did."""
+        state, _ = run_hunt([0, 1, 2, 3], set(), together={2, 3}, max_no_reproduce=2)
+        assert state.stage is Stage.CULPRIT
+        assert state.found == [2, 3]
+
+    def test_a_conjunction_spanning_the_root_halves_names_the_whole_set(self):
+        state, _ = run_hunt([0, 1, 2, 3], set(), together={1, 2}, max_no_reproduce=2)
+        assert state.stage is Stage.CULPRIT
+        assert state.found == [0, 1, 2, 3]
+
+    def test_the_whole_set_is_rechecked_only_once_halves_are_out_of_retries(self):
+        state = bisect.begin([0, 1], [0])
+        bisect.next_live_set(state)
+        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=2)
+        seen = []
+        while (live := bisect.next_live_set(state)) is not None:
+            seen.append(live)
+            bisect.record(state, reproduced=live == [0, 1], control_confirmations=2, max_no_reproduce=2)
+        assert seen == [[0], [1], [0], [1], [0, 1]]
+        assert state.found == [0, 1]
+
+    def test_a_whole_set_that_no_longer_reproduces_exhausts(self):
+        state = bisect.begin([0, 1], [0])
+        bisect.next_live_set(state)
+        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=1)
+        assert bisect.next_live_set(state) == [0]
+        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=1)
+        assert bisect.next_live_set(state) == [1]
+        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=1)
+        assert bisect.next_live_set(state) == [0, 1]
+        restored = HuntState.from_json(state.to_json())
+        assert restored is not None and restored.in_flight == [0, 1]
+        bisect.record(state, reproduced=False, control_confirmations=2, max_no_reproduce=1)
+        assert state.stage is Stage.EXHAUSTED
+        assert state.found == []
+
+    def test_a_conjunction_does_not_end_a_hunt_with_other_guilty_sets_pending(self):
+        state, _ = run_hunt(list(range(8)), {7}, together={0, 1}, max_no_reproduce=2, cap=400)
+        assert state.stage is Stage.CULPRIT
+        assert state.found == [0, 1, 7]
 
 
 class TestBudget:
