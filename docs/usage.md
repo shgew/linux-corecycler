@@ -186,8 +186,12 @@ unmapped/unselected core also pause without blaming another core.
 An unattributed crash never pauses and never guesses. Search runs the **live offset
 mask** -- every core other than the one under test sits at its own best-known offset,
 the only condition the machine actually operates in -- so being the sole core under
-load proves nothing about who crashed. A crash that no kernel machine check and no
-un-survived CO journal write names starts the attribution hunt:
+load proves nothing about who crashed on its own. What does prove it is the journal:
+when the loaded core was on a search, confirmation, backoff, or annealing step and
+every other live offset had already survived, that step is the only change from a
+vector that survived, and the crash fails it directly. A crash that no kernel machine
+check, no un-survived CO journal write, and no such lone trial names starts the
+attribution hunt:
 
 1. **Stock control run** -- every core at CO=0 under the same workload. It has to
    reproduce `control_run_confirmations` times to call a platform fault, which stops

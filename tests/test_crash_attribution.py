@@ -247,24 +247,54 @@ class TestForensicAttribution:
         assert after == {0: (BEST[0], BEST[0], 0), 1: (BEST[1], BEST[1], 0)}
         assert eng._smu.written == {}
 
-    def test_loaded_core_is_not_blamed_when_other_live_offsets_were_resident(self, db, topo_dual_ccd_x3d, mock_backend):
-        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[2, 3])
+    @staticmethod
+    def _seed_stepped_crash(eng, db, loaded_phase: TunerPhase, other_resident: int) -> None:
         eng._core_states = {
-            2: CoreState(core_id=2, phase=TunerPhase.COARSE_SEARCH, current_offset=-20, in_test=True),
-            3: CoreState(
-                core_id=3,
-                phase=TunerPhase.CONFIRMED,
-                current_offset=-15,
-                best_offset=-15,
-            ),
+            2: CoreState(core_id=2, phase=loaded_phase, current_offset=-20, best_offset=-20, in_test=True),
+            3: CoreState(core_id=3, phase=TunerPhase.CONFIRMED, current_offset=-15, best_offset=-15),
         }
         for cs in eng._core_states.values():
             db.upsert_tuner_core_state(eng._session_id, cs)
-            db.journal_co_intent(eng._session_id, cs.core_id, cs.current_offset, survived=True)
-        session = db.get_tuner_session(eng._session_id)
+        db.journal_co_intent(eng._session_id, 3, -15, survived=True)
+        if other_resident != -15:
+            db.journal_co_intent(eng._session_id, 3, other_resident, survived=False)
+        db.journal_co_intent(eng._session_id, 2, -20, survived=False)
         eng._forensics = lambda since, timeout=15.0, **kwargs: ([], True)
 
-        crashed, pending_hunt = eng._attribute_crash_after_reboot(session)
+    def test_stepped_trial_takes_the_crash_when_every_other_live_offset_is_proven(
+        self, db, topo_dual_ccd_x3d, mock_backend
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[2, 3])
+        self._seed_stepped_crash(eng, db, TunerPhase.COARSE_SEARCH, other_resident=-15)
+
+        crashed, pending_hunt = eng._attribute_crash_after_reboot(db.get_tuner_session(eng._session_id))
+
+        assert crashed == [2]
+        assert pending_hunt is False
+        assert eng._core_states[2].crash_count == 1
+        assert eng._core_states[2].backoff_fail_bound == -20
+        assert (eng._core_states[3].current_offset, eng._core_states[3].crash_count) == (-15, 0)
+
+    def test_stepped_trial_is_not_blamed_while_another_core_holds_an_unproven_value(
+        self, db, topo_dual_ccd_x3d, mock_backend
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[2, 3])
+        self._seed_stepped_crash(eng, db, TunerPhase.COARSE_SEARCH, other_resident=-18)
+
+        crashed, pending_hunt = eng._attribute_crash_after_reboot(db.get_tuner_session(eng._session_id))
+
+        assert crashed == []
+        assert pending_hunt is True
+        assert eng._pending_hunt_loaded == [2]
+        assert all(cs.crash_count == 0 for cs in eng._core_states.values())
+
+    def test_confirmed_loaded_core_is_not_blamed_when_other_live_offsets_were_resident(
+        self, db, topo_dual_ccd_x3d, mock_backend
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[2, 3])
+        self._seed_stepped_crash(eng, db, TunerPhase.CONFIRMED, other_resident=-15)
+
+        crashed, pending_hunt = eng._attribute_crash_after_reboot(db.get_tuner_session(eng._session_id))
 
         assert crashed == []
         assert pending_hunt is True

@@ -12,6 +12,10 @@ packaged as a NixOS module with an overlay. Forked from
 
 ### Fixed (2026-09-23 overnight run on the 9950X3D2)
 
+- A crash on a search, confirmation, backoff, or annealing step, with every other live
+  offset already survived, fails that step directly instead of opening a hunt. The trial
+  is the only change from a vector that survived. The night's 16 such hunts took 8.5 of
+  12 test hours, and none named a core other than the one on the step.
 - y-cruncher wrong answers (`Error(s) encountered`, `Coefficient is too large`, `Checksum
   mismatch`) are `computation` failures. They were apparatus faults, so one night retried
   away 11 real failures on core 1, and four in a row aborted the engine.

@@ -143,8 +143,14 @@ penalty. Attribution uses this strict priority:
    that core at its journaled resident offset. Evidence naming an unknown or
    stock core is an instrument/evidence inconsistency, never permission to
    blame a different core.
-3. **The only core away from stock** is attributable when exactly one
-   journaled resident offset is non-zero.
+3. **The only unproven offset resident** is attributable. That is the only
+   core away from stock when exactly one journaled resident offset is
+   non-zero. It is also the one in-test core on a stepped-phase slot when its
+   journaled resident equals its `current_offset` and every other non-zero
+   resident is journaled survived: the trial is the only difference from a
+   vector that already survived, so the crash is that step's FAIL and no hunt
+   runs. A loaded core outside a stepped phase, several in-test cores, or any
+   other un-survived resident still goes to the hunt.
 4. **Otherwise start or resume the attribution hunt.** An aggregate validation
    failure with no per-core verdict starts a hunt using the exact failed
    workload; it never guesses the most-aggressive core. `CONTROL` applies

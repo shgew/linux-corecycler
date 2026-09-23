@@ -924,7 +924,9 @@ class TunerEngine(QObject):
         #      owns its own reproduction verdict.
         #   2. Kernel-journal MCE lines name the faulting core directly.
         #   3. One in_test core that was also the sole non-stock resident is
-        #      deterministically attributable.
+        #      deterministically attributable, and so is one in_test core whose
+        #      stepped trial was the only unproven resident: every other live
+        #      offset had already survived, so the trial is the only change.
         #   4. One un-survived journal resident with no in_test marker catches
         #      crashes during writes, restores, and idle operation.
         #   5. Multi-core or otherwise ambiguous evidence blames nobody and
@@ -2129,9 +2131,10 @@ class TunerEngine(QObject):
 
         Returns (penalized_core_ids, pending_hunt). An armed persisted probe is
         the controlled crash experiment and owns its reproduction verdict.
-        Otherwise kernel-journal MCE lines name cores directly, and one in-test
-        core is attributable only when it was also the sole non-stock resident.
-        Multi-core sets and validation crashes are never guessed at: they return
+        Otherwise kernel-journal MCE lines name cores directly. One in-test core
+        is attributable when it was the sole non-stock resident, or when its
+        stepped trial was the only unproven offset resident. Anything else,
+        including validation crashes, is never guessed at: it returns
         pending_hunt=True so the caller runs the live-vector attribution hunt.
         """
         session_id = self._session_id
@@ -2188,6 +2191,13 @@ class TunerEngine(QObject):
                 resident_core = self._core_states[live_cores[0]]
                 resident_core.current_offset = residents[live_cores[0]]
                 crashed = self._penalize_cores([resident_core], "the sole journaled non-stock resident")
+            elif saved_hunt is None and (trial := self._sole_unproven_trial(in_test, residents)) is not None:
+                self.log_message.emit(
+                    f"Crash while core {trial.core_id} was on a {trial.phase.value} step at "
+                    f"{trial.current_offset} and every other live offset was already proven. "
+                    "That step is the only change from a vector that survived, so it takes the crash."
+                )
+                crashed = self._penalize_cores([trial], "the only unproven offset resident")
             self._clear_all_in_test()
             # A CO write journaled as intent that never recorded surviving is
             # how a crash with no in_test flag at all gets caught. It is proof
@@ -2224,6 +2234,24 @@ class TunerEngine(QObject):
         if crashed and session_id is not None:
             self._db.set_hunt_state(session_id, "")
         return crashed, pending_hunt
+
+    def _sole_unproven_trial(self, in_test: list[CoreState], residents: dict[int, int]) -> CoreState | None:
+        """The loaded core, when its stepped trial was the only unproven offset resident.
+
+        Every other non-stock resident sits inside its core's survived envelope,
+        so the trial is the one difference between a vector that survived and
+        the one that died. Anything looser still needs the hunt.
+        """
+        if len(in_test) != 1:
+            return None
+        cs = in_test[0]
+        resident = residents.get(cs.core_id, 0)
+        if cs.phase not in _STEPPED_PHASES or resident == 0 or resident != cs.current_offset:
+            return None
+        survived = tp.journal_survived_values(self._db, self._session_id)
+        if any(survived.get(core) != value for core, value in residents.items() if core != cs.core_id and value != 0):
+            return None
+        return cs
 
     def _reengage_quarantined(self, session_id: int) -> None:
         """Re-open a quarantined session on proven ground only.
