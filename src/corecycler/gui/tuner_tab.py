@@ -39,7 +39,7 @@ from PySide6.QtWidgets import (
 )
 
 from corecycler.engine.backends.base import FFTPreset, StressMode
-from corecycler.gui.style import PHASE_TO_GRID, button_qss, phase_label, status_label, theme
+from corecycler.gui.style import PHASE_TO_GRID, button_qss, duration_str, phase_label, status_label, theme
 from corecycler.gui.tool_prompt import ensure_tool
 from corecycler.history.db import RESUMABLE_STATUSES
 from corecycler.history.timefmt import format_local
@@ -275,6 +275,7 @@ class TunerTab(QWidget):
         strikes_header = self._core_table.horizontalHeaderItem(self._core_table.columnCount() - 1)
         strikes_header.setToolTip("Failed anneal probes one step deeper; each doubles the clean time the next needs")
         self._core_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._core_table.verticalHeader().setVisible(False)
         self._core_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._core_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self._core_table.setSelectionMode(QTableWidget.SelectionMode.ExtendedSelection)
@@ -1086,13 +1087,12 @@ class TunerTab(QWidget):
             str(projection["candidate_offset"]),
             str(accepted) if accepted is not None else "-",
             str(bios) if bios is not None else "-",
-            f"{projection['confidence_hours']:.1f}h",
-            *(f"{hours.get(regime, 0.0):.1f}h" for regime in _REGIMES),
+            duration_str(round(projection["confidence_hours"] * 3600.0)),
+            *(duration_str(round(hours.get(regime, 0.0) * 3600.0)) for regime in _REGIMES),
             f"{projection['suspicion']:.1f}" if projection["suspicion"] else "-",
             str(projection["crashes"]),
             str(projection["anneal_strikes"]),
         ]
-        self._core_table.setVerticalHeaderItem(row, QTableWidgetItem(phase_label(cs.phase)))
 
         color = QColor(theme.PHASE_COLORS[cs.phase])
         for column, text in enumerate(items):

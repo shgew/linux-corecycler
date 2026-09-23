@@ -80,6 +80,7 @@ class TestCoreRow:
         for regime in ("boost", "current", "transient"):
             db.bank_regime_time(selected_context, 0, regime, -30, 7200.0)
             db.bank_regime_time(other_context, 0, regime, -30, 18000.0)
+        db.bank_regime_time(selected_context, 0, "current", -30, 285.0)
         tab = _tab(db)
         tab._engine = _engine(sid, {0: state})
 
@@ -90,9 +91,30 @@ class TestCoreRow:
         headers = [tab._core_table.horizontalHeaderItem(c).text() for c in range(tab._core_table.columnCount())]
         assert tab._core_table.item(0, headers.index("Candidate")).text() == "-31"
         assert tab._core_table.item(0, headers.index("Accepted")).text() == "-30"
-        assert tab._core_table.item(0, headers.index("Confidence")).text() == "0.0h"
-        assert tab._core_table.item(0, headers.index("Boost")).text() == "2.0h"
-        assert tab._core_table.item(0, headers.index("Coupled")).text() == "0.0h"
+        assert tab._core_table.item(0, headers.index("Confidence")).text() == "-"
+        assert tab._core_table.item(0, headers.index("Boost")).text() == "2h 00m"
+        assert tab._core_table.item(0, headers.index("Current")).text() == "2h 04m"
+        assert tab._core_table.item(0, headers.index("Coupled")).text() == "-"
+
+    def test_sub_hour_banks_stay_distinguishable(self, db):
+        context = db.get_or_create_context(TuningContextRecord(bios_version="2402", context_hash="selected"))
+        sid = _sid(db, context)
+        state = CoreState(core_id=0, phase=TunerPhase.CONFIRMED, current_offset=-50, best_offset=-50)
+        db.upsert_tuner_core_state(sid, state)
+        for regime, seconds in (("boost", 285.0), ("current", 454.0), ("transient", 307.0), ("coupled", 219.0)):
+            db.bank_regime_time(context, 0, regime, -50, seconds)
+        tab = _tab(db)
+        tab._engine = _engine(sid, {0: state})
+
+        tab._update_core_row(0)
+
+        headers = [tab._core_table.horizontalHeaderItem(c).text() for c in range(tab._core_table.columnCount())]
+        cells = {name: tab._core_table.item(0, headers.index(name)).text() for name in headers}
+        assert cells["Boost"] == "4m 45s"
+        assert cells["Current"] == "7m 34s"
+        assert cells["Coupled"] == "3m 39s"
+        assert cells["Confidence"] == "3m 39s"
+        assert tab._core_table.verticalHeader().isHidden()
 
     def test_profile_quarantine_suppresses_the_accepted_offset(self, db):
         sid = _sid(db)

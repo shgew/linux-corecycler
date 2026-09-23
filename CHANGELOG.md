@@ -27,6 +27,9 @@ test, quality, Nix, hardware-contract, mutation, live-scenario, and history-db w
   skipped. One power-off threw away 44 clean launches.
 - Hunt slots log and record the offset the core held under the probe mask. The run
   logged "Core 3 offset -41: PASS" 44 times while core 3 sat at stock.
+- The Auto-Tuner core table shows banked regime time and confidence as a duration
+  (`4m 45s`, `2h 04m`) instead of one-decimal hours. Every 219 to 454 s confirm bank
+  rendered as `0.1h`. The row header no longer repeats the Phase column.
 
 ### Fixed (2026-09-23 overnight run on the 9950X3D2)
 
