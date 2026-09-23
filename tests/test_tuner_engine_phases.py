@@ -1651,7 +1651,7 @@ class TestHuntDecisions:
         assert all(cs.best_offset == -20 for cs in restored.values())
         assert all(cs.crash_count == 0 for cs in restored.values())
         assert engine.status == "running"
-        assert engine._db.get_unattributed_crashes(engine._session_id) == engine._config.suspicion_min_failures
+        assert engine._db.get_unattributed_crashes(engine._session_id) == engine._config.suspicion_min_failures + 1
 
     def test_exhausted_clear_winner_is_demoted_and_loses_banked_evidence(self, engine):
         for core_id in engine._core_states:

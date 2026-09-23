@@ -63,6 +63,19 @@ log = logging.getLogger(__name__)
 # machine may sleep again.
 DORMANT_STATUSES = frozenset({"idle", "paused", "completed", "aborted", "platform_fault", "profile_quarantined"})
 
+# Phases whose slot asks "does this core survive this offset?", so a crash the
+# hunt cannot pin on anyone still answers it.
+_STEPPED_PHASES = frozenset(
+    {
+        TunerPhase.COARSE_SEARCH,
+        TunerPhase.FINE_SEARCH,
+        TunerPhase.CONFIRMING,
+        TunerPhase.BACKOFF_PRECONFIRM,
+        TunerPhase.BACKOFF_CONFIRMING,
+        TunerPhase.ANNEALING,
+    }
+)
+
 
 def _duty_cycle_for(entry: dict) -> DutyCycle | None:
     """The duty cycle a battery entry asks for, if it is a transient regime.
@@ -2794,6 +2807,8 @@ class TunerEngine(QObject):
         # dressed up as a verdict.
         self._exonerate(state.exonerated)
         self._credit_suspicion(state.vector)
+        if self._session_id is not None:
+            self._db.set_unattributed_crashes(self._session_id, self._db.get_unattributed_crashes(self._session_id) + 1)
         picked = self._suspicion_verdict()
         if picked is not None:
             self._blame_core(
@@ -2806,7 +2821,32 @@ class TunerEngine(QObject):
                 "Hunt could not reproduce the failure and no core stands out yet. "
                 "Continuing the search; suspicion carries forward."
             )
+            self._fail_unanswered_step(state)
+            if self._paused:
+                self._restore_hunt_stock()
+                return
         self._after_hunt_resume(clear_incident=picked is not None)
+
+    def _fail_unanswered_step(self, state: bisect.HuntState) -> None:
+        """Answer the search step the machine died on, even though nobody took the blame.
+
+        Only the loaded core's offset changed since the vector last survived, so
+        the step is not survivable as tested. Retrying it until a lucky pass is
+        how a flaky offset gets selected by survivorship.
+        """
+        if len(state.loaded) != 1:
+            return
+        core_id = state.loaded[0]
+        cs = self._core_states.get(core_id)
+        if cs is None or cs.phase not in _STEPPED_PHASES or state.vector.get(core_id) != cs.current_offset:
+            return
+        self.log_message.emit(
+            f"Core {core_id} offset {cs.current_offset}: the machine died on this step and no core "
+            "took the blame, so the step counts as failed."
+        )
+        cs.battery_index = 0
+        self._battery_orders.pop(core_id, None)
+        self._advance_core(core_id, False)
 
     def _after_hunt_resume(self, *, clear_incident: bool = False) -> None:
         if not self._restore_hunt_stock():
@@ -4053,6 +4093,10 @@ class TunerEngine(QObject):
                 self._run_validation_next()
             return
 
+        if self._session_id is not None:
+            # Exhausted search hunts feed the suspicion fallback; they are not
+            # incidents against the profile validation is about to prove.
+            self._db.set_unattributed_crashes(self._session_id, 0)
         self._validation_core_index = 0
         self._validation_half_index = 0
         self._validation_stage = 1

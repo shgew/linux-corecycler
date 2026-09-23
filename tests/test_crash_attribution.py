@@ -460,6 +460,65 @@ class TestCrashHunt:
         assert all(eng._core_states[c].current_offset > BEST[c] for c in moved)
         assert any("[4, 5]" in m and "together" in m for m in messages)
 
+    @staticmethod
+    def _exhaust_hunt(eng, loaded: list[int]) -> None:
+        eng._start_hunt(loaded=loaded)
+        while eng._hunt is not None:
+            eng._on_test_finished(loaded[0], True, "", "", 60.0, 0.0)
+            if eng._hunt is not None:
+                eng._run_next_hunt_slot()
+
+    def test_an_unexplained_crash_fails_the_step_that_was_running(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        """Session 12: core 3 advanced from -40 to -41 after 3 freezes and 1 pass,
+        because an exhausted hunt left the step unanswered."""
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1, suspicion_min_failures=99)
+        _seed_confirmed_validating(eng, db, BEST, BASELINES)
+        searching = eng._core_states[3]
+        searching.phase = TunerPhase.COARSE_SEARCH
+        searching.best_offset = -38
+        db.upsert_tuner_core_state(eng._session_id, searching)
+        db.update_tuner_session_status(eng._session_id, "running")
+        monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
+        eng._start_worker = lambda *a, **k: None
+        eng._start_multi_core_worker = lambda *a, **k: None
+
+        self._exhaust_hunt(eng, [3])
+
+        assert searching.current_offset > BEST[3]
+        assert searching.phase is not TunerPhase.COARSE_SEARCH
+        assert all(cs.current_offset == BEST[c] for c, cs in eng._core_states.items() if c != 3)
+
+    def test_exhausted_hunts_feed_the_suspicion_fallback(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1, suspicion_min_failures=1)
+        _seed_confirmed_validating(eng, db, BEST, BASELINES)
+        eng._core_states[7].suspicion = 1000.0
+        monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
+        eng._start_worker = lambda *a, **k: None
+        eng._start_multi_core_worker = lambda *a, **k: None
+
+        self._exhaust_hunt(eng, [5])
+
+        assert eng._core_states[7].current_offset > BEST[7]
+        assert all(cs.current_offset == BEST[c] for c, cs in eng._core_states.items() if c != 7)
+
+    def test_search_incidents_do_not_pre_trip_the_validation_breaker(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1, suspicion_min_failures=99)
+        _seed_confirmed_validating(eng, db, BEST, BASELINES)
+        monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
+        eng._start_worker = lambda *a, **k: None
+        eng._start_multi_core_worker = lambda *a, **k: None
+        self._exhaust_hunt(eng, [5])
+        assert db.get_unattributed_crashes(eng._session_id) == 1
+        eng._run_validation_next = lambda: None
+
+        eng._enter_auto_validation(dict(BEST))
+
+        assert db.get_unattributed_crashes(eng._session_id) == 0
+
 
 class TestForeignMceEvidence:
     def test_parse_groups_by_core_and_severity(self, db, topo_dual_ccd_x3d, mock_backend):
