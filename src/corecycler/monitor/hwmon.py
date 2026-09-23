@@ -44,6 +44,10 @@ _SUPERIO_CHIPS = (
     "it8772",
 )
 
+# The in-kernel nct6775 driver exposes no voltage labels, but on every chip it
+# drives in0 is the dedicated CPUVCORE pin. NCT668x and ITE in0 is general purpose.
+_CPUVCORE_IN0_PREFIX = "nct67"
+
 
 def _normalized_label(label: str) -> str:
     return re.sub(r"[^a-z0-9]", "", label.lower())
@@ -69,6 +73,7 @@ class HWMonReader:
     def __init__(self) -> None:
         self._hwmon_path: Path | None = None
         self._superio_path: Path | None = None
+        self._superio_in0_is_vcore = False
         self._find_device()
 
     @staticmethod
@@ -99,6 +104,7 @@ class HWMonReader:
                 fallback = hwmon_dir
             elif any(name.startswith(chip) for chip in _SUPERIO_CHIPS):
                 self._superio_path = hwmon_dir
+                self._superio_in0_is_vcore = name.startswith(_CPUVCORE_IN0_PREFIX)
         if self._hwmon_path is None:
             self._hwmon_path = fallback
 
@@ -140,16 +146,26 @@ class HWMonReader:
                 data.vcore_v = raw / 1000.0
 
         if data.vcore_v is None and self._superio_path is not None:
-            for label_file in self._glob(self._superio_path, "in*_label"):
-                label = read_text_optional(label_file)
-                if label is None or _normalized_label(label) not in self._VCORE_LABELS:
-                    continue
-                raw = read_int_optional(label_file.with_name(label_file.name.replace("_label", "_input")))
-                if raw is not None:
-                    data.vcore_v = raw / 1000.0
-                break
+            data.vcore_v = self._superio_vcore(self._superio_path)
 
         return data
+
+    def _superio_vcore(self, path: Path) -> float | None:
+        label_files = self._glob(path, "in*_label")
+        input_file = next(
+            (
+                label_file.with_name(label_file.name.replace("_label", "_input"))
+                for label_file in label_files
+                if _normalized_label(read_text_optional(label_file) or "") in self._VCORE_LABELS
+            ),
+            None,
+        )
+        if input_file is None:
+            if label_files or not self._superio_in0_is_vcore:
+                return None
+            input_file = path / "in0_input"
+        raw = read_int_optional(input_file)
+        return raw / 1000.0 if raw is not None else None
 
     def max_cpu_temp(self) -> float | None:
         """Return the hottest readable CPU temperature, including coretemp cores."""

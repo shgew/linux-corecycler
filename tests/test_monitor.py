@@ -292,6 +292,43 @@ class TestHWMonReader:
 
         assert data.vcore_v is None
 
+    def _unlabeled_superio(self, tmp_path, chip_name):
+        hwmon_base = tmp_path / "hwmon"
+        cpu = hwmon_base / "hwmon0"
+        cpu.mkdir(parents=True)
+        (cpu / "name").write_text("zenpower")
+        (cpu / "temp1_input").write_text("60000")
+        (cpu / "temp1_label").write_text("Tctl")
+        sio = hwmon_base / "hwmon1"
+        sio.mkdir(parents=True)
+        (sio / "name").write_text(chip_name)
+        (sio / "in0_input").write_text("1120")
+        (sio / "in1_input").write_text("1816")
+        return hwmon_base
+
+    @pytest.mark.parametrize("chip_name", ["nct6799", "nct6798", "nct6775"])
+    def test_unlabeled_nct6775_driver_chip_reads_cpuvcore_pin(self, tmp_path, chip_name):
+        """The nct6775 driver never exposes voltage labels; in0 is the chip's dedicated CPUVCORE pin."""
+        with patch("corecycler.monitor.hwmon.HWMON_BASE", self._unlabeled_superio(tmp_path, chip_name)):
+            data = HWMonReader().read()
+
+        assert data.vcore_v == 1.12
+
+    @pytest.mark.parametrize("chip_name", ["nct6687", "it8688"])
+    def test_unlabeled_general_purpose_in0_is_not_guessed(self, tmp_path, chip_name):
+        with patch("corecycler.monitor.hwmon.HWMON_BASE", self._unlabeled_superio(tmp_path, chip_name)):
+            data = HWMonReader().read()
+
+        assert data.vcore_v is None
+
+    def test_unlabeled_nct6775_driver_chip_with_unreadable_cpuvcore(self, tmp_path):
+        hwmon_base = self._unlabeled_superio(tmp_path, "nct6799")
+        (hwmon_base / "hwmon1" / "in0_input").write_text("garbage")
+        with patch("corecycler.monitor.hwmon.HWMON_BASE", hwmon_base):
+            data = HWMonReader().read()
+
+        assert data.vcore_v is None
+
     def test_nct66xx_chip_detection(self, tmp_path):
         """NCT6683/6686/6687 chips detected as Super I/O devices."""
         for chip_name in ("nct6683", "nct6686", "nct6687"):
