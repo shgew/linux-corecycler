@@ -10,6 +10,21 @@ A per-core CPU stability tester and AMD PBO Curve Optimizer tuner for Linux,
 packaged as a NixOS module with an overlay. Forked from
 [Daaboulex/linux-corecycler](https://github.com/Daaboulex/linux-corecycler).
 
+### Fixed (2026-09-23 overnight run on the 9950X3D2)
+
+- y-cruncher wrong answers (`Error(s) encountered`, `Coefficient is too large`, `Checksum
+  mismatch`) are `computation` failures. They were apparatus faults, so one night retried
+  away 11 real failures on core 1, and four in a row aborted the engine.
+- A live set that fails while both of its halves run clean backs off as a whole. The hunt
+  used to exhaust and re-hunt the same pair, which froze 5/5 together and ran clean alone.
+- An exhausted hunt fails the search step that was running and counts toward the suspicion
+  fallback. A core had advanced a step through three freezes and one pass.
+- The micro-freeze breadcrumb records when its slot started. Resume reports how far into
+  the slot the machine died and seeds the hunt's time-to-failure from it. A failure within
+  `onset_failure_seconds` of load start is probed with repeated short launches instead of
+  ever-longer windows, and every solo slot idles `co_settle_seconds` between its CO write
+  and its load step.
+
 ### Fixed (2026-09-23 review of the fork's own changes)
 
 - `corecycler report` and the GUI showed every accepted and BIOS offset as empty, because

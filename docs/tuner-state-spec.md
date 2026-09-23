@@ -124,7 +124,9 @@ stock floor.
 - `startup`, `stall`, `killed`, an unknown worker outcome, or another
   apparatus fault: no stability verdict is manufactured. Restore the
   applicable baseline and retry or pause according to the instrument-failure
-  breaker.
+  breaker. A backend's own wrong-answer report (mprime `FATAL ERROR`,
+  y-cruncher `Error(s) encountered`, `Coefficient is too large`, `Checksum
+  mismatch`) is a `computation` FAIL, never an apparatus fault.
 - A worker result containing an unattributed machine check does not advance a
   loaded core merely because it was loaded; it enters crash attribution.
 
@@ -151,6 +153,18 @@ penalty. Attribution uses this strict priority:
    candidate universe with the suspect removed and confirms that suspect only
    when the failure disappears. Confirmed culprits do not terminate a hunt
    while known guilty pending sets remain.
+
+`PROBE` treats a set that reproduces while both of its halves ran clean as
+a conjunction: every member is found and backs off one step. For an onset
+failure, timed from the breadcrumb to within `onset_failure_seconds` of load
+start, each probe is a series of launches. The series answers the probe only
+after every launch passes, or at the first reproduction, and a series cut
+short is requeued whole. An `EXHAUSTED` hunt names nobody, but it counts one
+unattributed failure for the suspicion fallback. The core whose stepped-phase
+slot (`coarse_search`, `fine_search`, `confirming`, `backoff_preconfirm`,
+`backoff_confirming`, `annealing`) was running records a FAIL, so a step
+cannot advance through crashes that retries merely outlast. Entering fresh
+validation resets the unattributed-failure count.
 
 The persisted hunt workload records the concrete worker kind (`solo`,
 `parallel`, `rapid_transition`, or `soak`), duration, backend, stress mode,

@@ -194,7 +194,9 @@ un-survived CO journal write names starts the attribution hunt:
    the tuner from spending a week chasing a board current limit as if it were CO.
 2. **Group bisection over the live mask** -- half the cores keep their offsets, half
    drop to stock. A crash means the culprit is in the live half; log2(n) probes.
-   Both halves failing means two culprits, and both subtrees are pursued.
+   Both halves failing means two culprits, and both subtrees are pursued. A set that
+   fails while both of its halves run clean fails only as a whole, so every member
+   backs off one step.
 3. **Leave-one-out confirmation** -- the named core alone at its offset, at four
    times the base probe budget, because a false clean at the leaf costs the answer.
 4. **Suspicion fallback** -- when nothing reproduces inside budget, every core that
@@ -205,8 +207,21 @@ un-survived CO journal write names starts the attribution hunt:
 
 Probe budgets are `max(probe_base_seconds, probe_mttf_multiplier x observed
 time-to-failure)`, grown per bisection level and again for the final confirmation.
+The observed time comes from the micro-freeze breadcrumb, which records when its slot
+started. A failure within `onset_failure_seconds` of load starting is an onset
+failure: load starts reproduce it and wall time does not, so the probe budget is
+spent as launches of `max(onset_launch_seconds, probe_mttf_multiplier x observed
+time)` each. The probe is answered after its last clean launch or at its first
+failure, and a series cut short by a pause is rerun whole.
+
+Every solo slot idles `co_settle_seconds` between its CO write and its load step,
+watched for machine checks. The breadcrumb names the settle, so a freeze reads as
+following either the write or the load.
+
 A hunt that convicts nobody is recorded as such; it is never read as proof that the
-live profile is stable.
+live profile is stable. It counts as one unattributed failure for the suspicion
+fallback, and the search step that was running when the machine died records a
+fail, so a step never advances on retries alone.
 
 ### State machine
 
@@ -338,11 +353,11 @@ The status is the session's flow, and the CLI exit code follows it.
 | Stage | Question | Outcome |
 |---|---|---|
 | `control` | Does the machine die with every core at CO=0? | `platform` after `control_run_confirmations` reproductions; otherwise bisection starts |
-| `probe` | Which half of the live mask carries the culprit? | Recurses into the failing half, or into both halves when both fail |
+| `probe` | Which half of the live mask carries the culprit? | Recurses into the failing half, or into both halves when both fail. A set that fails while both halves ran clean backs off every member |
 | `confirm` | Does the named core alone reproduce it, at 4x the probe budget? | `culprit` on a reproduction; back to `probe` otherwise |
 | `culprit` | -- | The core is backed off one step and its banked confidence is discarded |
 | `platform` | -- | Tuner stops and reports a platform fault with the MCE, dmesg, thermal and PPT/TDC/EDC evidence. The answer is not in the offsets |
-| `exhausted` | Nothing reproduced inside budget | Falls back to the suspicion model, which acts only on a 2:1 separation after at least three unattributed failures |
+| `exhausted` | Nothing reproduced inside budget | Counts one unattributed failure for the suspicion model, which acts only on a 2:1 separation after at least three; the search step that was running records a fail |
 
 A probe that is interrupted by a thermal stop, an apparatus fault, or a deliberate
 abort is returned to the head of the queue rather than counted as an answer, so a
@@ -387,7 +402,11 @@ the SMU, and only then continues from the persisted cursor.
 | Anneal Bank Hours | 6.0 | > 0 | Clean hours in the weakest regime before a core probes a step deeper |
 | Anneal Max Strikes | 3 | 1-10 | Failed deeper probes before a core stops probing |
 | Control Run Confirmations | 2 | >= 1 | Stock reproductions required to call a platform fault |
-| Probe Base Seconds | 1800 | >= 1 | Floor on an attribution probe's budget |
+| Probe Base Seconds | 1800 | 60-86400 | Floor on an attribution probe's budget |
+| Probe MTTF Multiplier | 4.0 | 0.01-100 | Multiple of the observed time-to-failure a probe (or one onset launch) must outlast |
+| Onset Failure Seconds | 60 | 0-3600 | A failure this soon after load start is probed with repeated launches (0 = off) |
+| Onset Launch Seconds | 30 | 10-3600 | Minimum length of one onset-probe launch |
+| CO Settle Seconds | 5 | 0-60 | Watched idle between a solo slot's CO write and its load step |
 | Suspicion Separation | 2.0 | >= 1 | Score ratio the top suspect needs before the fallback acts |
 | Suspicion Min Failures | 3 | >= 1 | Unattributed failures required before the fallback may act |
 
