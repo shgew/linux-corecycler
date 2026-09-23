@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import os
 import socket
+import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -100,3 +102,22 @@ class TestNoDesktop:
 
         app = QApplication.instance() or QApplication([])
         assert app.platformName() == "offscreen"
+
+
+class TestCleanWorkerExit:
+    def test_a_leaked_queued_qt_call_does_not_crash_the_worker_at_exit(self, tmp_path):
+        pyside = pytest.importorskip("PySide6")
+        if not getattr(pyside, "__path__", None):
+            pytest.skip("Qt stub, not the real PySide6")
+        (tmp_path / "test_leak.py").write_text(
+            "from PySide6.QtCore import QTimer\n\n\ndef test_leak():\n    QTimer.singleShot(0, lambda: None)\n"
+        )
+        pytest_args = ["-p", "tests.conftest", "-p", "no:cacheprovider", "-n0", "-q", str(tmp_path)]
+        result = subprocess.run(
+            [sys.executable, "-m", "pytest", *pytest_args],
+            cwd=Path(__file__).parent.parent,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr

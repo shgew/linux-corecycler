@@ -50,6 +50,15 @@ def pytest_sessionfinish(session, exitstatus):
         shutil.rmtree(_TEST_HOME, ignore_errors=True)
 
 
+# A QTimer.singleShot or queued signal that no event loop ever delivered stays
+# posted on the main thread. Qt destroys it from a C exit handler, after Python
+# has finalized, and releasing its Python callable then segfaults the worker.
+def pytest_unconfigure(config):
+    qtcore = sys.modules.get("PySide6.QtCore")
+    if qtcore is not None and hasattr(qtcore, "QCoreApplication"):
+        qtcore.QCoreApplication.removePostedEvents(None)
+
+
 # Mock PySide6 if not installed — allows running state machine tests without Qt.
 # TunerEngine inherits QObject and uses Signal/Slot, but the state machine logic
 # (_advance_core, _apply_crash_penalty, etc.) is pure Python and testable without Qt.
