@@ -65,6 +65,7 @@ class SchedulerConfig:
     idle_between_cores: float = 0.0
     idle_stability_test: float = 0.0
     duty_cycle: DutyCycle | None = None
+    settle_seconds: float = 0.0
 
 
 class CoreScheduler:
@@ -265,6 +266,27 @@ class CoreScheduler:
         if lane is None:
             status.state = "skipped"
             return
+
+        if self.config.settle_seconds > 0:
+            settle_error = self._idle_phase(core_id, self.config.settle_seconds, "CO settle")
+            if settle_error:
+                status.state = "failed"
+                status.current_phase = ""
+                result = StressResult(
+                    core_id=core_id,
+                    passed=False,
+                    duration_seconds=self.config.settle_seconds,
+                    error_message=settle_error,
+                    error_type=self._classify_error(settle_error),
+                )
+                self.results[core_id].append(result)
+                for cb in self.on_core_finish:
+                    cb(core_id, result)
+                return
+            if self._stop_event.is_set():
+                status.state = "pending"
+                status.current_phase = ""
+                return
 
         self.stress_config.threads = len(lane.cpus)
         self.stress_config.duty_cycle = self.config.duty_cycle

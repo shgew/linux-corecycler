@@ -41,6 +41,9 @@ FIELD_BOUNDS: dict[str, tuple[int | float, int | float]] = {
     "probe_mttf_multiplier": (0.01, 100),
     "probe_level_multiplier": (1, 10),
     "probe_final_multiplier": (1, 100),
+    "onset_failure_seconds": (0, 3600),
+    "onset_launch_seconds": (10, 3600),
+    "co_settle_seconds": (0, 60),
     "suspicion_separation": (1, 100),
     "suspicion_min_failures": (1, 100),
     "anneal_bank_hours": (0.01, 8760),
@@ -181,6 +184,14 @@ class TunerConfig:
     probe_mttf_multiplier: float = 4.0
     probe_level_multiplier: float = 1.5
     probe_final_multiplier: float = 4.0
+    # A failure landing this soon after load starts is an onset failure: its
+    # probe budget is spent as launches of at least onset_launch_seconds, each
+    # outlasting mttf_multiplier x the observed failure time. 0 disables.
+    onset_failure_seconds: int = 60
+    onset_launch_seconds: int = 30
+    # Idle between a slot's CO write and its load step, so a freeze can name
+    # which of the two it followed.
+    co_settle_seconds: int = 5
     # The statistical fallback only acts on a clear winner.
     suspicion_separation: float = 2.0
     suspicion_min_failures: int = 3

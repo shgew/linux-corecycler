@@ -552,3 +552,25 @@ def probe_seconds(
     if state.stage is Stage.CONFIRM:
         budget *= final_multiplier
     return max(1, int(budget))
+
+
+def onset_launches(
+    state: HuntState,
+    *,
+    budget: int,
+    onset_seconds: int,
+    min_launch: int,
+    mttf_multiplier: float,
+) -> tuple[int, int]:
+    """Split a probe budget into ``(launch_seconds, launches)``.
+
+    A failure that lands within ``onset_seconds`` of load starting is
+    reproduced by load starts, not by wall time, so its budget is spent as
+    many launches each long enough to outlast the observed failure time. A
+    slow or untimed failure keeps one launch for the whole budget.
+    """
+    observed = state.observed_failure_time
+    if not 0 < observed <= onset_seconds:
+        return budget, 1
+    launch = min(budget, max(min_launch, math.ceil(observed * mttf_multiplier)))
+    return launch, math.ceil(budget / launch)

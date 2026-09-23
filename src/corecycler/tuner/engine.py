@@ -570,6 +570,8 @@ class TunerEngine(QObject):
         self._pending_hunt_loaded: list[int] = []
         self._pending_hunt_vector: dict[int, int] = {}
         self._pending_hunt_mttf = 0.0
+        self._hunt_launches_left = 0
+        self._hunt_launch_seconds = 0
         self._battery_orders: dict[int, tuple[tuple[str, int], list[str]]] = {}
         self._freeze: MicroFreezeMonitor | None = None
         self._freeze_slot_context = ""
@@ -829,6 +831,7 @@ class TunerEngine(QObject):
         self._pending_hunt_loaded = []
         self._pending_hunt_vector = {}
         self._pending_hunt_mttf = 0.0
+        self._hunt_launches_left = 0
         self._session_id = session_id
 
         try:
@@ -2643,27 +2646,48 @@ class TunerEngine(QObject):
 
     def _run_next_hunt_slot(self) -> None:
         if self._abort_requested or self._paused or self._hunt is None:
+            if self._paused and self._hunt_launches_left:
+                # A series cut short has not answered its question; the resume
+                # re-runs the whole probe instead of skipping past it.
+                self._requeue_hunt_probe()
             return
-        live = bisect.next_live_set(self._hunt)
-        if live is None:
-            self._resolve_hunt()
-            return
+        if self._hunt_launches_left:
+            self._hunt_launches_left -= 1
+            live = list(self._hunt.in_flight)
+            duration = self._hunt_launch_seconds
+            launches = 0
+        else:
+            live = bisect.next_live_set(self._hunt)
+            if live is None:
+                self._resolve_hunt()
+                return
+            replay_duration = (self._hunt.workload or {}).get("duration_seconds")
+            probe_base = (
+                replay_duration
+                if type(replay_duration) is int and replay_duration > 0
+                else self._config.probe_base_seconds
+            )
+            budget = bisect.probe_seconds(
+                self._hunt,
+                base=probe_base,
+                mttf_multiplier=self._config.probe_mttf_multiplier,
+                level_multiplier=self._config.probe_level_multiplier,
+                final_multiplier=self._config.probe_final_multiplier,
+            )
+            duration, launches = bisect.onset_launches(
+                self._hunt,
+                budget=budget,
+                onset_seconds=self._config.onset_failure_seconds,
+                min_launch=self._config.onset_launch_seconds,
+                mttf_multiplier=self._config.probe_mttf_multiplier,
+            )
+            self._hunt_launch_seconds = duration
+            self._hunt_launches_left = launches - 1
         self._hunt.armed = False
         self._save_hunt()
         if not self._apply_hunt_mask(live):
             return
 
-        replay_duration = (self._hunt.workload or {}).get("duration_seconds")
-        probe_base = (
-            replay_duration if type(replay_duration) is int and replay_duration > 0 else self._config.probe_base_seconds
-        )
-        duration = bisect.probe_seconds(
-            self._hunt,
-            base=probe_base,
-            mttf_multiplier=self._config.probe_mttf_multiplier,
-            level_multiplier=self._config.probe_level_multiplier,
-            final_multiplier=self._config.probe_final_multiplier,
-        )
         # The probe replays the load that was running when the machine died
         # and varies only the offset mask. Every core in the probe is marked
         # in_test so a mid-probe reboot is attributed to the probe rather than
@@ -2674,16 +2698,23 @@ class TunerEngine(QObject):
         reporter = loaded[0]
         self._last_tested_core = reporter
         self._emit_progress()
-        if self._hunt.stage is bisect.Stage.CONTROL:
-            self.log_message.emit(
-                f"Hunt control probe: every core at stock for {duration}s. "
-                "If the machine dies here the offsets are not the cause."
-            )
-        else:
-            self.log_message.emit(
-                f"Hunt probe ({self._hunt.stage}, level {self._hunt.level}): live {live}, "
-                f"every other core at stock, for {duration}s"
-            )
+        if launches:
+            span = f"{duration}s"
+            if launches > 1:
+                span = (
+                    f"{launches} launches of {duration}s: the failure came "
+                    f"{self._hunt.observed_failure_time:.0f}s after load started, so load starts reproduce it"
+                )
+            if self._hunt.stage is bisect.Stage.CONTROL:
+                self.log_message.emit(
+                    f"Hunt control probe: every core at stock for {span}. "
+                    "If the machine dies here the offsets are not the cause."
+                )
+            else:
+                self.log_message.emit(
+                    f"Hunt probe ({self._hunt.stage}, level {self._hunt.level}): live {live}, "
+                    f"every other core at stock, for {span}"
+                )
         workload = self._hunt.workload or {}
         match workload.get("kind"):
             case "rapid_transition":
@@ -2731,6 +2762,9 @@ class TunerEngine(QObject):
             return
         if foreign:
             reproduced = True
+        if not reproduced and self._hunt_launches_left:
+            QTimer.singleShot(0, self._run_next_hunt_slot)
+            return
         self._record_hunt_probe(reproduced=reproduced)
         QTimer.singleShot(0, self._run_next_hunt_slot)
 
@@ -2740,6 +2774,7 @@ class TunerEngine(QObject):
         A thermal stop or an apparatus fault is not an answer to the question
         the probe asked, so it must not be folded in as one.
         """
+        self._hunt_launches_left = 0
         if self._hunt is not None:
             self._hunt.armed = False
             if self._hunt.stage is bisect.Stage.CONFIRM and self._hunt.suspect is not None:
@@ -2770,6 +2805,7 @@ class TunerEngine(QObject):
                 self._db.upsert_tuner_core_state(self._session_id, cs)
 
     def _record_hunt_probe(self, *, reproduced: bool) -> None:
+        self._hunt_launches_left = 0
         whole_set = (
             self._hunt is not None
             and self._hunt.stage is bisect.Stage.PROBE
@@ -3402,6 +3438,7 @@ class TunerEngine(QObject):
             variable_load_interval=5.0 if spectrum else 15.0,
             idle_stability_test=15.0 if spectrum else 0.0,
             duty_cycle=duty_cycle,
+            settle_seconds=self._config.co_settle_seconds,
         )
 
         try:
@@ -3446,7 +3483,8 @@ class TunerEngine(QObject):
             worker,
             workload,
             self._cores_under_stress or [core_id],
-            freeze_context=f"core {core_id} at {cs.current_offset} ({self._worker_profile}, {regime})",
+            freeze_context=f"core {core_id} at {cs.current_offset} ({self._worker_profile}, {regime})"
+            + (f", load after a {self._config.co_settle_seconds}s CO settle" if self._config.co_settle_seconds else ""),
             emit_started=core_id,
             slot=slot,
         )

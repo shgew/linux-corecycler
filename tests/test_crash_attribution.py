@@ -526,6 +526,90 @@ class TestCrashHunt:
         assert db.get_unattributed_crashes(eng._session_id) == 0
 
 
+class TestOnsetHunt:
+    """Session 12 froze seconds after load starts; ever-longer probes added
+    wall time and no load starts."""
+
+    def _engine(self, db, topo, mock_backend, monkeypatch):
+        eng = _make_engine(db, topo, mock_backend, probe_base_seconds=300)
+        _seed_confirmed_validating(eng, db, BEST, BASELINES)
+        monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
+        eng.launches = []
+        eng._start_worker = lambda core, duration, **_k: eng.launches.append(duration)
+        eng._start_multi_core_worker = lambda cores, duration, **_k: eng.launches.append(duration)
+        return eng
+
+    @staticmethod
+    def _budget(eng) -> int:
+        return bisect.probe_seconds(
+            eng._hunt,
+            base=eng._config.probe_base_seconds,
+            mttf_multiplier=eng._config.probe_mttf_multiplier,
+            level_multiplier=eng._config.probe_level_multiplier,
+            final_multiplier=eng._config.probe_final_multiplier,
+        )
+
+    @staticmethod
+    def _launch(eng, passed: bool) -> None:
+        eng._on_test_finished(5, passed, "" if passed else "mprime error: FATAL ERROR", "", 32.0, 0.0)
+        eng._run_next_hunt_slot()
+
+    def test_a_probe_is_answered_only_after_its_last_clean_launch(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
+        eng._start_hunt(observed_mttf=8.0, loaded=[5])
+        budget = self._budget(eng)
+        control_launches = 0
+        while eng._hunt.stage is bisect.Stage.CONTROL:
+            control_launches += 1
+            self._launch(eng, True)
+
+        assert eng.launches[0] == 32
+        assert control_launches == -(-budget // 32)
+        assert set(eng.launches[:control_launches]) == {32}
+        assert eng._hunt.stage is bisect.Stage.PROBE
+
+    def test_a_failing_launch_answers_the_probe_at_once(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
+        eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
+        eng._start_hunt(observed_mttf=8.0, loaded=[5])
+        self._launch(eng, True)
+        assert eng._hunt.control_fails == 0
+
+        self._launch(eng, False)
+
+        assert eng._hunt.control_fails == 1
+        budget = self._budget(eng)
+        clean = 0
+        while eng._hunt.stage is bisect.Stage.CONTROL:
+            clean += 1
+            self._launch(eng, True)
+        assert clean == -(-budget // 32)
+
+    def test_a_pause_between_launches_requeues_the_whole_probe(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
+        eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
+        eng._start_hunt(observed_mttf=8.0, loaded=[5])
+        while eng._hunt.stage is bisect.Stage.CONTROL:
+            self._launch(eng, True)
+        probe = list(eng._hunt.in_flight)
+        eng._on_test_finished(5, True, "", "", 32.0, 0.0)
+
+        eng.pause()
+        eng._run_next_hunt_slot()
+
+        persisted = bisect.HuntState.from_json(db.get_tuner_session(eng._session_id).hunt_state)
+        assert persisted.in_flight == []
+        assert bisect.next_live_set(persisted) == probe
+
+    def test_a_long_failure_keeps_one_launch_per_probe(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
+        eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
+        eng._start_hunt(observed_mttf=900.0, loaded=[5])
+        budget = self._budget(eng)
+        self._launch(eng, True)
+        assert eng.launches[0] == budget
+        assert eng._hunt.stage is bisect.Stage.PROBE
+
+
 class TestForeignMceEvidence:
     def test_parse_groups_by_core_and_severity(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)

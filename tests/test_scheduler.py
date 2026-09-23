@@ -409,6 +409,45 @@ class TestIdleComposition:
         assert results[0][0].passed is False
         assert results[0][0].error_type == "mce"
 
+    def test_a_settle_idles_before_the_payload_starts(self, tmp_path, monkeypatch):
+        """Separating the CO write from the load step is what lets a freeze
+        name which of the two it followed."""
+        events: list[str] = []
+        monkeypatch.setattr(execution, "watch_idle", lambda **kwargs: events.append(kwargs["phase"]))
+        sched = make_scheduler(tmp_path, cores_to_test=[0], settle_seconds=0.01)
+
+        def stress(sup, lanes, config_for, duration):
+            events.append("stress")
+            return step_pass(sup, lanes, config_for, duration)
+
+        ScriptedSupervisor.script = [stress]
+        results = sched.run()
+        assert events == ["CO settle", "stress"]
+        assert results[0][0].passed is True
+
+    def test_an_mce_during_the_settle_fails_the_core_without_launching(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(execution, "watch_idle", lambda **kwargs: "MCE during CO settle: bang")
+        sched = make_scheduler(tmp_path, cores_to_test=[0], settle_seconds=0.01)
+        launched: list[int] = []
+
+        def stress(sup, lanes, config_for, duration):
+            launched.append(1)
+            return step_pass(sup, lanes, config_for, duration)
+
+        ScriptedSupervisor.script = [stress]
+        results = sched.run()
+        assert launched == []
+        assert results[0][0].passed is False
+        assert results[0][0].error_type == "mce"
+
+    def test_a_stop_during_the_settle_leaves_no_verdict(self, tmp_path, monkeypatch):
+        sched = make_scheduler(tmp_path, cores_to_test=[0], settle_seconds=0.01)
+        monkeypatch.setattr(execution, "watch_idle", lambda **kwargs: sched._stop_event.set())
+        ScriptedSupervisor.script = [step_pass]
+        results = sched.run()
+        assert results[0] == []
+        assert sched.core_status[0].state == "pending"
+
 
 class TestVariableLoadComposition:
     def test_a_variable_segment_failure_is_attributed(self, tmp_path):

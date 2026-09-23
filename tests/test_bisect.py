@@ -266,6 +266,38 @@ class TestBudget:
         assert seconds == 3600
 
 
+class TestOnsetLaunches:
+    """A failure that lands seconds after load starts is reproduced by load
+    starts, not by wall time: the budget is spent as many short launches."""
+
+    KW = {"onset_seconds": 60, "min_launch": 30, "mttf_multiplier": 4.0}
+
+    @pytest.mark.parametrize("observed", [0.0, 61.0, 900.0])
+    def test_an_untimed_or_slow_failure_keeps_one_long_launch(self, observed):
+        state = HuntState(stage=Stage.PROBE, observed_failure_time=observed)
+        assert bisect.onset_launches(state, budget=556, **self.KW) == (556, 1)
+
+    def test_an_onset_failure_spends_the_budget_as_launches(self):
+        state = HuntState(stage=Stage.PROBE, observed_failure_time=8.0)
+        launch, count = bisect.onset_launches(state, budget=556, **self.KW)
+        assert launch == 32
+        assert count == 18
+        assert launch * count >= 556
+
+    def test_a_very_fast_failure_still_gets_the_minimum_launch(self):
+        state = HuntState(stage=Stage.PROBE, observed_failure_time=1.0)
+        assert bisect.onset_launches(state, budget=300, **self.KW) == (30, 10)
+
+    def test_a_launch_never_outlasts_the_budget(self):
+        state = HuntState(stage=Stage.PROBE, observed_failure_time=8.0)
+        assert bisect.onset_launches(state, budget=20, **self.KW) == (20, 1)
+
+    def test_a_zero_threshold_disables_onset_probes(self):
+        state = HuntState(stage=Stage.PROBE, observed_failure_time=8.0)
+        kw = {**self.KW, "onset_seconds": 0}
+        assert bisect.onset_launches(state, budget=556, **kw) == (556, 1)
+
+
 class TestPersistence:
     def test_state_survives_a_round_trip(self):
         state, _ = run_hunt(list(range(8)), {3}, cap=6)
