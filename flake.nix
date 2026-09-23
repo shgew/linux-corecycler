@@ -238,6 +238,7 @@
                 pkgs.nixfmt
                 pkgs.ruff
               ];
+              CORECYCLER_DEV_SHELL = "1";
             };
 
             checks = {

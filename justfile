@@ -1,7 +1,7 @@
 set shell := ["bash", "-euo", "pipefail", "-c"]
 set positional-arguments
 
-dev := if env("IN_NIX_SHELL", "") != "" { "" } else { "nix develop --command" }
+dev := if env("CORECYCLER_DEV_SHELL", "") == "1" { "" } else { "nix develop --command" }
 system := arch() + "-" + os()
 history_db := env("HOME") / ".local/share/corecycler/history/history.db"
 
