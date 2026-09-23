@@ -39,6 +39,7 @@ class PMTableOffsets:
     cldo_vddg_ccd: int  # -1 if not available
     vdd_misc: int
     vdd_mem: int  # -1 if not calibrated
+    edc_value: int = -1  # -1 if the layout has no EDC current field
     verified: bool = False  # True only if confirmed on real hardware
 
 
@@ -61,6 +62,9 @@ PM_TABLE_OFFSETS: dict[int, PMTableOffsets] = {
         cldo_vddg_ccd=0x414,
         vdd_misc=0xE8,
         vdd_mem=0x0A8,
+        # Right after EDC_LIMIT: tracks load and stays above TDC current (gnr-smu
+        # profiles.py, confirmed on a 9950X3D2: 123-158 A against TDC 111-146 A).
+        edc_value=0x100,
         verified=True,
     ),
     0x621102: PMTableOffsets(
@@ -143,7 +147,7 @@ class PMTableData:
     edc_limit_a: float = 0.0
     ppt_value_w: float = 0.0
     tdc_value_a: float = 0.0
-    edc_value_a: float = 0.0
+    edc_value_a: float | None = None
     tctl_c: float = 0.0
     tdie_c: float = 0.0
 
@@ -312,7 +316,7 @@ class PMTableReader:
         data.tdc_limit_a = read(8)
         data.tdc_value_a = read(9)
         data.edc_limit_a = read(63)
-        data.edc_value_a = 0.0
+        data.edc_value_a = _read_float(raw, offsets.edc_value, offsets.table_size) if offsets.edc_value >= 0 else None
         data.tctl_c = read(11)
         data.tdie_c = 0.0
         data.package_power_w = data.ppt_value_w

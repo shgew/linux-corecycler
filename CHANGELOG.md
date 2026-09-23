@@ -24,6 +24,9 @@ test, quality, Nix, hardware-contract, mutation, live-scenario, and history-db w
 - `ryzen_smu` retries a PM table transfer rejected at probe once, after a DRAM base
   lookup, and logs the rejection. On a 9950X3D2 (SMU 98.84.0) the first transfer failed
   silently at boot, so `pm_table` never appeared and PPT, TDC and EDC showed N/A.
+- The Monitor tab shows live EDC current on PM table 0x620205 (Granite Ridge 16-core)
+  from the field after EDC_LIMIT, instead of a hardcoded 0 A. Layouts with no known EDC
+  current field show EDC as N/A rather than 0%.
 - A hunt with exactly one live core under load runs that core alone first, and convicts
   it after one probe if it reproduces. The rule that failed a stepped trial directly when
   every other live offset had survived is gone: it never fired, because every slot's

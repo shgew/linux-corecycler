@@ -34,7 +34,6 @@ class TestPMTableData:
         assert data.edc_limit_a == 0.0
         assert data.ppt_value_w == 0.0
         assert data.tdc_value_a == 0.0
-        assert data.edc_value_a == 0.0
         assert data.tctl_c == 0.0
         assert data.tdie_c == 0.0
         assert data.raw_floats == []
@@ -107,6 +106,7 @@ class TestPMTableReader:
         struct.pack_into("<f", raw, 9 * 4, 95.0)
         struct.pack_into("<f", raw, 11 * 4, 70.0)
         struct.pack_into("<f", raw, 63 * 4, 230.0)
+        struct.pack_into("<f", raw, 64 * 4, 205.0)
         smu_dir = _make_smu_dir(tmp_path, version_int=0x620205, raw_bytes=bytes(raw))
 
         result = PMTableReader(sysfs_path=smu_dir).read()
@@ -117,8 +117,21 @@ class TestPMTableReader:
         assert result.tdc_limit_a == pytest.approx(190.0)
         assert result.tdc_value_a == pytest.approx(95.0)
         assert result.edc_limit_a == pytest.approx(230.0)
+        assert result.edc_value_a == pytest.approx(205.0)
         assert result.tctl_c == pytest.approx(70.0)
         assert result.package_power_w == pytest.approx(142.0)
+
+    def test_edc_current_is_absent_where_the_layout_has_none(self, tmp_path):
+        raw = bytearray(_build_versioned_pm_table(0x620105))
+        struct.pack_into("<f", raw, 63 * 4, 230.0)
+        struct.pack_into("<f", raw, 64 * 4, 205.0)
+        smu_dir = _make_smu_dir(tmp_path, version_int=0x620105, raw_bytes=bytes(raw))
+
+        result = PMTableReader(sysfs_path=smu_dir).read()
+
+        assert result is not None
+        assert result.edc_limit_a == pytest.approx(230.0)
+        assert result.edc_value_a is None
 
     def test_raw_floats_always_available(self, tmp_path):
         """raw_floats should contain the full array regardless of parsing."""
