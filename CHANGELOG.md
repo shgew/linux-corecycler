@@ -17,6 +17,13 @@ test, quality, Nix, hardware-contract, mutation, live-scenario, and history-db w
 
 ### Fixed (2026-09-23 evening run on the 9950X3D2)
 
+- The Monitor tab reads Vcore from an unlabeled Nuvoton NCT67xx `in0`, the chip's
+  dedicated CPUVCORE pin. The in-kernel `nct6775` driver never exposes voltage labels, so
+  the label-only Super I/O fallback could not find Vcore on any board it drives, and
+  zenpower5 exposes no voltages on Granite Ridge.
+- `ryzen_smu` retries a PM table transfer rejected at probe once, after a DRAM base
+  lookup, and logs the rejection. On a 9950X3D2 (SMU 98.84.0) the first transfer failed
+  silently at boot, so `pm_table` never appeared and PPT, TDC and EDC showed N/A.
 - A hunt with exactly one live core under load runs that core alone first, and convicts
   it after one probe if it reproduces. The rule that failed a stepped trial directly when
   every other live offset had survived is gone: it never fired, because every slot's

@@ -1,6 +1,8 @@
 # ryzen_smu kernel module for Curve Optimizer, PBO controls, and PM table access.
-# The local patch fixes two pinned-upstream safety defects: non-OK mailbox
+# The mailbox patch fixes two pinned-upstream safety defects: non-OK mailbox
 # responses being lost while retries remain, and stale SMN data after read failure.
+# The probe patch retries a rejected first PM table transfer once after a DRAM
+# base lookup; on Granite Ridge (SMU 98.84.0) that rejection silently dropped `pm_table`.
 # Supports GCC and Clang/LLVM kernels through the shared toolchain helper.
 # Source: https://github.com/amkillam/ryzen_smu
 {
@@ -32,7 +34,10 @@ in
 toolchain.buildStdenv.mkDerivation {
   pname = "ryzen-smu-${kernel.version}";
   inherit version src;
-  patches = [ ./ryzen-smu-mailbox.patch ];
+  patches = [
+    ./ryzen-smu-mailbox.patch
+    ./ryzen-smu-pm-table-probe.patch
+  ];
 
   hardeningDisable = [ "pic" ];
 

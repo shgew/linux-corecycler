@@ -1,0 +1,26 @@
+diff --git a/drv.c b/drv.c
+--- a/drv.c
++++ b/drv.c
+@@ -379,6 +379,13 @@ static int ryzen_smu_probe(struct pci_dev *dev, const struct pci_device_id *id)
+ 
+     // Check that PM table options are supported before adding it to the attr list
+     ret = smu_transfer_table_to_dram(g_driver.device);
++    if (ret != SMU_Return_OK && ret != SMU_Return_Unsupported) {
++        // The first transfer after boot can be rejected until the table's
++        // DRAM address has been requested. Request it and retry once.
++        pr_info("PM table transfer returned %d, retrying after DRAM base lookup", ret);
++        smu_get_dram_base_address(g_driver.device);
++        ret = smu_transfer_table_to_dram(g_driver.device);
++    }
+     if (ret == SMU_Return_OK) {
+         ret = smu_get_pm_table_version(g_driver.device, &g_driver.pm_table_version);
+         if (ret != SMU_Return_OK && ret != SMU_Return_Unsupported) {
+@@ -410,7 +417,7 @@ static int ryzen_smu_probe(struct pci_dev *dev, const struct pci_device_id *id)
+             pr_err("Failed to probe the PM table -- disabling feature (%d)", ret);
+     }
+     else {
+-        pr_debug("Notice: PM tables are not supported for the current platform (%d)", ret);
++        pr_info("Notice: PM tables are not supported for the current platform (%d)", ret);
+     }
+ 
+ _CONTINUE_SETUP:
