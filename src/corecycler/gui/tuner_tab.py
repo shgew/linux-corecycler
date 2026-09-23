@@ -113,7 +113,9 @@ def describe_slot(slot: dict, elapsed: float | None = None) -> str:
     """One line saying what the running test is and why it runs."""
     parts: list[str] = []
     hunt = slot.get("hunt")
-    if hunt is not None:
+    if hunt is not None and hunt["stage"] == "lead":
+        parts.append(f"Hunt lead probe: core {hunt['live'][0]} alone, the rest at stock")
+    elif hunt is not None:
         parts.append(f"Hunt probe (level {hunt['level']}): cores {hunt['live']} live, the rest at stock")
         parts.append(f"load on cores {slot['cores']}")
     else:

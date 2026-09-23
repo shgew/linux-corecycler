@@ -261,45 +261,21 @@ class TestForensicAttribution:
         db.journal_co_intent(eng._session_id, 2, -20, survived=False)
         eng._forensics = lambda since, timeout=15.0, **kwargs: ([], True)
 
-    def test_stepped_trial_takes_the_crash_when_every_other_live_offset_is_proven(
-        self, db, topo_dual_ccd_x3d, mock_backend
+    @pytest.mark.parametrize("phase", [TunerPhase.COARSE_SEARCH, TunerPhase.CONFIRMED])
+    @pytest.mark.parametrize("other_resident", [-15, -18])
+    def test_a_crash_with_one_loaded_live_core_hunts_that_core_alone_first(
+        self, db, topo_dual_ccd_x3d, mock_backend, phase, other_resident
     ):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[2, 3])
-        self._seed_stepped_crash(eng, db, TunerPhase.COARSE_SEARCH, other_resident=-15)
+        self._seed_stepped_crash(eng, db, phase, other_resident=other_resident)
+        eng._start_worker = lambda *_a, **_k: None
 
         crashed, pending_hunt = eng._attribute_crash_after_reboot(db.get_tuner_session(eng._session_id))
-
-        assert crashed == [2]
-        assert pending_hunt is False
-        assert eng._core_states[2].crash_count == 1
-        assert eng._core_states[2].backoff_fail_bound == -20
-        assert (eng._core_states[3].current_offset, eng._core_states[3].crash_count) == (-15, 0)
-
-    def test_stepped_trial_is_not_blamed_while_another_core_holds_an_unproven_value(
-        self, db, topo_dual_ccd_x3d, mock_backend
-    ):
-        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[2, 3])
-        self._seed_stepped_crash(eng, db, TunerPhase.COARSE_SEARCH, other_resident=-18)
-
-        crashed, pending_hunt = eng._attribute_crash_after_reboot(db.get_tuner_session(eng._session_id))
-
-        assert crashed == []
-        assert pending_hunt is True
-        assert eng._pending_hunt_loaded == [2]
+        assert (crashed, pending_hunt) == ([], True)
         assert all(cs.crash_count == 0 for cs in eng._core_states.values())
 
-    def test_confirmed_loaded_core_is_not_blamed_when_other_live_offsets_were_resident(
-        self, db, topo_dual_ccd_x3d, mock_backend
-    ):
-        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[2, 3])
-        self._seed_stepped_crash(eng, db, TunerPhase.CONFIRMED, other_resident=-15)
-
-        crashed, pending_hunt = eng._attribute_crash_after_reboot(db.get_tuner_session(eng._session_id))
-
-        assert crashed == []
-        assert pending_hunt is True
-        assert eng._pending_hunt_loaded == [2]
-        assert all(cs.crash_count == 0 for cs in eng._core_states.values())
+        eng._start_hunt(loaded=eng._pending_hunt_loaded)
+        assert eng._hunt.in_flight == [2]
 
     def test_only_non_stock_resident_can_be_blamed_without_a_hunt(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, cores_to_test=[2, 3])
@@ -343,21 +319,38 @@ class TestCrashHunt:
         assert all(cs.crash_count == 0 for cs in eng._core_states.values())
         assert all(not cs.in_test for cs in eng._core_states.values())
 
-    def test_hunt_opens_by_bisecting_the_live_set(self, db, topo_dual_ccd_x3d, mock_backend):
+    def test_hunt_opens_with_the_loaded_core_alone_for_its_timed_budget(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         _seed_confirmed_validating(eng, db, BEST, BASELINES)
         eng._smu.written = dict(BEST)
         probes = []
         eng._start_worker = lambda core_id, duration, **kwargs: probes.append((core_id, duration))
 
-        eng._start_hunt(loaded=[5])
+        eng._start_hunt(observed_mttf=82.0, loaded=[5])
 
         assert eng.status == "hunting"
-        assert eng._hunt is not None
-        assert eng._hunt.in_flight == [0, 1, 2, 3]
-        assert eng._smu.written == {core: BEST[core] if core < 4 else 0 for core in BEST}
-        assert probes and probes[0][0] == 5
+        assert eng._hunt.in_flight == [5]
+        assert eng._smu.written == {core: BEST[core] if core == 5 else 0 for core in BEST}
+        assert probes == [(5, 328)]
         assert eng._core_states[5].in_test is True
+
+    def test_a_lead_that_reproduces_backs_off_only_the_loaded_core(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_confirmed_validating(eng, db, BEST, BASELINES)
+        monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
+        eng._start_worker = lambda *_a, **_k: None
+        eng._start_hunt(loaded=[5])
+
+        eng._record_hunt_probe(reproduced=True)
+        eng._run_next_hunt_slot()
+
+        assert eng._hunt is None
+        assert eng._core_states[5].current_offset > BEST[5]
+        assert {c: cs.current_offset for c, cs in eng._core_states.items() if c != 5} == {
+            c: v for c, v in BEST.items() if c != 5
+        }
 
     def test_non_hunt_pass_clears_the_resume_crash_streak(self, db, topo_dual_ccd_x3d, mock_backend):
         eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
@@ -598,6 +591,7 @@ class TestOnsetHunt:
             base=eng._config.probe_base_seconds,
             mttf_multiplier=eng._config.probe_mttf_multiplier,
             level_multiplier=eng._config.probe_level_multiplier,
+            onset_seconds=eng._config.onset_failure_seconds,
         )
 
     @staticmethod
@@ -656,21 +650,20 @@ class TestOnsetHunt:
                 base=3600,
                 mttf_multiplier=eng._config.probe_mttf_multiplier,
                 level_multiplier=eng._config.probe_level_multiplier,
+                onset_seconds=eng._config.onset_failure_seconds,
             )
         ]
 
     def test_a_failing_launch_answers_the_probe_at_once(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
         eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
         eng._start_hunt(observed_mttf=8.0, loaded=[0])
-        first = list(eng._hunt.in_flight)
         self._launch(eng, True, core=0)
-        assert eng._hunt.in_flight == first
+        assert eng._hunt.in_flight == [0]
 
         self._launch(eng, False, core=0)
 
-        assert eng._hunt.guilty_halves == [first]
-        assert eng._hunt.in_flight != first
-        assert eng._hunt.launches_done == 0
+        assert eng._hunt is None
+        assert eng._core_states[0].current_offset > BEST[0]
 
     def test_a_pause_between_launches_keeps_its_clean_launches(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
         """Session 12 paused after 44 clean launches of a 131-launch probe and
@@ -709,13 +702,19 @@ class TestOnsetHunt:
         messages: list[str] = []
         eng.log_message.connect(messages.append)
         eng._start_hunt(observed_mttf=8.0, loaded=[5])
+        self._launch(eng, True)
+        eng._record_hunt_probe(reproduced=False)
+        eng._run_next_hunt_slot()
 
         self._launch(eng, True)
 
         assert eng._smu.written[5] == 0
-        assert "Core 5 offset 0: PASS" in messages
+        assert [m for m in messages if m.startswith("Core 5 offset")] == [
+            "Core 5 offset -30: PASS",
+            "Core 5 offset 0: PASS",
+        ]
         hunt_rows = [row for row in db.get_tuner_test_log(eng._session_id, core_id=5) if row["phase"] == "hunt"]
-        assert [row["offset_tested"] for row in hunt_rows] == [0]
+        assert [row["offset_tested"] for row in hunt_rows] == [-30, 0]
 
     def test_a_probe_that_could_not_run_is_requeued_at_stock(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
         """Session 12 paused on "mprime exited with code 0" mid-probe and lost

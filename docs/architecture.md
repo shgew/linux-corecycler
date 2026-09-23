@@ -58,7 +58,7 @@ src/corecycler/
     config.py          TunerConfig dataclass (search parameters with defaults)
     state.py           TunerPhase StrEnum, CoreState / TunerSession dataclasses
     regime.py          The four confidence regimes, the offset masks, and the workload battery
-    bisect.py          Attribution hunt state machine: bisection of the live mask down to a lone reproducer
+    bisect.py          Attribution hunt state machine: loaded-core lead, then bisection down to a lone reproducer
     report.py          The per-core answer with the banked evidence behind it
     persistence.py     Session CRUD, core-state upsert, test log, CO write-ahead journal
     engine.py          TunerEngine: state machine, scheduling, crash recovery, staged validation (1-7),

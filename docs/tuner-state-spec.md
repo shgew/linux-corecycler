@@ -146,18 +146,18 @@ penalty. Attribution uses this strict priority:
    that core at its journaled resident offset. Evidence naming an unknown or
    stock core is an instrument/evidence inconsistency, never permission to
    blame a different core.
-3. **The only unproven offset resident** is attributable. That is the only
-   core away from stock when exactly one journaled resident offset is
-   non-zero. It is also the one in-test core on a stepped-phase slot when its
-   journaled resident equals its `current_offset` and every other non-zero
-   resident is journaled survived: the trial is the only difference from a
-   vector that already survived, so the crash is that step's FAIL and no hunt
-   runs. A loaded core outside a stepped phase, several in-test cores, or any
-   other un-survived resident still goes to the hunt.
+3. **The only non-stock resident** is attributable: the only core away from
+   stock when exactly one journaled resident offset is non-zero. Being the
+   one loaded core is not attribution on its own; that goes to the hunt's
+   `LEAD` probe.
 4. **Otherwise start or resume the attribution hunt.** An aggregate validation
    failure with no per-core verdict starts a hunt using the exact failed
    workload; it never guesses the most-aggressive core. There is no stock
-   control stage. `PROBE` applies the persisted in-flight group from
+   control stage. When exactly one loaded core holds a live offset and the
+   live set has more than one core, the hunt opens in `LEAD`: that core runs
+   alone with every other core at stock. A reproduction makes it the culprit;
+   a clean answer moves to `PROBE` over the whole live set, that core
+   included. `PROBE` applies the persisted in-flight group from
    `HuntState`; an in-flight group that was never answered is replayed, never
    skipped. A lone core that reproduces with every other core
    at stock is a culprit with no further probe. Culprits do not terminate a
@@ -179,9 +179,11 @@ validation resets the unattributed-failure count.
 The persisted hunt workload records the concrete worker kind (`solo`,
 `parallel`, `rapid_transition`, or `soak`), duration, backend, stress mode,
 FFT preset, threads, profile, and test list. Resume therefore replays the same
-experiment instead of reconstructing or substituting a workload. The recorded
-duration only lengthens a probe: its budget base is the larger of that duration
-and `probe_base_seconds`, so a short search slot never shortens attribution.
+experiment instead of reconstructing or substituting a workload. A failure the
+breadcrumb timed past `onset_failure_seconds` sets the probe budget itself,
+`probe_mttf_multiplier` times that time. An onset or untimed failure keeps a
+floor: the larger of the recorded duration and `probe_base_seconds`, so a short
+search slot never shortens attribution.
 
 A stability ambiguity never pauses the crash-attribution engine and never
 causes a guessed penalty: it becomes another hunt probe. This path pauses only

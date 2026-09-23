@@ -1107,7 +1107,7 @@ class TunerEngine(QObject):
                         resumed.observed_failure_time = self._pending_hunt_mttf
                     self.log_message.emit(
                         f"Resumed session {session_id}: attribution hunt over {resumed.candidates}, "
-                        "bisecting the live set under the load that was running."
+                        "replaying the load that was running."
                     )
                 self._run_next_hunt_slot()
                 return
@@ -2197,13 +2197,6 @@ class TunerEngine(QObject):
                 resident_core = self._core_states[live_cores[0]]
                 resident_core.current_offset = residents[live_cores[0]]
                 crashed = self._penalize_cores([resident_core], "the sole journaled non-stock resident")
-            elif saved_hunt is None and (trial := self._sole_unproven_trial(in_test, residents)) is not None:
-                self.log_message.emit(
-                    f"Crash while core {trial.core_id} was on a {trial.phase.value} step at "
-                    f"{trial.current_offset} and every other live offset was already proven. "
-                    "That step is the only change from a vector that survived, so it takes the crash."
-                )
-                crashed = self._penalize_cores([trial], "the only unproven offset resident")
             self._clear_all_in_test()
             # A CO write journaled as intent that never recorded surviving is
             # how a crash with no in_test flag at all gets caught. It is proof
@@ -2240,24 +2233,6 @@ class TunerEngine(QObject):
         if crashed and session_id is not None:
             self._db.set_hunt_state(session_id, "")
         return crashed, pending_hunt
-
-    def _sole_unproven_trial(self, in_test: list[CoreState], residents: dict[int, int]) -> CoreState | None:
-        """The loaded core, when its stepped trial was the only unproven offset resident.
-
-        Every other non-stock resident sits inside its core's survived envelope,
-        so the trial is the one difference between a vector that survived and
-        the one that died. Anything looser still needs the hunt.
-        """
-        if len(in_test) != 1:
-            return None
-        cs = in_test[0]
-        resident = residents.get(cs.core_id, 0)
-        if cs.phase not in _STEPPED_PHASES or resident == 0 or resident != cs.current_offset:
-            return None
-        survived = tp.journal_survived_values(self._db, self._session_id)
-        if any(survived.get(core) != value for core, value in residents.items() if core != cs.core_id and value != 0):
-            return None
-        return cs
 
     def _reengage_quarantined(self, session_id: int) -> None:
         """Re-open a quarantined session on proven ground only.
@@ -2590,7 +2565,9 @@ class TunerEngine(QObject):
         self._validation_thermal_aborts = 0
         self._transition_status("hunting")
         self._save_hunt()
-        self.log_message.emit(f"Attribution hunt over {candidates}: bisecting the live set.")
+        lead = bisect.lead_probe(self._hunt.candidates, self._hunt.loaded)
+        opening = f"core {lead[0]} alone first, then bisection of the live set" if lead else "bisecting the live set"
+        self.log_message.emit(f"Attribution hunt over {candidates}: {opening}.")
         self._run_next_hunt_slot()
 
     def _restore_hunt_stock(self) -> bool:
@@ -2703,6 +2680,7 @@ class TunerEngine(QObject):
                 base=probe_base,
                 mttf_multiplier=self._config.probe_mttf_multiplier,
                 level_multiplier=self._config.probe_level_multiplier,
+                onset_seconds=self._config.onset_failure_seconds,
             )
             duration, launches = bisect.onset_launches(
                 self._hunt,
@@ -2738,9 +2716,11 @@ class TunerEngine(QObject):
                 )
                 if done:
                     span += f"; {done} already ran clean"
-            self.log_message.emit(
-                f"Hunt probe (level {self._hunt.level}): live {live}, every other core at stock, for {span}"
-            )
+            if self._hunt.stage is bisect.Stage.LEAD:
+                probe = f"Hunt lead probe: core {live[0]} was the only live core under load, so it runs alone"
+            else:
+                probe = f"Hunt probe (level {self._hunt.level}): live {live}"
+            self.log_message.emit(f"{probe}, every other core at stock, for {span}")
         workload = self._hunt.workload or {}
         match workload.get("kind"):
             case "rapid_transition":
@@ -2860,7 +2840,7 @@ class TunerEngine(QObject):
             for culprit in state.found:
                 self._blame_core(
                     culprit,
-                    "isolated by bisection of the live offset vector",
+                    "the attribution hunt reproduced the failure with it live",
                     resident=state.vector.get(culprit),
                 )
             self._after_hunt_resume(clear_incident=True)

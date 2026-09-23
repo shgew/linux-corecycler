@@ -270,6 +270,12 @@ class TestSlotLine:
         assert "Hunt probe (level 1): cores [0, 1] live, the rest at stock" in text
         assert "1800 s" in text
 
+    def test_hunt_lead_probe_names_the_core_running_alone(self, db):
+        tab = _tab(db)
+        slot = {"cores": [3], "duration_seconds": 328, "hunt": {"stage": "lead", "level": 0, "live": [3]}}
+        tab._on_slot_started(json.dumps(slot))
+        assert "Hunt lead probe: core 3 alone, the rest at stock" in tab._slot_label.text()
+
     def test_validation_slot_names_its_stage_and_cores(self, db):
         tab = _tab(db)
         slot = {"kind": "parallel", "cores": [0, 1, 2], "validation_stage": 2, "duration_seconds": 300}

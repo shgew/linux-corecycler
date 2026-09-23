@@ -336,7 +336,12 @@ def _hunt_state_v5(hunt: dict | None) -> dict | None:
         return None
     del hunt["control_fails"]
     if hunt.get("stage") == "control":
-        hunt.update(stage="probe", armed=False, launches_done=0)
+        candidates, loaded = hunt.get("candidates"), hunt.get("loaded")
+        lead = []
+        if isinstance(candidates, list) and isinstance(loaded, list):
+            lead = [core for core in loaded if core in candidates]
+        stage = "lead" if len(lead) == 1 and len(candidates) > 1 else "probe"
+        hunt.update(stage=stage, armed=False, launches_done=0)
     hunt["version"] = 5
     return hunt
 

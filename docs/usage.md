@@ -185,35 +185,39 @@ unmapped/unselected core also pause without blaming another core.
 An unattributed crash never pauses and never guesses. Search runs the **live offset
 mask** -- every core other than the one under test sits at its own best-known offset,
 the only condition the machine actually operates in -- so being the sole core under
-load proves nothing about who crashed on its own. What does prove it is the journal:
-when the loaded core was on a search, confirmation, backoff, or annealing step and
-every other live offset had already survived, that step is the only change from a
-vector that survived, and the crash fails it directly. A crash that no kernel machine
-check, no un-survived CO journal write, and no such lone trial names starts the
-attribution hunt, replaying the workload and offset vector the slot persisted before
-it launched. A crash with no core holding a live offset is a platform fault outright
-and needs no hunt.
+load proves nothing about who crashed on its own. A crash that no kernel machine check
+and no un-survived CO journal write names starts the attribution hunt, replaying the
+workload and offset vector the slot persisted before it launched. A crash with no core
+holding a live offset is a platform fault outright and needs no hunt.
 
-1. **Group bisection over the live mask** -- half the cores keep their offsets, half
+1. **Lead probe** -- when exactly one live core was under load, it runs alone first
+   with every other core at stock. Its offset is the one the crash exercised directly,
+   so the likeliest answer costs one probe. A clean lead proves nothing about a core
+   that fails only together with a peer, so bisection then covers the whole live set,
+   the loaded core included. Validation slots loading several cores skip the lead.
+2. **Group bisection over the live mask** -- half the cores keep their offsets, half
    drop to stock. A crash means the culprit is in the live half; log2(n) probes.
    Both halves failing means two culprits, and both subtrees are pursued. A set that
    fails while both of its halves run clean fails only as a whole, so every member
    backs off one step. There is no all-stock control probe first: it cost the longest
    probe of every hunt to rule out the least likely cause, and hardware errors
    reported by a core at stock already pause the hunt.
-2. **Lone reproduction** -- a single core that reproduces the failure with every
+3. **Lone reproduction** -- a single core that reproduces the failure with every
    other core at stock is the culprit. That reproduction is the answer the hunt was
    asking for, so nothing re-runs the other cores without it.
-3. **Suspicion fallback** -- when nothing reproduces inside budget, every core that
+4. **Suspicion fallback** -- when nothing reproduces inside budget, every core that
    held a live offset accrues suspicion weighted by offset depth and by whether it
    was loaded or idle. It only acts on a two-to-one separation after at least three
    unattributed failures; a near-tie refuses to act, which is exactly where a guess
    would be worst.
 
-Probe budgets are `max(probe_base_seconds, probe_mttf_multiplier x observed
-time-to-failure)`, grown per bisection level.
-A replayed slot longer than `probe_base_seconds` (a soak) raises that base to its own
-length; a shorter one never lowers it.
+Probe budgets are `probe_mttf_multiplier x observed time-to-failure` when the
+breadcrumb timed the failure past `onset_failure_seconds`, and
+`max(probe_base_seconds, probe_mttf_multiplier x observed time)` for an onset or
+untimed failure, grown per bisection level. A freeze 82 s into its slot probes for
+328 s, not 30 minutes. For the floor case, a replayed slot longer than
+`probe_base_seconds` (a soak) raises that base to its own length; a shorter one never
+lowers it.
 The observed time comes from the micro-freeze breadcrumb, which records when its slot
 started. A failure within `onset_failure_seconds` of load starting is an onset
 failure: load starts reproduce it and wall time does not, so the probe budget is
@@ -360,6 +364,7 @@ The status is the session's flow, and the CLI exit code follows it.
 
 | Stage | Question | Outcome |
 |---|---|---|
+| `lead` | Does the one loaded live core fail alone? | A reproduction makes it the culprit; a clean run starts bisection over the whole live set |
 | `probe` | Which half of the live mask carries the culprit? | Recurses into the failing half, or into both halves when both fail. A lone core that reproduces is a culprit. A set that fails while both halves ran clean backs off every member |
 | `culprit` | -- | The core is backed off one step and its banked confidence is discarded |
 | `exhausted` | Nothing reproduced inside budget | Counts one unattributed failure for the suspicion model, which acts only on a 2:1 separation after at least three; the search step that was running records a fail |

@@ -288,19 +288,20 @@ class TestOpenGuards:
         state.update(changes)
         return json.dumps(state)
 
-    def test_v24_migration_turns_a_stock_control_into_the_first_bisection(self, tmp_path):
-        """Session 12 was 30 minutes into an all-stock control probe."""
+    @pytest.mark.parametrize(("loaded", "stage", "first"), [([3], Stage.LEAD, [3]), ([5], Stage.PROBE, [0, 1])])
+    def test_v24_migration_turns_a_stock_control_into_the_first_probe(self, tmp_path, loaded, stage, first):
+        """Session 12 was 30 minutes into an all-stock control probe with core 3 alone under load."""
         session = self._migrate_v22(
             tmp_path,
             {"max_offset": -50, "control_run_confirmations": 2},
-            self._v4_control_hunt(),
+            self._v4_control_hunt(loaded=loaded),
             version=23,
         )
 
         state = HuntState.from_json(session.hunt_state)
-        assert state.stage is Stage.PROBE
+        assert state.stage is stage
         assert (state.armed, state.launches_done, state.vector[3]) == (False, 0, -40)
-        assert bisect.next_live_set(state) == [0, 1]
+        assert bisect.next_live_set(state) == first
         assert json.loads(session.config_json) == {"max_offset": -50}
 
     def test_v24_migration_keeps_an_open_bisection_as_it_was(self, tmp_path):

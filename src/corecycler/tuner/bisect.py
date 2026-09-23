@@ -15,6 +15,11 @@ There is no stock control probe. A crash with every core at stock is already
 recognised without one (no core held a live offset), and asking it of every
 hunt spent the longest probe on the least likely answer.
 
+When exactly one live core was under load, that core runs alone first. It is
+the only core whose offset the crash exercised directly, so the likeliest
+answer costs one probe; a clean lead proves nothing about a conjunction, so
+bisection then covers the whole live set, the loaded core included.
+
 A single core reaches the end of bisection only by reproducing the failure
 with every other core at stock. That is the whole question the hunt asks, so
 the core is convicted there; re-running everyone else without it would only
@@ -39,6 +44,8 @@ from corecycler.tuner import regime
 
 
 class Stage(StrEnum):
+    #: Probing the one loaded live core alone before any bisection.
+    LEAD = "lead"
     #: Halving the live set to find which half carries the culprit.
     PROBE = "probe"
     #: A culprit was confirmed.
@@ -51,6 +58,12 @@ def split(candidates: list[int]) -> tuple[list[int], list[int]]:
     """Halve a candidate set, larger half first so odd sets shrink fastest."""
     mid = (len(candidates) + 1) // 2
     return candidates[:mid], candidates[mid:]
+
+
+def lead_probe(candidates: list[int], loaded: list[int]) -> list[int]:
+    """The loaded core to probe alone first, when exactly one live core was under load."""
+    lead = [core for core in loaded if core in candidates]
+    return lead if len(lead) == 1 and len(candidates) > 1 else []
 
 
 _STATE_VERSION = 5
@@ -155,10 +168,13 @@ class HuntState:
     @property
     def started(self) -> bool:
         """Whether any probe was dispatched or answered; until then this is only crash context."""
+        if self.stage is Stage.LEAD:
+            return bool(self.in_flight)
         return (
             self.stage is not Stage.PROBE
             or self.pending != [self.candidates]
             or bool(self.in_flight or self.queue or self.parent or self.found or self.no_reproduce)
+            or bool(lead_probe(self.candidates, self.loaded))
         )
 
     def to_json(self) -> str:
@@ -304,6 +320,22 @@ def _validate_state(state: HuntState) -> None:
     if state.launches_done and not in_flight:
         raise _invalid("launch progress requires an unanswered probe")
 
+    if state.stage is Stage.LEAD:
+        lead = lead_probe(candidates, state.loaded)
+        if (
+            not lead
+            or pending != [candidates]
+            or in_flight not in ([], lead)
+            or queue
+            or guilty
+            or parent
+            or found
+            or state.level
+            or state.no_reproduce
+        ):
+            raise _invalid("lead stage probes only the one loaded live core, before any bisection")
+        return
+
     if state.stage is Stage.PROBE:
         if len(queue) > 2 or len(guilty) > 2:
             raise _invalid("probe stage has too many split sets")
@@ -344,7 +376,7 @@ def begin(candidates: list[int], loaded: list[int], *, observed_failure_time: fl
     universe = _core_set(sorted(candidates), "candidates", empty=False)
     loaded_set = _core_set(sorted(loaded), "loaded", empty=False)
     state = HuntState(
-        stage=Stage.PROBE,
+        stage=Stage.LEAD if lead_probe(universe, loaded_set) else Stage.PROBE,
         candidates=universe,
         pending=[list(universe)],
         observed_failure_time=_duration(observed_failure_time, "observed_failure_time"),
@@ -363,6 +395,9 @@ def next_live_set(state: HuntState) -> list[int] | None:
     if state.stage in (Stage.CULPRIT, Stage.EXHAUSTED):
         return None
     if state.in_flight:
+        return list(state.in_flight)
+    if state.stage is Stage.LEAD:
+        state.in_flight = lead_probe(state.candidates, state.loaded)
         return list(state.in_flight)
     if state.queue:
         state.in_flight = state.queue.pop(0)
@@ -390,6 +425,13 @@ def record(state: HuntState, *, reproduced: bool, max_no_reproduce: int) -> Hunt
     state.launches_done = 0
     probe = list(state.in_flight)
     state.in_flight = []
+    if state.stage is Stage.LEAD:
+        state.stage = Stage.PROBE
+        if reproduced:
+            state.pending = []
+            state.found = probe
+            state.stage = Stage.CULPRIT
+        return state
     if probe == state.parent:
         return _record_whole_set(state, reproduced=reproduced)
     if reproduced:
@@ -441,13 +483,20 @@ def probe_seconds(
     base: int,
     mttf_multiplier: float,
     level_multiplier: float,
+    onset_seconds: int,
 ) -> int:
     """How long this probe runs before a survival counts as clean.
 
-    A false clean near the leaves throws away the whole answer, so the budget
-    grows with depth.
+    A failure timed past ``onset_seconds`` sets its own budget: ``base`` above
+    ``mttf_multiplier`` times that time only re-asks an answered question for
+    longer. An onset or untimed failure keeps ``base`` as its floor, because
+    load starts, not wall time, reproduce it. A false clean near the leaves
+    throws away the whole answer, so the budget grows with depth.
     """
-    budget = max(float(base), state.observed_failure_time * mttf_multiplier)
+    observed = state.observed_failure_time
+    budget = observed * mttf_multiplier
+    if observed <= onset_seconds:
+        budget = max(float(base), budget)
     budget *= level_multiplier**state.level
     return max(1, int(budget))
 

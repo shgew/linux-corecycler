@@ -374,6 +374,7 @@ class TestWorkloadSelection:
             base=max(1200, eng._config.probe_base_seconds),
             mttf_multiplier=eng._config.probe_mttf_multiplier,
             level_multiplier=eng._config.probe_level_multiplier,
+            onset_seconds=eng._config.onset_failure_seconds,
         )
         assert eng._worker_profile == "spectrum"
 

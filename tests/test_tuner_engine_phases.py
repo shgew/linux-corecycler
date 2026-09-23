@@ -333,12 +333,20 @@ class TestValidationSoak:
         assert engine.status == "profile_quarantined"
 
 
+def _past_lead(state: bisect.HuntState) -> bisect.HuntState:
+    """Answer a hunt's lead probe clean, leaving it at its first bisection."""
+    if state.stage is bisect.Stage.LEAD:
+        bisect.next_live_set(state)
+        bisect.record(state, reproduced=False, max_no_reproduce=1)
+    return state
+
+
 class TestHuntSlots:
     def _hunting(self, engine):
         candidates = sorted(engine._core_states)
         for cid in candidates:
             _confirm(engine, cid, -20)
-        engine._hunt = bisect.begin(candidates, loaded=[0])
+        engine._hunt = _past_lead(bisect.begin(candidates, loaded=[0]))
         engine._hunt.vector = dict.fromkeys(candidates, -20)
         engine._hunt.workload = {
             "regime": "current",
@@ -436,7 +444,7 @@ class TestApparatusFault:
     def test_a_fault_during_a_hunt_requeues_the_probe(self, engine, monkeypatch):
         for cid in engine._core_states:
             _confirm(engine, cid, -20)
-        state = bisect.begin(sorted(engine._core_states), loaded=[0])
+        state = _past_lead(bisect.begin(sorted(engine._core_states), loaded=[0]))
         in_flight = bisect.next_live_set(state)
         engine._hunt = state
         engine._hunting = True
@@ -1480,7 +1488,7 @@ class TestHuntDecisions:
         candidates = sorted(engine._core_states)
         for core_id in candidates:
             _confirm(engine, core_id, -20)
-        state = bisect.begin(candidates, loaded=[0])
+        state = _past_lead(bisect.begin(candidates, loaded=[0]))
         first = bisect.next_live_set(state)
         engine._hunt = state
         engine._hunting = True
@@ -1524,7 +1532,7 @@ class TestHuntDecisions:
         assert persisted.no_reproduce == engine._config.max_unattributed_crash_hunts
 
     def test_a_consumed_probe_state_becomes_an_exhausted_verdict(self, engine):
-        state = bisect.begin([0, 1], loaded=[0])
+        state = _past_lead(bisect.begin([0, 1], loaded=[0]))
         state.pending.clear()
 
         assert bisect.next_live_set(state) is None
@@ -1782,7 +1790,7 @@ class TestRemainingHuntCoverage:
             cs = _confirm(engine, core_id, -20)
             cs.in_test = True
             engine._db.upsert_tuner_core_state(sid, cs)
-        state = bisect.begin(sorted(engine._core_states), loaded=[0])
+        state = _past_lead(bisect.begin(sorted(engine._core_states), loaded=[0]))
         failed_live = bisect.next_live_set(state)
         state.vector = dict.fromkeys(engine._core_states, -20)
         state.workload = {"regime": "current", "backend": "mprime", "stress_mode": "avx2", "fft_preset": "small"}
@@ -1885,7 +1893,7 @@ class TestEngineSafetyReviewRegressions:
         sid = engine._session_id
         for core_id in engine._core_states:
             _confirm(engine, core_id, -20)
-        state = bisect.begin(sorted(engine._core_states), loaded=[0])
+        state = _past_lead(bisect.begin(sorted(engine._core_states), loaded=[0]))
         bisect.next_live_set(state)
         state.vector = dict.fromkeys(engine._core_states, -20)
         state.workload = {
@@ -2134,7 +2142,7 @@ class TestStartAndResumeGuards:
         run_next.assert_called_once_with()
 
     def test_hardware_evidence_on_a_live_core_reproduces_the_incident(self, engine, monkeypatch):
-        engine._hunt = bisect.begin(sorted(engine._core_states), [0])
+        engine._hunt = _past_lead(bisect.begin(sorted(engine._core_states), [0]))
         bisect.next_live_set(engine._hunt)
         engine._hunt.vector = dict.fromkeys(engine._core_states, -20)
         engine._hunting = True

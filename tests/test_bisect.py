@@ -25,7 +25,7 @@ def run_hunt(
 
     ``together`` is a set that fails only when every member is live at once.
     """
-    state = bisect.begin(candidates, [candidates[0]])
+    state = bisect.begin(candidates, [max(candidates) + 1])
     probes = 0
     while probes < cap:
         live = bisect.next_live_set(state)
@@ -43,7 +43,7 @@ def run_hunt(
 
 
 def _state_at(stage: Stage) -> HuntState:
-    state = bisect.begin([0, 1, 2, 3], [0])
+    state = bisect.begin([0, 1, 2, 3], [9])
     if stage is Stage.CULPRIT:
         state.pending = [[0]]
         bisect.next_live_set(state)
@@ -54,23 +54,67 @@ def _state_at(stage: Stage) -> HuntState:
 
 
 class TestCrashContext:
-    def test_the_first_probe_is_the_larger_half_of_the_live_set(self):
-        state = bisect.begin([0, 1, 2, 3, 4], [4])
+    @pytest.mark.parametrize("loaded", [[0, 1], [5]])
+    def test_without_one_loaded_live_core_the_first_probe_is_the_larger_half(self, loaded):
+        state = bisect.begin([0, 1, 2, 3, 4], loaded)
         assert bisect.next_live_set(state) == [0, 1, 2]
 
     def test_a_hunt_that_has_asked_nothing_is_only_crash_context(self):
-        state = bisect.begin([0, 1, 2, 3], [3])
+        state = bisect.begin([0, 1, 2, 3], [5])
         assert state.started is False
         bisect.next_live_set(state)
         assert state.started is True
 
     def test_a_hunt_back_on_its_whole_set_after_clean_halves_has_started(self):
-        state = bisect.begin([0, 1], [0])
+        state = bisect.begin([0, 1], [5])
         for _ in range(2):
             bisect.next_live_set(state)
             bisect.record(state, reproduced=False, max_no_reproduce=5)
         assert state.pending == [[0, 1]]
         assert state.started is True
+
+
+class TestLeadProbe:
+    """Session 12: core 3 was the only core under load, and asking it alone answers in one probe."""
+
+    def test_the_one_loaded_live_core_is_probed_alone_first(self):
+        state = bisect.begin([0, 1, 2, 3], [3])
+        assert state.started is False
+        assert bisect.next_live_set(state) == [3]
+        assert state.started is True
+
+    def test_a_loaded_core_that_reproduces_alone_is_the_culprit(self):
+        state = bisect.begin([0, 1, 2, 3], [3])
+        bisect.next_live_set(state)
+        bisect.record(state, reproduced=True, max_no_reproduce=2)
+        assert bisect.next_live_set(state) is None
+        assert (state.stage, state.found) == (Stage.CULPRIT, [3])
+
+    def test_a_clean_lead_bisects_the_whole_live_set_including_the_loaded_core(self):
+        state = bisect.begin([0, 1, 2, 3], [3])
+        bisect.next_live_set(state)
+        bisect.record(state, reproduced=False, max_no_reproduce=2)
+        assert state.started is True
+        assert bisect.next_live_set(state) == [0, 1]
+        assert state.queue == [[2, 3]]
+
+    def test_a_loaded_core_that_fails_only_with_a_peer_is_still_found(self):
+        state = bisect.begin([0, 1, 2, 3], [3])
+        while (live := bisect.next_live_set(state)) is not None:
+            bisect.record(state, reproduced={2, 3} <= set(live), max_no_reproduce=2)
+        assert (state.stage, state.found) == (Stage.CULPRIT, [2, 3])
+
+    def test_an_unanswered_lead_survives_a_round_trip(self):
+        state = bisect.begin([0, 1, 2, 3], [3])
+        bisect.next_live_set(state)
+        restored = HuntState.from_json(state.to_json())
+        assert (restored.stage, bisect.next_live_set(restored)) == (Stage.LEAD, [3])
+
+    def test_a_lead_on_any_other_core_is_rejected(self):
+        state = bisect.begin([0, 1, 2, 3], [3])
+        state.in_flight = [2]
+        with pytest.raises(InvalidHuntState):
+            HuntState.from_json(state.to_json())
 
 
 class TestIsolation:
@@ -92,7 +136,7 @@ class TestIsolation:
         assert state.pending == []
 
     def test_exhaustion_preserves_an_already_confirmed_culprit(self):
-        state = bisect.begin([0, 1, 2], [0])
+        state = bisect.begin([0, 1, 2], [9])
         state.stage = Stage.PROBE
         state.found = [0]
         state.pending = [[1, 2]]
@@ -117,7 +161,7 @@ class TestIsolation:
     def test_a_core_that_reproduced_alone_is_convicted_without_a_leave_one_out_probe(self):
         """Session 12: core 3 killed the machine with every other core at stock,
         then the hunt queued 131 launches of the other three without it."""
-        state = bisect.begin([0, 1, 2, 3], [3])
+        state = bisect.begin([0, 1, 2, 3], [9])
         probes = []
         while (live := bisect.next_live_set(state)) is not None and len(probes) < 10:
             probes.append(live)
@@ -129,7 +173,7 @@ class TestIsolation:
 
     def test_an_unanswered_probe_is_replayed_before_the_queue_moves_on(self):
         """A shutdown mid-probe must not skip to the other half, as the 09:26 pause skipped [0, 1]."""
-        state = bisect.begin([0, 1, 2, 3], [3])
+        state = bisect.begin([0, 1, 2, 3], [9])
         first = bisect.next_live_set(state)
 
         restored = HuntState.from_json(state.to_json())
@@ -162,7 +206,7 @@ class TestNonReproduction:
 
     def test_a_retried_set_is_not_split_further(self):
         """Neither half reproducing means splitting again would invent facts."""
-        state = bisect.begin([0, 1, 2, 3], [0])
+        state = bisect.begin([0, 1, 2, 3], [9])
         bisect.next_live_set(state)
         bisect.record(state, reproduced=False, max_no_reproduce=5)
         bisect.next_live_set(state)
@@ -183,7 +227,7 @@ class TestConjunction:
         assert state.found == [0, 1, 2, 3]
 
     def test_the_whole_set_is_rechecked_only_once_halves_are_out_of_retries(self):
-        state = bisect.begin([0, 1], [0])
+        state = bisect.begin([0, 1], [9])
         seen = []
         while (live := bisect.next_live_set(state)) is not None:
             seen.append(live)
@@ -192,7 +236,7 @@ class TestConjunction:
         assert state.found == [0, 1]
 
     def test_a_whole_set_that_no_longer_reproduces_exhausts(self):
-        state = bisect.begin([0, 1], [0])
+        state = bisect.begin([0, 1], [9])
         assert bisect.next_live_set(state) == [0]
         bisect.record(state, reproduced=False, max_no_reproduce=1)
         assert bisect.next_live_set(state) == [1]
@@ -211,25 +255,26 @@ class TestConjunction:
 
 
 class TestBudget:
+    kw = {"base": 1800, "mttf_multiplier": 4.0, "level_multiplier": 1.5, "onset_seconds": 60}
+
     def test_budget_grows_with_depth(self):
         shallow = HuntState(stage=Stage.PROBE, level=1, observed_failure_time=0.0)
         deep = HuntState(stage=Stage.PROBE, level=3, observed_failure_time=0.0)
-        kw = {
-            "base": 1800,
-            "mttf_multiplier": 4.0,
-            "level_multiplier": 1.5,
-        }
-        assert bisect.probe_seconds(deep, **kw) > bisect.probe_seconds(shallow, **kw)
+        assert bisect.probe_seconds(deep, **self.kw) > bisect.probe_seconds(shallow, **self.kw)
 
-    def test_a_fast_failure_still_gets_the_floor(self):
-        state = HuntState(stage=Stage.PROBE, observed_failure_time=5.0)
-        seconds = bisect.probe_seconds(state, base=1800, mttf_multiplier=4.0, level_multiplier=1.5)
-        assert seconds == 1800
+    @pytest.mark.parametrize("observed", [0.0, 5.0, 60.0])
+    def test_an_untimed_or_onset_failure_keeps_the_floor(self, observed):
+        state = HuntState(stage=Stage.PROBE, observed_failure_time=observed)
+        assert bisect.probe_seconds(state, **self.kw) == 1800
+
+    def test_a_timed_failure_sets_its_own_budget_below_the_floor(self):
+        """Session 12 froze 82 s into its slot and the hunt still probed for 45 minutes."""
+        state = HuntState(stage=Stage.PROBE, level=1, observed_failure_time=82.0)
+        assert bisect.probe_seconds(state, **self.kw) == 492
 
     def test_a_slow_failure_stretches_the_budget(self):
         state = HuntState(stage=Stage.PROBE, observed_failure_time=900.0)
-        seconds = bisect.probe_seconds(state, base=1800, mttf_multiplier=4.0, level_multiplier=1.5)
-        assert seconds == 3600
+        assert bisect.probe_seconds(state, **self.kw) == 3600
 
 
 class TestOnsetLaunches:
@@ -271,7 +316,7 @@ class TestPersistence:
         assert restored == state
 
     def test_armed_probe_evidence_survives_a_round_trip(self):
-        state = bisect.begin([0, 1], [0])
+        state = bisect.begin([0, 1], [9])
         bisect.next_live_set(state)
         state.armed = True
         state.vector = {0: -20, 1: 0}
@@ -289,7 +334,7 @@ class TestPersistence:
         assert restored.observed_failure_time == 0.0
 
     def test_observed_failure_time_survives_a_round_trip(self):
-        state = bisect.begin([0, 1], [0], observed_failure_time=123.5)
+        state = bisect.begin([0, 1], [9], observed_failure_time=123.5)
 
         restored = HuntState.from_json(state.to_json())
 
@@ -405,7 +450,7 @@ class TestPersistence:
             state.to_json()
 
     def test_active_and_resolved_partition_cannot_overlap(self):
-        state = bisect.begin([0, 1, 2, 3], [0])
+        state = bisect.begin([0, 1, 2, 3], [9])
         assert bisect.next_live_set(state) == [0, 1]
         raw = json.loads(state.to_json())
         raw["found"] = [0]
@@ -414,7 +459,7 @@ class TestPersistence:
             HuntState.from_json(json.dumps(raw))
 
     def test_split_level_is_bounded_by_candidate_universe(self):
-        raw = json.loads(bisect.begin([0, 1], [0]).to_json())
+        raw = json.loads(bisect.begin([0, 1], [9]).to_json())
         raw.update(stage="probe", level=3)
 
         with pytest.raises(InvalidHuntState, match="split depth"):
@@ -462,7 +507,7 @@ class TestPersistence:
 
     def test_fresh_process_resume_matches_uninterrupted_search(self):
         uninterrupted, _ = run_hunt(list(range(8)), {6})
-        state = bisect.begin(list(range(8)), [0])
+        state = bisect.begin(list(range(8)), [8])
         stages = set()
         requeued = False
 

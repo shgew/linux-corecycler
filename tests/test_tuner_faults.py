@@ -27,6 +27,7 @@ from hypothesis import strategies as st
 
 from corecycler import __version__
 from corecycler.engine.backends.base import FFTPreset, StressBackend, StressConfig, StressMode
+from corecycler.engine.detector import MCEEvent
 from corecycler.engine.execution import ThermalWatch
 from corecycler.engine.scheduler import CoreScheduler, SchedulerConfig
 from corecycler.history.db import HistoryDB
@@ -648,12 +649,14 @@ class TestUnstableBaselineEscapes:
 
 
 # ---------------------------------------------------------------------------
-# T3: repeated crash-resumes open the stock-control attribution hunt
+# T3: repeated convicted crash-resumes open the attribution hunt
 # ---------------------------------------------------------------------------
 
 
 class TestResumeCrashCircuitBreaker:
-    def test_threshold_starts_a_hunt_instead_of_dead_ending(self, db, topo, smu, mock_backend):
+    def test_threshold_starts_a_hunt_instead_of_dead_ending(self, db, topo, smu, mock_backend, monkeypatch):
+        event = MCEEvent(timestamp=0, cpu=0, bank=0, message="hardware error", corrected=False)
+        monkeypatch.setattr(engine_mod, "harvest_kernel_mce", lambda *_a, **_kw: ([event], True))
         cfg = TunerConfig(
             cores_to_test=[0, 1],
             resume_crash_quarantine_threshold=1,
@@ -691,6 +694,7 @@ class TestResumeCrashCircuitBreaker:
         )
 
         session = db.get_tuner_session(sid)
+        assert eng._core_states[0].crash_count == 1
         assert eng.status == "hunting"
         assert HuntState.from_json(session.hunt_state).in_flight == [0]
         assert (smu.applied[0], smu.applied[1]) == (-10, 0)
@@ -1758,8 +1762,6 @@ class TestRebootGate:
         assert db.get_resume_crash_streak(sid) == crashes
 
     def test_forensic_cutoff_survives_resume_evidence_repairs(self, db, topo, smu, mock_backend):
-        from corecycler.engine.detector import MCEEvent
-
         old = "2026-01-01T00:00:00+00:00"
         with patch.object(db, "_now_iso", return_value=old):
             sid = db.create_tuner_session(TunerConfig(cores_to_test=[0]).to_json(), "", "")
@@ -2393,7 +2395,7 @@ class TestUnattributedIncidentOnResume:
         assert eng.status == "hunting"
         assert session.hunt_state
         assert db.get_unattributed_crashes(sid) == 0
-        assert smu.applied == {core: -10 if core == 0 else 0 for core in topo.cores}
+        assert smu.applied == {core: -12 if core == 1 else 0 for core in topo.cores}
 
     def test_clean_reboot_mid_validation_is_not_an_incident(self, db, topo, smu, mock_backend, monkeypatch):
         monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda timeout=15.0, **kwargs: True)
