@@ -343,7 +343,7 @@ def drive_validation(db, topo, backend, cliffs, agg_margin, cfg_kw, cap=8000, ab
                 )
                 eng._on_test_finished(core, ok, "", "" if ok else "agg", 1.0, 0.0)
             vector = tuple((c, cs.best_offset) for c, cs in sorted(eng._core_states.items()))
-            settled_for = settled_for + 1 if vector == last_vector else 0
+            settled_for = settled_for + 1 if vector == last_vector and eng._hunt is None else 0
             last_vector = vector
     return eng, steps
 

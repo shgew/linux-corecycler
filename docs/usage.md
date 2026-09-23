@@ -207,6 +207,8 @@ un-survived CO journal write names starts the attribution hunt:
 
 Probe budgets are `max(probe_base_seconds, probe_mttf_multiplier x observed
 time-to-failure)`, grown per bisection level and again for the final confirmation.
+A replayed slot longer than `probe_base_seconds` (a soak) raises that base to its own
+length; a shorter one never lowers it.
 The observed time comes from the micro-freeze breadcrumb, which records when its slot
 started. A failure within `onset_failure_seconds` of load starting is an onset
 failure: load starts reproduce it and wall time does not, so the probe budget is

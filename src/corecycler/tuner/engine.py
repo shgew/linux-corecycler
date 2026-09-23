@@ -2662,11 +2662,11 @@ class TunerEngine(QObject):
                 self._resolve_hunt()
                 return
             replay_duration = (self._hunt.workload or {}).get("duration_seconds")
-            probe_base = (
-                replay_duration
-                if type(replay_duration) is int and replay_duration > 0
-                else self._config.probe_base_seconds
-            )
+            # A replay longer than the floor (a soak) keeps its length; a short
+            # search slot is still the same experiment, just run for longer.
+            probe_base = self._config.probe_base_seconds
+            if type(replay_duration) is int and replay_duration > probe_base:
+                probe_base = replay_duration
             budget = bisect.probe_seconds(
                 self._hunt,
                 base=probe_base,

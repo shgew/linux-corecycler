@@ -28,6 +28,9 @@ packaged as a NixOS module with an overlay. Forked from
   is stopped) is requeued and every core goes back to stock before the pause. It used to
   drop the probe, so resume skipped half of a bisection, and it left the other live cores
   at their offsets while idle.
+- `probe_base_seconds` is a floor again. Replaying the crashed slot had replaced it with
+  that slot's length, so a hunt after a 60s search step probed for 75s and 112s and could
+  clear a pair on two load starts. A replay longer than the floor still keeps its length.
 
 ### Fixed (2026-09-23 review of the fork's own changes)
 

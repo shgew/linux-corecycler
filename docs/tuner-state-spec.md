@@ -169,7 +169,9 @@ validation resets the unattributed-failure count.
 The persisted hunt workload records the concrete worker kind (`solo`,
 `parallel`, `rapid_transition`, or `soak`), duration, backend, stress mode,
 FFT preset, threads, profile, and test list. Resume therefore replays the same
-experiment instead of reconstructing or substituting a workload.
+experiment instead of reconstructing or substituting a workload. The recorded
+duration only lengthens a probe: its budget base is the larger of that duration
+and `probe_base_seconds`, so a short search slot never shortens attribution.
 
 A stability ambiguity never pauses the crash-attribution engine and never
 causes a guessed penalty: it becomes another hunt probe. This path pauses only

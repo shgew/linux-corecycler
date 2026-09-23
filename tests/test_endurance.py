@@ -369,7 +369,7 @@ class TestWorkloadSelection:
         assert worker.scheduler.stress_config.fft_preset is FFTPreset.LARGE
         assert worker.scheduler.stress_config.threads == 1
         assert worker.scheduler.config.variable_load is True
-        assert worker.scheduler.config.seconds_per_core == 1200
+        assert worker.scheduler.config.seconds_per_core == max(1200, eng._config.probe_base_seconds)
         assert eng._worker_profile == "spectrum"
 
     def test_transient_slot_reaches_the_scheduler_as_a_duty_cycled_workload(

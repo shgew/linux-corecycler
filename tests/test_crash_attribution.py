@@ -591,6 +591,35 @@ class TestOnsetHunt:
         assert set(eng.launches[:control_launches]) == {32}
         assert eng._hunt.stage is bisect.Stage.PROBE
 
+    @staticmethod
+    def _replaying(eng, *, duration: int, observed: float) -> None:
+        state = bisect.begin(sorted(BEST), [5], observed_failure_time=observed)
+        state.vector = dict(BEST)
+        state.workload = {**eng._workload_snapshot(eng._core_states[5]), "kind": "solo", "duration_seconds": duration}
+        eng._hunt = state
+        eng._hunting = True
+        eng._run_next_hunt_slot()
+
+    def test_a_short_replayed_slot_still_gets_the_probe_floor(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
+        """Session 12's hunt replayed a 75s search slot, so its probes lasted 75s
+        and 112s and a pair could be cleared on two load starts."""
+        eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
+        self._replaying(eng, duration=75, observed=8.0)
+        control_launches = 1
+        while eng._hunt.stage is bisect.Stage.CONTROL:
+            self._launch(eng, True)
+            control_launches += 1
+
+        assert control_launches - 1 == -(-eng._config.probe_base_seconds // 32)
+
+    def test_a_replayed_slot_longer_than_the_floor_keeps_its_length(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
+        self._replaying(eng, duration=3600, observed=0.0)
+
+        assert eng.launches == [3600]
+
     def test_a_failing_launch_answers_the_probe_at_once(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
         eng = self._engine(db, topo_dual_ccd_x3d, mock_backend, monkeypatch)
         eng._start_hunt(observed_mttf=8.0, loaded=[5])
