@@ -109,7 +109,10 @@ class TestCaptureSystemContext:
             boost_limit_mhz=200,
         )
 
-    def test_optional_smu_values_may_be_unavailable(self, tmp_path):
+    def test_optional_smu_values_may_be_unavailable(self, tmp_path, monkeypatch):
+        import corecycler.smu.pmtable as pmtable_mod
+
+        monkeypatch.setattr(pmtable_mod, "read_power_limits", lambda: (None, None, None))
         smu = MagicMock()
         smu.get_all_co_offsets.return_value = {0: -30}
         smu.get_pbo_scalar.side_effect = OSError
