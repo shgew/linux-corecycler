@@ -83,6 +83,18 @@ def test_periodic_breadcrumb_contains_context_and_worst_latency(
     assert "worst_latency_ms=1001.000" in content
 
 
+def test_breadcrumb_records_when_its_slot_started(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A freeze's timing relative to load start is the one fact a reboot
+    cannot erase if the breadcrumb carries it."""
+    path = tmp_path / "microfreeze.breadcrumb"
+    monitor = MicroFreezeMonitor(path)
+
+    _run_with_latencies(monitor, monkeypatch, [1.001])
+
+    fields = dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines())
+    assert fields["started"] == monitor.started_at.isoformat()
+
+
 def test_breadcrumb_write_error_is_logged_and_swallowed(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

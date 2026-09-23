@@ -473,7 +473,9 @@ class TestCrashHunt:
     ):
         """Session 12: core 3 advanced from -40 to -41 after 3 freezes and 1 pass,
         because an exhausted hunt left the step unanswered."""
-        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1, suspicion_min_failures=99)
+        eng = _make_engine(
+            db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1, suspicion_min_failures=99
+        )
         _seed_confirmed_validating(eng, db, BEST, BASELINES)
         searching = eng._core_states[3]
         searching.phase = TunerPhase.COARSE_SEARCH
@@ -491,7 +493,9 @@ class TestCrashHunt:
         assert all(cs.current_offset == BEST[c] for c, cs in eng._core_states.items() if c != 3)
 
     def test_exhausted_hunts_feed_the_suspicion_fallback(self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch):
-        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1, suspicion_min_failures=1)
+        eng = _make_engine(
+            db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1, suspicion_min_failures=1
+        )
         _seed_confirmed_validating(eng, db, BEST, BASELINES)
         eng._core_states[7].suspicion = 1000.0
         monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
@@ -506,7 +510,9 @@ class TestCrashHunt:
     def test_search_incidents_do_not_pre_trip_the_validation_breaker(
         self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
     ):
-        eng = _make_engine(db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1, suspicion_min_failures=99)
+        eng = _make_engine(
+            db, topo_dual_ccd_x3d, mock_backend, max_unattributed_crash_hunts=1, suspicion_min_failures=99
+        )
         _seed_confirmed_validating(eng, db, BEST, BASELINES)
         monkeypatch.setattr("corecycler.tuner.engine.QTimer.singleShot", lambda *_: None)
         eng._start_worker = lambda *a, **k: None
@@ -755,7 +761,7 @@ class TestResumeHuntAttribution:
         engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
         session = _seed_confirmed_validating(engine, db, BEST, BASELINES)
         engine._forensics = lambda *_a, **_kw: ([], True)
-        engine._read_breadcrumb = lambda: "mprime AVX2 large"
+        engine._read_breadcrumb = lambda: ("mprime AVX2 large", None)
         messages = []
         engine.log_message.connect(messages.append)
 
@@ -764,6 +770,26 @@ class TestResumeHuntAttribution:
         assert crashed == []
         assert pending_hunt is True
         assert any("mprime AVX2 large" in message for message in messages)
+
+    def test_the_hunt_inherits_the_freeze_time_the_breadcrumb_measured(
+        self, db, topo_dual_ccd_x3d, mock_backend, monkeypatch
+    ):
+        import corecycler.tuner.engine as engine_mod
+
+        engine = _make_engine(db, topo_dual_ccd_x3d, mock_backend)
+        _seed_confirmed_validating(engine, db, BEST, BASELINES)
+        engine._forensics = lambda *_a, **_kw: ([], True)
+        engine._read_breadcrumb = lambda: ("core 5 at -30 (sustained, current), about 8s into the slot", 8.0)
+        monkeypatch.setattr(engine_mod, "_rebooted_since", lambda *_a, **_kw: True)
+        monkeypatch.setattr(engine_mod, "last_boot_ended_cleanly", lambda *_a, **_kw: False)
+        monkeypatch.setattr(engine_mod.QTimer, "singleShot", lambda *_a: None)
+        engine._start_worker = lambda *a, **k: None
+        engine._start_multi_core_worker = lambda *a, **k: None
+
+        engine.resume(engine._session_id)
+
+        assert engine._hunt is not None
+        assert engine._hunt.observed_failure_time == 8.0
 
     def test_a_journal_suspect_already_attributed_is_not_penalized_twice(self, db, topo_single_ccd, mock_backend):
         engine = _make_engine(db, topo_single_ccd, mock_backend)

@@ -39,6 +39,7 @@ class MicroFreezeMonitor:
         self.threshold_ms = threshold_ms
         self.cpu = cpu
         self.breadcrumb_path = breadcrumb_path
+        self.started_at = datetime.now(UTC)
         self._context = ""
         self._hitches: deque[Hitch] = deque(maxlen=_MAX_WINDOW_SAMPLES)
         self._lock = threading.Lock()
@@ -113,7 +114,10 @@ class MicroFreezeMonitor:
         with self._lock:
             context = self._context
             worst_ms = max((hitch.latency_ms for hitch in self._hitches), default=0.0)
-        content = f"timestamp={datetime.now(UTC).isoformat()}\ncontext={context}\nworst_latency_ms={worst_ms:.3f}\n"
+        content = (
+            f"timestamp={datetime.now(UTC).isoformat()}\ncontext={context}\nworst_latency_ms={worst_ms:.3f}\n"
+            f"started={self.started_at.isoformat()}\n"
+        )
         try:
             atomic_write(self.breadcrumb_path, content, durable=True)
         except OSError as exc:

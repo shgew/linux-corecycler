@@ -2149,9 +2149,9 @@ class TestMicroFreezeLifecycle:
             eng._freeze_context("core 0 transient at -12")
             eng._start_freeze_monitor()
             eng._freeze._write_breadcrumb()
-            assert eng._read_breadcrumb() == (
-                "core 0 transient at -12 (worst scheduling hitch 0.000ms in the minute before the freeze)"
-            )
+            text, seconds = eng._read_breadcrumb()
+            assert text.startswith("core 0 transient at -12, about 0s into the slot (worst scheduling hitch 0.000ms")
+            assert seconds is not None and 0.0 <= seconds < 5.0
             eng._freeze.stop = MagicMock(return_value=True)
             eng._stop_freeze_monitor()
 
@@ -2173,7 +2173,7 @@ class TestMicroFreezeLifecycle:
     def test_unreadable_breadcrumb_has_no_crash_context(self, db, simple_topology, mock_smu, mock_backend, tmp_path):
         eng = self._engine(db, simple_topology, mock_smu, mock_backend)
         with patch.object(eng, "_breadcrumb_path", return_value=tmp_path / "missing.txt"):
-            assert eng._read_breadcrumb() == ""
+            assert eng._read_breadcrumb() == ("", None)
 
     def test_a_breadcrumb_written_before_any_slot_names_nothing(
         self, db, simple_topology, mock_smu, mock_backend, tmp_path
@@ -2185,7 +2185,40 @@ class TestMicroFreezeLifecycle:
         breadcrumb.write_text("context=\nworst_latency_ms=41.250\n")
         eng = self._engine(db, simple_topology, mock_smu, mock_backend)
         with patch.object(eng, "_breadcrumb_path", return_value=breadcrumb):
-            assert eng._read_breadcrumb() == ""
+            assert eng._read_breadcrumb() == ("", None)
+
+    def test_a_breadcrumb_times_the_freeze_from_its_slot_start(
+        self, db, simple_topology, mock_smu, mock_backend, tmp_path
+    ):
+        """Session 12's freezes landed seconds after each launch; the breadcrumb
+        said 'sustained' and threw the timestamp away."""
+        breadcrumb = tmp_path / "microfreeze.txt"
+        breadcrumb.write_text(
+            "timestamp=2026-09-23T01:36:39.800000+00:00\n"
+            "context=core 1 at -36 (sustained, current)\n"
+            "worst_latency_ms=0.000\n"
+            "started=2026-09-23T01:36:31.400000+00:00\n"
+        )
+        eng = self._engine(db, simple_topology, mock_smu, mock_backend)
+        with patch.object(eng, "_breadcrumb_path", return_value=breadcrumb):
+            text, seconds = eng._read_breadcrumb()
+        assert seconds == pytest.approx(8.4)
+        assert "core 1 at -36 (sustained, current), about 8s into the slot" in text
+
+    @pytest.mark.parametrize("started", ["", "started=not-a-time\n", "started=2026-09-23T01:37:00+00:00\n"])
+    def test_an_untimeable_breadcrumb_keeps_its_context_without_a_time(
+        self, db, simple_topology, mock_smu, mock_backend, tmp_path, started
+    ):
+        breadcrumb = tmp_path / "microfreeze.txt"
+        breadcrumb.write_text(
+            f"timestamp=2026-09-23T01:36:39+00:00\ncontext=core 1 at -36\nworst_latency_ms=0.000\n{started}"
+        )
+        eng = self._engine(db, simple_topology, mock_smu, mock_backend)
+        with patch.object(eng, "_breadcrumb_path", return_value=breadcrumb):
+            assert eng._read_breadcrumb() == (
+                "core 1 at -36 (worst scheduling hitch 0.000ms in the minute before the freeze)",
+                None,
+            )
 
 
 class TestMaskApplicationFailures:

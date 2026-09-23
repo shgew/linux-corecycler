@@ -15,6 +15,7 @@ import logging
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot
@@ -568,6 +569,7 @@ class TunerEngine(QObject):
         self._hunt: bisect.HuntState | None = None
         self._pending_hunt_loaded: list[int] = []
         self._pending_hunt_vector: dict[int, int] = {}
+        self._pending_hunt_mttf = 0.0
         self._battery_orders: dict[int, tuple[tuple[str, int], list[str]]] = {}
         self._freeze: MicroFreezeMonitor | None = None
         self._freeze_slot_context = ""
@@ -826,6 +828,7 @@ class TunerEngine(QObject):
         self._soaking = False
         self._pending_hunt_loaded = []
         self._pending_hunt_vector = {}
+        self._pending_hunt_mttf = 0.0
         self._session_id = session_id
 
         try:
@@ -981,7 +984,7 @@ class TunerEngine(QObject):
                     f"{streak} crash-resumes in a row with no surviving test. "
                     "Asking whether the machine survives at full stock before blaming any offset."
                 )
-                self._start_hunt(loaded=self._pending_hunt_loaded)
+                self._start_hunt(observed_mttf=self._pending_hunt_mttf, loaded=self._pending_hunt_loaded)
                 return
 
         # Step 2: Restore all cores to their baseline offsets.
@@ -1099,7 +1102,7 @@ class TunerEngine(QObject):
                 return
             self.log_message.emit(f"Resumed session {session_id} — starting attribution hunt")
             self._db.update_tuner_session_status(session_id, "validating")
-            self._start_hunt(loaded=self._pending_hunt_loaded)
+            self._start_hunt(observed_mttf=self._pending_hunt_mttf, loaded=self._pending_hunt_loaded)
             return
 
         # Check if all cores are confirmed — if so, we were paused during
@@ -1393,18 +1396,28 @@ class TunerEngine(QObject):
         if self._freeze is not None:
             self._freeze.set_context(context)
 
-    def _read_breadcrumb(self) -> str:
-        """What the last breadcrumb says the machine was doing when it died."""
+    def _read_breadcrumb(self) -> tuple[str, float | None]:
+        """What the last breadcrumb says the machine was doing when it died,
+        and how many seconds into its slot the last breadcrumb landed."""
         try:
             raw = self._breadcrumb_path().read_text()
         except OSError:
-            return ""
+            return "", None
         fields = dict(line.split("=", 1) for line in raw.splitlines() if "=" in line)
         context = fields.get("context", "").strip()
         worst = fields.get("worst_latency_ms", "").strip()
         if not context:
-            return ""
-        return f"{context} (worst scheduling hitch {worst}ms in the minute before the freeze)"
+            return "", None
+        try:
+            seconds = (
+                datetime.fromisoformat(fields["timestamp"].strip()) - datetime.fromisoformat(fields["started"].strip())
+            ).total_seconds()
+        except (KeyError, ValueError, TypeError):
+            seconds = None
+        if seconds is not None and seconds < 0:
+            seconds = None
+        timing = f", about {seconds:.0f}s into the slot" if seconds is not None else ""
+        return f"{context}{timing} (worst scheduling hitch {worst}ms in the minute before the freeze)", seconds
 
     def _banked_hours(self, cs: CoreState) -> float:
         """Clean hours in the weakest regime at this core's current best offset."""
@@ -2199,7 +2212,8 @@ class TunerEngine(QObject):
                     f"{len(in_test)} under load. Nothing here names a culprit, so the "
                     f"offsets stay where they are and an attribution hunt decides."
                 )
-                breadcrumb = self._read_breadcrumb()
+                breadcrumb, seconds = self._read_breadcrumb()
+                self._pending_hunt_mttf = seconds or 0.0
                 if breadcrumb:
                     # Context, never a verdict: it says what died, not who.
                     self.log_message.emit(f"Last breadcrumb before the freeze: {breadcrumb}")
