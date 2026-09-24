@@ -1614,6 +1614,7 @@ class TestHuntDecisions:
 
         restored = engine._db.get_tuner_core_states(engine._session_id)
         assert restored[0].current_offset == -19
+        assert restored[0].crash_count == 1
         assert restored[0].suspicion == 0.0
         assert all(restored[cid].current_offset == -20 for cid in (1, 2, 3))
         assert engine._db.get_regime_banks(context_id, 0, -20) == {}
@@ -1739,7 +1740,13 @@ class TestResumeAttributionLadder:
 
 
 class TestRemainingHuntCoverage:
-    def test_completed_probe_state_resolves_to_a_persisted_culprit_verdict(self, engine):
+    @pytest.mark.parametrize(
+        ("observed_failure_time", "expected"),
+        [(0.0, -19), (10.0, -17), (60.0, -17), (61.0, -19)],
+    )
+    def test_completed_probe_state_resolves_to_a_persisted_culprit_verdict(
+        self, engine, observed_failure_time, expected
+    ):
         for core_id in engine._core_states:
             _confirm(engine, core_id, -20)
         engine._hunt = bisect.HuntState(
@@ -1747,6 +1754,7 @@ class TestRemainingHuntCoverage:
             stage=bisect.Stage.CULPRIT,
             found=[0],
             loaded=[0],
+            observed_failure_time=observed_failure_time,
         )
         engine._hunting = True
         engine._save_hunt()
@@ -1755,8 +1763,16 @@ class TestRemainingHuntCoverage:
 
         restored = engine._db.get_tuner_core_states(engine._session_id)
         session = engine._db.get_tuner_session(engine._session_id)
-        assert restored[0].current_offset == -19
+        assert restored[0].current_offset == expected
+        assert restored[0].crash_count == 1
         assert all(restored[cid].current_offset == -20 for cid in (1, 2, 3))
+        assert all(restored[cid].crash_count == 0 for cid in (1, 2, 3))
+        failures = [
+            (row["core_id"], row["offset_tested"], row["error_type"])
+            for row in engine._db.get_tuner_test_log(engine._session_id)
+            if not row["passed"]
+        ]
+        assert failures == [(0, -20, "crash")]
         assert session.hunt_state == ""
         assert session.status == "running"
 

@@ -164,7 +164,7 @@ penalty. Attribution uses this strict priority:
    hunt while known guilty pending sets remain.
 
 `PROBE` treats a set that reproduces while both of its halves ran clean as
-a conjunction: every member is found and backs off one step. For an onset
+a conjunction: every member is found and charged with the crash. For an onset
 failure, timed from the breadcrumb to within `onset_failure_seconds` of load
 start, each probe is a series of launches. The series answers the probe only
 after every launch passes, or at the first reproduction. `launches_done`

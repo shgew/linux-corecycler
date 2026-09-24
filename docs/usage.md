@@ -199,7 +199,7 @@ holding a live offset is a platform fault outright and needs no hunt.
    drop to stock. A crash means the culprit is in the live half; log2(n) probes.
    Both halves failing means two culprits, and both subtrees are pursued. A set that
    fails while both of its halves run clean fails only as a whole, so every member
-   backs off one step. There is no all-stock control probe first: it cost the longest
+   is charged with the crash. There is no all-stock control probe first: it cost the longest
    probe of every hunt to rule out the least likely cause, and hardware errors
    reported by a core at stock already pause the hunt.
 3. **Lone reproduction** -- a single core that reproduces the failure with every
@@ -366,7 +366,7 @@ The status is the session's flow, and the CLI exit code follows it.
 |---|---|---|
 | `lead` | Does the one loaded live core fail alone? | A reproduction makes it the culprit; a clean run starts bisection over the whole live set |
 | `probe` | Which half of the live mask carries the culprit? | Recurses into the failing half, or into both halves when both fail. A lone core that reproduces is a culprit. A set that fails while both halves ran clean backs off every member |
-| `culprit` | -- | The core is backed off one step and its banked confidence is discarded |
+| `culprit` | -- | The core is charged with the crash (`crash_count`, crash cooldown, a `crash` test-log row) and backs off one step, or `crash_penalty_steps` when the failure came within `onset_failure_seconds` of load start; its banked confidence is discarded |
 | `exhausted` | Nothing reproduced inside budget | Counts one unattributed failure for the suspicion model, which acts only on a 2:1 separation after at least three; the search step that was running records a fail |
 
 A probe that is interrupted by a thermal stop, an apparatus fault, a pause, or a

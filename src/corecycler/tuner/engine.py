@@ -2819,7 +2819,7 @@ class TunerEngine(QObject):
         if whole_set and reproduced:
             self.log_message.emit(
                 f"Hunt: {self._hunt.parent} fail together, yet every half of that set ran clean. "
-                "No single core carries it, so each of them backs off one step."
+                "No single core carries it, so each of them is charged with the crash."
             )
         bisect.record(
             self._hunt,
@@ -2837,12 +2837,20 @@ class TunerEngine(QObject):
             self._db.set_hunt_state(self._session_id, "")
 
         if state.stage is bisect.Stage.CULPRIT and state.found:
-            for culprit in state.found:
-                self._blame_core(
-                    culprit,
-                    "the attribution hunt reproduced the failure with it live",
-                    resident=state.vector.get(culprit),
+            observed = state.observed_failure_time
+            if 0 < observed <= self._config.onset_failure_seconds:
+                # Failing seconds after load starts puts the offset far past its edge; walking
+                # it back one step per crash buys a reboot and a hunt for every step.
+                steps = self._config.crash_penalty_steps
+                reason = (
+                    f"the attribution hunt reproduced the failure with it live, {observed:.0f}s "
+                    "after load started, so it takes the full crash penalty"
                 )
+            else:
+                steps = 1
+                reason = "the attribution hunt reproduced the failure with it live"
+            for culprit in state.found:
+                self._blame_core(culprit, reason, resident=state.vector.get(culprit), steps=steps)
             self._after_hunt_resume(clear_incident=True)
             return
 
@@ -2900,11 +2908,22 @@ class TunerEngine(QObject):
         self._transition_status("running")
         QTimer.singleShot(0, self._run_next)
 
-    def _blame_core(self, core_id: int, reason: str, *, resident: int | None = None) -> None:
-        """Demote one core from the exact resident value and make it re-earn everything."""
+    def _blame_core(self, core_id: int, reason: str, *, resident: int | None = None, steps: int = 1) -> None:
+        """Charge one core with the hard crash from the exact resident value and make it re-earn everything."""
         cs = self._core_states[core_id]
         cs.current_offset = resident if resident is not None else self._mask_offset(cs, Mask.LIVE)
-        self._apply_crash_penalty(cs, steps=1, count_crash=False)
+        if self._session_id is not None:
+            self._db.insert_tuner_test_log(
+                self._session_id,
+                core_id,
+                cs.current_offset,
+                cs.phase.value,
+                passed=False,
+                error_msg=f"Hard crash charged after reboot: {reason}. Offset {cs.current_offset} was resident.",
+                error_type="crash",
+                duration=None,
+            )
+        self._apply_crash_penalty(cs, steps=steps)
         cs.suspicion = 0.0
         if self._session_id is not None:
             self._db.upsert_tuner_core_state(self._session_id, cs)

@@ -10,6 +10,18 @@ A per-core CPU stability tester and AMD PBO Curve Optimizer tuner for Linux,
 packaged as a NixOS module with an overlay. Forked from
 [Daaboulex/linux-corecycler](https://github.com/Daaboulex/linux-corecycler).
 
+### Fixed (2026-09-24 overnight run on the 9950X3D2)
+
+- A core convicted by an attribution hunt, or picked by the suspicion fallback, is now
+  charged with the crash like every other hard-crash verdict: `crash_count`, crash cooldown
+  and a `crash` test-log row. `corecycler report` showed core 0 with 0 crashes and no
+  failures after eight hunt verdicts against it.
+- A hunt culprit whose failure came within `onset_failure_seconds` of load start backs
+  off the full `crash_penalty_steps` instead of one step. Such a fast failure puts the
+  offset far past its edge, and one step per crash walked core 0 from -49 to -40 through
+  nine crash-and-hunt cycles. Slow and untimed failures keep one step: a core that fails
+  only in validation gains nothing from a deeper backoff, which it bisects back anyway.
+
 ### Added (2026-09-23 development workflow)
 
 - Added the `just` dev-shell dependency and a repository `justfile` for recurring
